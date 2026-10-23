@@ -230,6 +230,7 @@ Status Session::prepare() {
   cudaMemset(d_recent_.get(), 0, kMaxRecent * sizeof(int));
   cudaMemset(x_.get(), 0, static_cast<size_t>(cp_.chunk_prefill) * d.hidden *
                               sizeof(uint16_t));
+  cudaMemset(xf_.get(), 0, static_cast<size_t>(d.hidden) * sizeof(uint16_t));
   cudaMemset(route_idx_.get(), 0, (d.n_expert_used + 1) * sizeof(int));
 
   // Static combine extension: slot K carries the shared expert with weight 1.
@@ -535,6 +536,9 @@ void Session::head_launch_row(int row) {
   cudaStream_t s = stream_.get();
   cuda::rmsnorm_f16(xn_.get(), x_.get() + static_cast<size_t>(row) * d.hidden,
                     w_.output_norm, d.hidden, mc_.norm_eps, s);
+  // MTP stash: prefill's tail row is the hidden the first draft conditions on.
+  cudaMemcpyAsync(xf_.get(), xn_.get(), d.hidden * sizeof(uint16_t),
+                  cudaMemcpyDeviceToDevice, s);
   cuda::quantize_q8_k(xn_.get(), d_xq_.get(), d.hidden, s);
   cuda::gemv_q4_k_q8(Q4W(w_.output), d_xq_.get(), logits_.get(), d.n_vocab,
                      d.hidden, s);
@@ -654,6 +658,11 @@ Status Session::forward_window(const std::vector<int>& window,
     // Batched head: all rows at once, then one D2H.
     cuda::rmsnorm_batched_f16(xn_.get(), x_.get(), w_.output_norm, d.hidden,
                               mc_.norm_eps, n, s);
+    // MTP stash: the drafter must condition on the pass actually executed
+    // last (verify windows included), not on a stale decode_step hidden.
+    cudaMemcpyAsync(xf_.get(),
+                    xn_.get() + static_cast<size_t>(n - 1) * d.hidden,
+                    d.hidden * sizeof(uint16_t), cudaMemcpyDeviceToDevice, s);
     cuda::quantize_q8_k(xn_.get(), d_xq_.get(),
                         static_cast<size_t>(n) * d.hidden, s);
     DeviceBuffer<float> lwin(static_cast<size_t>(n) * d.n_vocab);

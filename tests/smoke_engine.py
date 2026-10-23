@@ -122,8 +122,60 @@ def phase_long():
     print("SHUTDOWN:", json.dumps(e.resp()))
 
 
+def run_greedy(mtp_flag, n=40):
+    """One greedy generation on a fresh engine, MTP drafting on or off.
+
+    Greedy verification must keep the token stream bit-identical to plain
+    decoding, so the mtp=True and mtp=False runs have to agree token for
+    token - that is the correctness check; drafted/accepted check that the
+    speculative machinery actually runs.
+    """
+    e = Engine()
+    e.send({"cmd": "load", "model": MODEL, "ctx": 4096, "vram_mb": 10240,
+            "threads": 2, "graphs": True, "mtp": mtp_flag, "chunk": 8192,
+            "kv_q8": True})
+    r = e.resp("load")
+    assert r.get("type") == "loaded", r
+    rng = np.random.default_rng(101)
+    ids = rng.integers(1000, 31000, size=32).astype(int).tolist()
+    e.send({"cmd": "generate", "ids": ids, "max_tokens": n, "greedy": True,
+            "presence_penalty": 0.0, "repeat_penalty": 1.0, "seed": 1})
+    toks, res = [], None
+    while True:
+        r = e.resp("greedy")
+        if r.get("type") == "token":
+            toks.append(r["id"])
+        elif r.get("type") == "done":
+            res = r
+            break
+        else:
+            print("  msg:", json.dumps(r)[:200])
+    e.send({"cmd": "shutdown"})
+    e.resp("shutdown")
+    return toks, res
+
+
+def phase_mtp():
+    ta, ra = run_greedy(True)
+    tb, rb = run_greedy(False)
+    print(f"  mtp:on  drafted={ra.get('drafted')} accepted={ra.get('accepted')} "
+          f"decode_tps={ra.get('decode_tps', 0):.1f} tokens={len(ta)}")
+    print(f"  mtp:off drafted={rb.get('drafted')} accepted={rb.get('accepted')} "
+          f"decode_tps={rb.get('decode_tps', 0):.1f} tokens={len(tb)}")
+    assert ra.get("drafted", 0) > 0, "MTP drafter produced no candidates"
+    if ta != tb:
+        for i, (a, b) in enumerate(zip(ta, tb)):
+            if a != b:
+                print(f"  MISMATCH at {i}: mtp={a} plain={b}")
+                break
+        raise SystemExit("FAIL: speculative stream diverged from plain decode")
+    print(f"  STREAMS IDENTICAL ({len(ta)} tokens) - bit-exact greedy chain")
+    print("PHASE mtp: PASS")
+
+
 if __name__ == "__main__":
     ph = sys.argv[1] if len(sys.argv) > 1 else "hot"
     t0 = time.time()
-    {"hot": phase_hot, "cold": phase_cold, "long": phase_long}[ph]()
+    {"hot": phase_hot, "cold": phase_cold, "long": phase_long,
+     "mtp": phase_mtp}[ph]()
     print(f"PHASE {ph}: PASS ({time.time()-t0:.1f}s)")

@@ -170,10 +170,14 @@ def main(out):
     w.add("qwen3_5_moe.rope.scaling.type", "mrope")
     w.add("qwen3_5_moe.rope.scaling.section", [11, 11, 10])
 
-    print("[1/3] emb + head", flush=True)
+    print("[1/3] emb + head + mtp", flush=True)
     w.tensor("token_embd.weight", rand2(V, H), T_F16)
     w.tensor("output_norm.weight", 1.0 + rand2(H, 1).reshape(-1) * 0.01, T_F16)
     w.tensor("output.weight", rand2(V, H), T_Q4_K)
+    # MTP head: fc maps cat=[emb(t); h] (2H) -> H, proj_out H -> H. Both fp16;
+    # the drafter reuses output_norm for its two rmsnorms (see mtp.cpp).
+    w.tensor("mtp.fc.weight", rand2(2 * H, H), T_F16)
+    w.tensor("mtp.proj_out.weight", rand2(H, H), T_F16)
 
     for l in range(L):
         print(f"[2/3] layer {l}", flush=True)
