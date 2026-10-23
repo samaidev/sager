@@ -250,6 +250,12 @@ Status Session::prepare() {
       SLOG_W("session", "graph capture failed (%s) - running eager",
              status_str(s));
       graphs_.set_valid(false);
+      // A sticky device error here means the context is unusable - surface it
+      // instead of letting the eager path fail mysteriously later.
+      cudaError_t ds = cudaDeviceSynchronize();
+      SLOG_W("session", "post-capture device sync: %s",
+             ds == cudaSuccess ? "clean"
+                               : cudaGetErrorString(cudaGetLastError()));
     }
   } else {
     graphs_.set_valid(false);
@@ -343,19 +349,32 @@ Status Session::capture_graphs() {
   // Warm every kernel once (module load) outside capture.
   dense_layer_launch(0, 1);
   stream_.sync();
+  if (cudaError_t we = cudaGetLastError(); we != cudaSuccess) {
+    SLOG_W("session", "capture warmup left error: %s", cudaGetErrorString(we));
+    return Status::kCudaError;
+  }
 
   for (int L = 0; L < d.n_layer; ++L) {
-    cudaStreamBeginCapture(stream_.get(), cudaStreamCaptureModeThreadLocal);
+    if (cudaStreamBeginCapture(stream_.get(), cudaStreamCaptureModeThreadLocal)
+        != cudaSuccess) {
+      SLOG_W("session", "L%d: begin capture failed: %s", L,
+             cudaGetErrorString(cudaGetLastError()));
+      return Status::kCudaError;
+    }
     dense_layer_launch(L, 1);
     cudaGraph_t graph = nullptr;
-    if (cudaStreamEndCapture(stream_.get(), &graph) != cudaSuccess) {
+    cudaError_t ec = cudaStreamEndCapture(stream_.get(), &graph);
+    if (ec != cudaSuccess) {
+      SLOG_W("session", "L%d: end capture failed: %s", L,
+             cudaGetErrorString(ec));
       cudaGetLastError();   // pop the capture error: keep the stream usable
       return Status::kCudaError;   // for the eager fallback path
     }
     cudaGraphExec_t exec = nullptr;
     if (cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) != cudaSuccess) {
+      cudaError_t ei = cudaGetLastError();
+      SLOG_W("session", "L%d: instantiate failed: %s", L, cudaGetErrorString(ei));
       cudaGraphDestroy(graph);
-      cudaGetLastError();
       return Status::kCudaError;
     }
     cudaGraphDestroy(graph);
