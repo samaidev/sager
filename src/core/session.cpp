@@ -169,7 +169,7 @@ Status Session::alloc_scratch() {
       !h_x16_.alloc(H) || !miss_x_.alloc(H) ||
       !miss_y_.alloc(static_cast<size_t>(K) * H) ||
       !logits_host_.alloc(V) || !h_ptrs_.alloc(3 * K) ||
-      !h_hit_rows_.alloc(K)) {
+      !h_hit_rows_.alloc(K) || !h_slot_of_k_.alloc(K)) {
     return Status::kOomRam;
   }
   return Status::kOk;
