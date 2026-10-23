@@ -171,7 +171,6 @@ struct Parser {
   const char* p;
   const char* end;
   bool ok = true;
-  Value* out_val = nullptr;
 
   void skip_ws() { while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) ++p; }
 
@@ -183,16 +182,19 @@ struct Parser {
     if (c == '{') return parse_object(out, depth);
     if (c == '[') return parse_array(out, depth);
     if (c == '"') { std::string s; if (!parse_string(&s)) return false; *out = Value(std::move(s)); return true; }
-    if (c == 't') { return parse_lit("true",  Value(true)); }
-    if (c == 'f') { return parse_lit("false", Value(false)); }
-    if (c == 'n') { return parse_lit("null",  Value()); }
+    if (c == 't') { return parse_lit(out, "true",  Value(true)); }
+    if (c == 'f') { return parse_lit(out, "false", Value(false)); }
+    if (c == 'n') { return parse_lit(out, "null",  Value()); }
     return parse_number(out);
   }
 
-  bool parse_lit(const char* lit, Value v) {
+  // Writes through the caller's `out` - the previous draft stored literals
+  // into a stale root pointer, so every true/false/null member value was
+  // silently dropped and option flags always fell back to their defaults.
+  bool parse_lit(Value* out, const char* lit, Value v) {
     size_t n = std::char_traits<char>::length(lit);
     if (static_cast<size_t>(end - p) < n || std::char_traits<char>::compare(p, lit, n) != 0) { ok = false; return false; }
-    p += n; *out_val = std::move(v); return true;
+    p += n; *out = std::move(v); return true;
   }
 
   bool parse_string(std::string* out) {
@@ -308,9 +310,8 @@ struct Parser {
 }  // namespace detail
 
 inline bool Value::parse(const std::string& text, Value* out) {
-  detail::Parser ps{text.data(), text.data() + text.size(), true, nullptr};
+  detail::Parser ps{text.data(), text.data() + text.size(), true};
   Value v;
-  ps.out_val = &v;
   if (!ps.parse_value(&v, 0)) return false;
   ps.skip_ws();
   if (ps.p != ps.end) return false;  // trailing garbage is an error
