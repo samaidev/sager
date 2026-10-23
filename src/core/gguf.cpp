@@ -147,16 +147,6 @@ Status File::open(const std::string& path) {
         if (!read_exact(&v.f64v, 8)) { close(); return Status::kGgufParseError; }
         break;
       }
-      case Type::f16: {
-        uint16_t x; if (!read_exact(&x, 2)) { close(); return Status::kGgufParseError; }
-        // fp16 -> double (host half conversion from q4_k.hpp is internal; use a
-        // small inline here to avoid a circular include).
-        uint32_t s = (x & 0x8000u) << 16, e = (x & 0x7C00u) >> 10, m = x & 0x3FFu;
-        uint32_t bits = (e == 0) ? (s | ((127 - 15 + 1) << 23))
-                                 : (s | ((e + 112u) << 23) | (m << 13));
-        float f; std::memcpy(&f, &bits, 4);
-        v.f64v = (x & 0x7FFF) == 0 ? 0.0 : f; break;
-      }
       case Type::string: {
         if (!read_str(&v.str)) { close(); return Status::kGgufParseError; }
         break;
@@ -169,7 +159,7 @@ Status File::open(const std::string& path) {
         size_t elem_sz = 0;
         switch (static_cast<Type>(et)) {
           case Type::u8: case Type::i8: case Type::boolean: elem_sz = 1; break;
-          case Type::u16: case Type::i16: case Type::f16:   elem_sz = 2; break;
+          case Type::u16: case Type::i16:              elem_sz = 2; break;
           case Type::u32: case Type::i32: case Type::f32:   elem_sz = 4; break;
           case Type::u64: case Type::i64: case Type::f64:   elem_sz = 8; break;
           case Type::string: elem_sz = 0; break;  // handled element-wise

@@ -42,8 +42,8 @@ GGUF_MAGIC = b"GGUF"
 T_F32, T_F16, T_Q4_K = 0, 1, 12
 QK_K, QK, BLOCK_BYTES = 256, 32, 144
 
-# GGUF metadata value types
-T_ARR, T_STRING, T_UINT32, T_FLOAT32, T_BOOL, T_UINT64, T_FLOAT64 = 9, 8, 4, 3, 7, 10, 5
+# GGUF metadata value types (spec / llama.cpp enum gguf_type order)
+T_ARR, T_STRING, T_UINT32, T_FLOAT32, T_BOOL, T_UINT64, T_FLOAT64 = 9, 8, 4, 6, 7, 10, 12
 
 
 # ---------------------------------------------------------------------------

@@ -22,9 +22,14 @@
 
 namespace sager::gguf {
 
+// GGUF v3 metadata value types - ids MUST match the spec
+// (llama.cpp enum gguf_type): u8 i8 u16 i16 u32 i32 f32 bool string
+// array u64 i64 f64. The previous draft ordering silently desynced the KV
+// parser on any spec-conformant file (first caught by the T4 smoke test).
 enum class Type : uint32_t {
-  u8 = 0, i8, u16, i16, u32, i32, u64, i64, f32, f64, boolean,
-  string, array, f16,
+  u8 = 0, i8 = 1, u16 = 2, i16 = 3, u32 = 4, i32 = 5,
+  f32 = 6, boolean = 7, string = 8, array = 9,
+  u64 = 10, i64 = 11, f64 = 12,
 };
 
 struct Value {
@@ -43,13 +48,13 @@ struct Value {
         return static_cast<int64_t>(u64v);
       case Type::u8: case Type::u16: case Type::u32: case Type::u64:
         return static_cast<int64_t>(u64v);
-      case Type::f16: case Type::f32: case Type::f64:
+      case Type::f32: case Type::f64:
         return static_cast<int64_t>(f64v);
       default: return d;
     }
   }
   double   as_double(double d = 0) const {
-    if (type == Type::f32 || type == Type::f64 || type == Type::f16) return f64v;
+    if (type == Type::f32 || type == Type::f64) return f64v;
     if (type == Type::boolean) return u64v ? 1.0 : 0.0;
     if (type == Type::string) return d;
     return static_cast<double>(static_cast<int64_t>(u64v));
