@@ -47,7 +47,10 @@ __device__ __forceinline__ int dp4a_subblock(const uint8_t* qs16,
                            (static_cast<uint32_t>(w1) << 8) |
                            (static_cast<uint32_t>(w2) << 16) |
                            (static_cast<uint32_t>(w3) << 24);
-    acc_i = __dp4a(wpack, xpack, acc_i);
+    // Cast to int: nibble bytes are 0..15 so signed interpretation is exact,
+    // while the int8 activation bytes MUST be read as signed. The unsigned
+    // overload would corrupt every negative activation.
+    acc_i = __dp4a(static_cast<int>(wpack), static_cast<int>(xpack), acc_i);
   }
   return acc_i;
 }
@@ -208,8 +211,6 @@ __global__ void gemv_ptrs_q4_k_q8_f16_kernel(
   for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
   if (lane == 0) *reinterpret_cast<__half*>(&y[row]) = __float2half(acc);
 }
-
-}  // namespace
 
 // ---- batched variants (prefill / verify window): one extra grid dim over
 // tokens. Activation rows are contiguous and 256-divisible, so xq slices per

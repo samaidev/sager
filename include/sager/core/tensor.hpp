@@ -32,9 +32,34 @@
 
 namespace sager {
 
-// Non-CUDA-safe allocation helpers (work in CPU-only builds too).
-void* host_alloc(size_t bytes, bool pinned);
-void  host_free(void* p, bool pinned);
+// Allocation helpers used by PinnedBuffer and the CPU expert pool. "pinned"
+// means page-locked host memory (async-copy friendly); on CPU-only builds
+// every allocation degrades to plain heap. Defined inline so the header
+// stays self-contained for both sager_core and the tests.
+#if defined(SAGER_HAVE_CUDA)
+inline void* host_alloc(size_t bytes, bool pinned) {
+  if (bytes == 0) return nullptr;
+  if (!pinned) return std::malloc(bytes);
+  void* p = nullptr;
+  // Portable pinned memory: page-locked and addressable from any device.
+  if (cudaHostAlloc(&p, bytes, cudaHostAllocPortable) != cudaSuccess) {
+    SLOG_E("cuda", "cudaHostAlloc(%zu) failed: %s", bytes,
+           cudaGetErrorString(cudaGetLastError()));
+    return nullptr;
+  }
+  return p;
+}
+inline void host_free(void* p, bool pinned) {
+  if (!p) return;
+  if (pinned) cudaFreeHost(p);
+  else        std::free(p);
+}
+#else
+inline void* host_alloc(size_t bytes, bool) {
+  return bytes ? std::malloc(bytes) : nullptr;
+}
+inline void host_free(void* p, bool) { std::free(p); }
+#endif
 
 #if defined(SAGER_HAVE_CUDA)
 
@@ -110,6 +135,8 @@ class PinnedBuffer {
 
   T* get() const { return ptr_; }
   size_t count() const { return count_; }
+  T& operator[](size_t i) { return ptr_[i]; }
+  const T& operator[](size_t i) const { return ptr_[i]; }
   explicit operator bool() const { return ptr_ != nullptr; }
 
  private:

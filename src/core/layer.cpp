@@ -79,10 +79,10 @@ void shared_expert_forward(const Weights& w, int layer,
   // 2*n_ff_exp)] region; we lay g,u after the output row.
   uint16_t* g = y + hidden;
   uint16_t* u = g + n_ff_exp;
-  cuda::gemv_q4_k_q8_f16out(lw.shared_gate, xq, g, n_ff_exp, hidden, s);
-  cuda::gemv_q4_k_q8_f16out(lw.shared_up, xq, u, n_ff_exp, hidden, s);
+  cuda::gemv_q4_k_q8_f16out(reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_gate), xq, g, n_ff_exp, hidden, s);
+  cuda::gemv_q4_k_q8_f16out(reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_up), xq, u, n_ff_exp, hidden, s);
   cuda::silu_mul_f16(g, g, u, 1, n_ff_exp, s);
-  cuda::gemv_q4_k_q8_f16out(lw.shared_out, reinterpret_cast<q4k::BlockQ8K*>(g),
+  cuda::gemv_q4_k_q8_f16out(reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_out), reinterpret_cast<q4k::BlockQ8K*>(g),
                             y, hidden, n_ff_exp, s);
 }
 #endif

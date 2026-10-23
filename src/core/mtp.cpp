@@ -85,7 +85,8 @@ std::vector<int> MtpDrafter::draft(int last_token) {
     cuda::gemv_f16_f16out(w.mtp_proj_out, sc.h1.get(), sc.h2.get(), H, H, st);
     cuda::rmsnorm_f16(sc.h2.get(), sc.h2.get(), w.output_norm, H, eps, st);
     cuda::quantize_q8_k(sc.h2.get(), sc.q.get(), H, st);
-    cuda::gemv_q4_k_q8(w.output, sc.q.get(), sc.lg.get(), V, H, st);
+    cuda::gemv_q4_k_q8(reinterpret_cast<const q4k::BlockQ4K*>(w.output),
+                       sc.q.get(), sc.lg.get(), V, H, st);
     cudaMemcpy(sc.host_lg.data(), sc.lg.get(), V * sizeof(float),
                cudaMemcpyDeviceToHost);
     const int tok = argmax_host(sc.host_lg.data(), V);

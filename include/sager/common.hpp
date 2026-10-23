@@ -55,6 +55,9 @@ inline const char* status_str(Status s) {
   return "unknown";
 }
 
+// "!status" reads naturally at the ~30 alloc/init guard sites ("if (!ok(...))").
+inline bool operator!(Status s) { return s != Status::kOk; }
+
 // ---------------------------------------------------------------------------
 // Geometry. Everything is metadata-driven: values are read from the GGUF
 // header at load time, never hard-coded. The numbers below are only

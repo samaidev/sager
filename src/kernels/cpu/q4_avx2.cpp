@@ -79,7 +79,7 @@ void quantize_row_q8_k_avx2(const float* x, q4k::BlockQ8K* out, int n) {
     const float* xb = x + static_cast<size_t>(b) * q4k::kQK_K;
     q4k::BlockQ8K& ob = out[b];
     float amax = 1e-30f;
-    for (int i = 0; i < q4k::kQK_K; ++i) amax = std::fmaxf(amax, std::fabsf(xb[i]));
+    for (int i = 0; i < q4k::kQK_K; ++i) amax = std::fmax(amax, std::fabs(xb[i]));
     const float d = amax / 127.f;
     ob.d = d;
     const float id = d > 0 ? 1.f / d : 0.f;
@@ -155,7 +155,7 @@ void quantize_row_q8_k_avx2(const float* x, q4k::BlockQ8K* out, int n) {
     const float* xb = x + static_cast<size_t>(b) * q4k::kQK_K;
     q4k::BlockQ8K& ob = out[b];
     float amax = 1e-30f;
-    for (int i = 0; i < q4k::kQK_K; ++i) amax = std::fmaxf(amax, std::fabsf(xb[i]));
+    for (int i = 0; i < q4k::kQK_K; ++i) amax = std::fmax(amax, std::fabs(xb[i]));
     const float d = amax / 127.f;
     ob.d = d;
     const float id = d > 0 ? 1.f / d : 0.f;

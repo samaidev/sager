@@ -33,9 +33,14 @@
 
 #if defined(SAGER_HAVE_CUDA)
 #include <cuda_runtime.h>
+#include "sager/kernels/cuda_ops.hpp"
 #endif
 
 namespace sager {
+
+#if defined(SAGER_HAVE_CUDA)
+using sager::cuda::SeqParams;   // decode-step parameter block
+#endif
 
 // KV cache with optional per-token Q8 quantization (kv_q8).
 class KVCache {
@@ -166,7 +171,8 @@ class Session {
   DeviceBuffer<uint16_t> expert_g_, expert_u_, expert_y_, shared_y_;
   DeviceBuffer<uint16_t> xf_, d_cat_, d_m1_;
   DeviceBuffer<float>    route_logits_, d_miss_y_;
-  DeviceBuffer<int>      route_idx_, d_slot_of_k_, d_hit_rows_, d_ptrs_hit_;
+  DeviceBuffer<int>      route_idx_, d_slot_of_k_, d_hit_rows_;
+  DeviceBuffer<q4k::BlockQ4K*> d_ptrs_hit_;   // fused ptr-table (3*K rows)
   DeviceBuffer<float>    route_w_;
   DeviceBuffer<q4k::BlockQ8K> d_xq_, d_hq_, d_mq_;
   DeviceBuffer<float>    logits_, mtp_logits_;

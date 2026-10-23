@@ -24,6 +24,9 @@ if(SAGER_ENABLE_CUDA)
   check_language(CUDA)
   if(CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
+    # Host TUs (sager_core) include <cuda_runtime.h> under SAGER_HAVE_CUDA,
+    # so the toolkit's include dirs + libcudart must reach plain CXX targets.
+    find_package(CUDAToolkit REQUIRED)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
     # T4 = compute capability 7.5 (Turing). Keep the fatbin small and targeted;
@@ -97,8 +100,11 @@ if(SAGER_ENABLE_CUDA)
   )
   target_include_directories(sager_cuda PUBLIC include)
   target_compile_definitions(sager_cuda PUBLIC SAGER_HAVE_CUDA=1)
-  set_property(TARGET sager_cuda PROPERTY CUDA_SEPARABLE_COMPILATION ON)
-  target_link_libraries(sager_core PUBLIC sager_cuda)
+  # Whole-program per-TU compilation: the kernel files share no device
+  # symbols, and skipping the device-link step avoids the RDC registration
+  # pitfall when the final executable is CXX-only.
+  set_property(TARGET sager_cuda PROPERTY CUDA_SEPARABLE_COMPILATION OFF)
+  target_link_libraries(sager_core PUBLIC sager_cuda CUDA::cudart)
 endif()
 
 # ---------------------------------------------------------------------------

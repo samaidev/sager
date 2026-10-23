@@ -27,6 +27,13 @@
 
 namespace sager {
 
+#if defined(SAGER_HAVE_CUDA)
+// Attention/head/shared-expert weights live in VRAM as raw Q4_K bytes
+// (weights.cpp carves them that way); the LayerWeights members expose them
+// as uint16_t* and the block type is restored at each launch site.
+#define Q4W(p) reinterpret_cast<const q4k::BlockQ4K*>(p)
+#endif
+
 // ---------------------------------------------------------------------------
 // KVCache
 // ---------------------------------------------------------------------------
@@ -264,15 +271,15 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
   cuda::quantize_q8_k(xn_.get(), d_xq_.get(), n_tokens * H, s);
 
   if (n_tokens == 1) {
-    cuda::gemv_q4_k_q8_f16out(lw.wq, d_xq_.get(), q_.get(), Q, H, s);
-    cuda::gemv_q4_k_q8_f16out(lw.wk, d_xq_.get(), k_.get(), KVd, H, s);
-    cuda::gemv_q4_k_q8_f16out(lw.wv, d_xq_.get(), v_.get(), KVd, H, s);
+    cuda::gemv_q4_k_q8_f16out(Q4W(lw.wq), d_xq_.get(), q_.get(), Q, H, s);
+    cuda::gemv_q4_k_q8_f16out(Q4W(lw.wk), d_xq_.get(), k_.get(), KVd, H, s);
+    cuda::gemv_q4_k_q8_f16out(Q4W(lw.wv), d_xq_.get(), v_.get(), KVd, H, s);
   } else {
-    cuda::gemv_q4_k_q8_f16out_batched(lw.wq, d_xq_.get(), q_.get(), Q, H,
+    cuda::gemv_q4_k_q8_f16out_batched(Q4W(lw.wq), d_xq_.get(), q_.get(), Q, H,
                                       n_tokens, s);
-    cuda::gemv_q4_k_q8_f16out_batched(lw.wk, d_xq_.get(), k_.get(), KVd, H,
+    cuda::gemv_q4_k_q8_f16out_batched(Q4W(lw.wk), d_xq_.get(), k_.get(), KVd, H,
                                       n_tokens, s);
-    cuda::gemv_q4_k_q8_f16out_batched(lw.wv, d_xq_.get(), v_.get(), KVd, H,
+    cuda::gemv_q4_k_q8_f16out_batched(Q4W(lw.wv), d_xq_.get(), v_.get(), KVd, H,
                                       n_tokens, s);
   }
   cuda::rope_f16(q_.get(), k_.get(), d_pos_ids_.get(), d.n_head, d.n_head_kv,
@@ -298,10 +305,10 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
   }
   if (n_tokens == 1) {
     cuda::quantize_q8_k(attn_out_.get(), d_hq_.get(), Q, s);
-    cuda::gemv_q4_k_q8_f16out(lw.wo, d_hq_.get(), o_proj_.get(), H, Q, s);
+    cuda::gemv_q4_k_q8_f16out(Q4W(lw.wo), d_hq_.get(), o_proj_.get(), H, Q, s);
   } else {
     cuda::quantize_q8_k(attn_out_.get(), d_hq_.get(), n_tokens * Q, s);
-    cuda::gemv_q4_k_q8_f16out_batched(lw.wo, d_hq_.get(), o_proj_.get(), H, Q,
+    cuda::gemv_q4_k_q8_f16out_batched(Q4W(lw.wo), d_hq_.get(), o_proj_.get(), H, Q,
                                       n_tokens, s);
   }
   cuda::add_f16(x_.get(), o_proj_.get(), n_tokens * H, s);
@@ -474,7 +481,7 @@ void Session::head_launch() {
   cuda::rmsnorm_f16(xn_.get(), x_.get(), w_.output_norm, d.hidden,
                     mc_.norm_eps, s);
   cuda::quantize_q8_k(xn_.get(), d_xq_.get(), d.hidden, s);
-  cuda::gemv_q4_k_q8(w_.output, d_xq_.get(), logits_.get(), d.n_vocab,
+  cuda::gemv_q4_k_q8(Q4W(w_.output), d_xq_.get(), logits_.get(), d.n_vocab,
                      d.hidden, s);
 }
 
@@ -484,7 +491,7 @@ void Session::head_launch_row(int row) {
   cuda::rmsnorm_f16(xn_.get(), x_.get() + static_cast<size_t>(row) * d.hidden,
                     w_.output_norm, d.hidden, mc_.norm_eps, s);
   cuda::quantize_q8_k(xn_.get(), d_xq_.get(), d.hidden, s);
-  cuda::gemv_q4_k_q8(w_.output, d_xq_.get(), logits_.get(), d.n_vocab,
+  cuda::gemv_q4_k_q8(Q4W(w_.output), d_xq_.get(), logits_.get(), d.n_vocab,
                      d.hidden, s);
   cudaMemcpyAsync(logits_host_.get(), logits_.get(),
                   d.n_vocab * sizeof(float), cudaMemcpyDeviceToHost, s);
@@ -606,7 +613,7 @@ Status Session::forward_window(const std::vector<int>& window,
                         static_cast<size_t>(n) * d.hidden, s);
     DeviceBuffer<float> lwin(static_cast<size_t>(n) * d.n_vocab);
     if (!lwin) return Status::kOomVram;
-    cuda::gemv_q4_k_q8_batched(w_.output, d_xq_.get(), lwin.get(), d.n_vocab,
+    cuda::gemv_q4_k_q8_batched(Q4W(w_.output), d_xq_.get(), lwin.get(), d.n_vocab,
                                d.hidden, n, s);
     cudaMemcpy(logits_out, lwin.get(),
                static_cast<size_t>(n) * d.n_vocab * sizeof(float),

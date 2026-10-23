@@ -178,9 +178,11 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
       SAGER_CUDA_CHECK(cudaMemcpy(output_norm, f.tensor_data(*t), t->nbytes, cudaMemcpyHostToDevice));
     }
   }
-  // output head: uploaded to device as raw quant bytes (dtype from file)
+  // output head: uploaded to device as raw quant bytes.
+  // v0.1 kernel surface is Q4_K-only, so a Q6_K head would silently produce
+  // garbage logits - reject it here instead.
   if (const auto* t = f.tensor("output.weight")) {
-    if (t->type == 12 || t->type == 14) {
+    if (t->type == 12) {
       void* p = nullptr;
       if (cudaMalloc(&p, t->nbytes) != cudaSuccess) return Status::kOomVram;
       output = static_cast<uint16_t*>(p);
