@@ -297,20 +297,36 @@ def convert(hf_dir: str, out_path: str, workers: int) -> None:
     w.add("general.name", os.path.basename(os.path.normpath(hf_dir)))
     w.add("general.quantization", "Q4_K_M")
     w.add("sager.version", 1)
+    # Canonical "sager.*" namespace - the keys src/core/config.cpp reads first.
     w.add("sager.block_count", cfg["n_layer"])
+    w.add("sager.moe_layer_count", cfg["n_layer"])
+    w.add("sager.attention.head_count", cfg["n_head"])
+    w.add("sager.attention.head_count_kv", cfg["n_head_kv"])
+    w.add("sager.attention.key_length", cfg["head_dim"])
+    w.add("sager.attention.layer_norm_rms_epsilon", float(cfg["norm_eps"]))
+    w.add("sager.embedding_length", cfg["hidden"])
+    w.add("sager.feed_forward_length", cfg["n_ff_exp"])
     w.add("sager.expert_count", cfg["n_expert"])
     w.add("sager.expert_used_count", cfg["n_expert_used"])
     w.add("sager.expert_feed_forward_length", cfg["n_ff_exp"])
-    w.add("sager.shared_expert", 1 if cfg["shared_expert"] else 0)
+    w.add("sager.expert_shared_count", 1 if cfg["shared_expert"] else 0)
     w.add("sager.context_length", cfg["n_ctx_train"])
-    # qwen-family aliases (dual namespace, config.cpp reads both)
+    w.add("sager.vocab_size", cfg["n_vocab"])
+    w.add("sager.rope.theta", float(cfg["rope_theta"]))
+    w.add("sager.rope.partial_rotary_factor", float(cfg["rope_partial"]))
+    if cfg["mrope"]:
+        w.add("sager.rope.mrope_section", cfg["mrope_section"])
+    # qwen-family aliases (community converters / fallback readers)
     w.add("qwen3_5_moe.block_count", cfg["n_layer"])
+    w.add("qwen3_5_moe.moe_layer_count", cfg["n_layer"])
     w.add("qwen3_5_moe.expert_count", cfg["n_expert"])
     w.add("qwen3_5_moe.expert_used_count", cfg["n_expert_used"])
     w.add("qwen3_5_moe.expert_feed_forward_length", cfg["n_ff_exp"])
+    w.add("qwen3_5_moe.expert_shared_count", 1 if cfg["shared_expert"] else 0)
     w.add("qwen3_5_moe.attention.head_count", cfg["n_head"])
     w.add("qwen3_5_moe.attention.head_count_kv", cfg["n_head_kv"])
     w.add("qwen3_5_moe.attention.key_length", cfg["head_dim"])
+    w.add("qwen3_5_moe.attention.layer_norm_rms_epsilon", float(cfg["norm_eps"]))
     w.add("qwen3_5_moe.embedding_length", cfg["hidden"])
     w.add("qwen3_5_moe.vocab_size", cfg["n_vocab"])
     w.add("qwen3_5_moe.rope.dimension_count",
@@ -319,7 +335,6 @@ def convert(hf_dir: str, out_path: str, workers: int) -> None:
     w.add("qwen3_5_moe.rope.scaling.type",
           "mrope" if cfg["mrope"] else "none")
     w.add("qwen3_5_moe.rope.scaling.section", cfg["mrope_section"])
-    w.add("qwen3_5_moe.attention.rms_norm_eps", float(cfg["norm_eps"]))
 
     def shp(name: str) -> Tuple[int, ...]:
         with safe_open(mapping[name], framework="numpy") as f:

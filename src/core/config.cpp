@@ -45,6 +45,9 @@ Status ModelConfig::load(const std::string& gguf_path, ModelConfig* out) {
                             f.kv_int("qwen3_5_moe.context_length", d.n_ctx_train)));
   d.shared_expert = static_cast<int>(f.kv_int("sager.expert_shared_count",
                             f.kv_int("qwen3_5_moe.expert_shared_count", d.shared_expert)));
+  // Layers that are MoE (defaults to all blocks; Sage-A1.5 is fully MoE).
+  d.n_moe_layer   = static_cast<int>(f.kv_int("sager.moe_layer_count",
+                            f.kv_int("qwen3_5_moe.moe_layer_count", d.n_layer)));
 
   out->norm_eps     = static_cast<float>(f.kv_double("sager.attention.layer_norm_rms_epsilon",
                               f.kv_double("qwen3_5_moe.attention.layer_norm_rms_epsilon", 1e-6)));
