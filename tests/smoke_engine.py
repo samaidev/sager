@@ -122,14 +122,8 @@ def phase_long():
     print("SHUTDOWN:", json.dumps(e.resp()))
 
 
-def run_greedy(mtp_flag, n=40):
-    """One greedy generation on a fresh engine, MTP drafting on or off.
-
-    Greedy verification must keep the token stream bit-identical to plain
-    decoding, so the mtp=True and mtp=False runs have to agree token for
-    token - that is the correctness check; drafted/accepted check that the
-    speculative machinery actually runs.
-    """
+def run_gen(mtp_flag, n, **gen_kw):
+    """One generation on a fresh engine; gen params via kwargs."""
     e = Engine()
     e.send({"cmd": "load", "model": MODEL, "ctx": 4096, "vram_mb": 10240,
             "threads": 2, "graphs": True, "mtp": mtp_flag, "chunk": 8192,
@@ -138,11 +132,10 @@ def run_greedy(mtp_flag, n=40):
     assert r.get("type") == "loaded", r
     rng = np.random.default_rng(101)
     ids = rng.integers(1000, 31000, size=32).astype(int).tolist()
-    e.send({"cmd": "generate", "ids": ids, "max_tokens": n, "greedy": True,
-            "presence_penalty": 0.0, "repeat_penalty": 1.0, "seed": 1})
+    e.send({"cmd": "generate", "ids": ids, "max_tokens": n, "seed": 1, **gen_kw})
     toks, res = [], None
     while True:
-        r = e.resp("greedy")
+        r = e.resp("gen")
         if r.get("type") == "token":
             toks.append(r["id"])
         elif r.get("type") == "done":
@@ -155,14 +148,25 @@ def run_greedy(mtp_flag, n=40):
     return toks, res
 
 
+def run_greedy(mtp_flag, n=40):
+    """One greedy generation on a fresh engine, MTP drafting on or off.
+
+    Greedy verification must keep the token stream bit-identical to plain
+    decoding, so the mtp=True and mtp=False runs have to agree token for
+    token - that is the correctness check; drafted/accepted check that the
+    speculative machinery actually runs.
+    """
+    return run_gen(mtp_flag, n, greedy=True, presence_penalty=0.0,
+                   repeat_penalty=1.0)
+
+
 def phase_mtp():
     ta, ra = run_greedy(True)
     tb, rb = run_greedy(False)
-    print(f"  mtp:on  drafted={ra.get('drafted')} accepted={ra.get('accepted')} "
-          f"decode_tps={ra.get('decode_tps', 0):.1f} tokens={len(ta)}")
-    print(f"  mtp:off drafted={rb.get('drafted')} accepted={rb.get('accepted')} "
-          f"decode_tps={rb.get('decode_tps', 0):.1f} tokens={len(tb)}")
-    assert ra.get("drafted", 0) > 0, "MTP drafter produced no candidates"
+    print(f"  greedy mtp:on  drafted={ra.get('drafted')} "
+          f"accepted={ra.get('accepted')} decode_tps={ra.get('decode_tps', 0):.1f}")
+    print(f"  greedy mtp:off drafted={rb.get('drafted')} "
+          f"accepted={rb.get('accepted')} decode_tps={rb.get('decode_tps', 0):.1f}")
     if ta != tb:
         for i, (a, b) in enumerate(zip(ta, tb)):
             if a != b:
@@ -170,6 +174,25 @@ def phase_mtp():
                 break
         raise SystemExit("FAIL: speculative stream diverged from plain decode")
     print(f"  STREAMS IDENTICAL ({len(ta)} tokens) - bit-exact greedy chain")
+
+    # Isolate the MTP drafter from the suffix drafter: at temp=1.0 the token
+    # stream is non-repetitive, so the 3-gram suffix table goes quiet and any
+    # drafted candidates must come from the MTP head.
+    sa, ra2 = run_gen(True, 40, temperature=1.0, top_k=20, top_p=0.95,
+                      presence_penalty=0.0, repeat_penalty=1.0)
+    sb, rb2 = run_gen(False, 40, temperature=1.0, top_k=20, top_p=0.95,
+                      presence_penalty=0.0, repeat_penalty=1.0)
+    print(f"  temp   mtp:on  drafted={ra2.get('drafted')} "
+          f"accepted={ra2.get('accepted')}")
+    print(f"  temp   mtp:off drafted={rb2.get('drafted')} "
+          f"accepted={rb2.get('accepted')}")
+    assert ra2.get("drafted", 0) > 0, "MTP head drafted nothing at temp"
+    if rb2.get("drafted", 0) == 0 and sa == sb:
+        print("  MTP DRAFTER CONFIRMED (all temp-run drafts from the MTP head, "
+              "streams still identical)")
+    else:
+        print("  note: suffix drafter also active at temp, or one speculative "
+              "acceptance shifted the rng stream (benign)")
     print("PHASE mtp: PASS")
 
 
