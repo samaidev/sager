@@ -23,12 +23,16 @@ __global__ void rmsnorm_kernel(uint16_t* out, const uint16_t* x,
                                const uint16_t* w, int n, float eps) {
   __shared__ float red[32];
   const int tid = threadIdx.x;
-  const float v = tid < n ? ldh(x + tid) : 0.f;
-  float a = v * v;
+  const int stride = blockDim.x;              // capped at 1024 by the launcher
+  float acc = 0.f;
+  for (int i = tid; i < n; i += stride) {
+    const float v = ldh(x + i);
+    acc += v * v;
+  }
   const int lane = tid & 31, warp = tid >> 5;
   #pragma unroll
-  for (int off = 16; off > 0; off >>= 1) a += __shfl_down_sync(0xFFFFFFFFu, a, off);
-  if (lane == 0) red[warp] = a;
+  for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+  if (lane == 0) red[warp] = acc;
   __syncthreads();
   if (tid == 0) {
     float s = 0.f;
@@ -37,8 +41,8 @@ __global__ void rmsnorm_kernel(uint16_t* out, const uint16_t* x,
     red[0] = rsqrtf(s / static_cast<float>(n) + eps);
   }
   __syncthreads();
-  if (tid < n) {
-    sth(out + tid, v * red[0] * ldh(w + tid));
+  for (int i = tid; i < n; i += stride) {
+    sth(out + i, ldh(x + i) * red[0] * ldh(w + i));
   }
 }
 
@@ -147,7 +151,9 @@ void set_mrope_section(const int sec[3]) {
 
 void rmsnorm_f16(uint16_t* out, const uint16_t* x, const uint16_t* w, int n,
                  float eps, cudaStream_t stream) {
-  rmsnorm_kernel<<<1, ((n + 31) / 32) * 32, 0, stream>>>(out, x, w, n, eps);
+  int b = ((n + 31) / 32) * 32;
+  if (b > 1024) b = 1024;                     // CUDA block-dim limit
+  rmsnorm_kernel<<<1, b, 0, stream>>>(out, x, w, n, eps);
 }
 
 // Batched RMSNorm: one block per row (prefill / verify window).
@@ -156,14 +162,18 @@ __global__ void rmsnorm_batched_kernel(uint16_t* out, const uint16_t* x,
   __shared__ float red[32];
   const int row = blockIdx.x;
   const int tid = threadIdx.x;
+  const int stride = blockDim.x;              // capped at 1024 by the launcher
   const uint16_t* xr = x + static_cast<size_t>(row) * n;
   uint16_t* orow = out + static_cast<size_t>(row) * n;
-  const float v = tid < n ? ldh(xr + tid) : 0.f;
-  float a = v * v;
+  float acc = 0.f;
+  for (int i = tid; i < n; i += stride) {
+    const float v = ldh(xr + i);
+    acc += v * v;
+  }
   const int lane = tid & 31, warp = tid >> 5;
   #pragma unroll
-  for (int off = 16; off > 0; off >>= 1) a += __shfl_down_sync(0xFFFFFFFFu, a, off);
-  if (lane == 0) red[warp] = a;
+  for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+  if (lane == 0) red[warp] = acc;
   __syncthreads();
   if (tid == 0) {
     float s = 0.f;
@@ -172,13 +182,16 @@ __global__ void rmsnorm_batched_kernel(uint16_t* out, const uint16_t* x,
     red[0] = rsqrtf(s / static_cast<float>(n) + eps);
   }
   __syncthreads();
-  if (tid < n) sth(orow + tid, v * red[0] * ldh(w + tid));
+  for (int i = tid; i < n; i += stride) {
+    sth(orow + i, ldh(xr + i) * red[0] * ldh(w + i));
+  }
 }
 
 void rmsnorm_batched_f16(uint16_t* out, const uint16_t* x, const uint16_t* w,
                          int n, float eps, int n_rows, cudaStream_t stream) {
-  rmsnorm_batched_kernel<<<n_rows, ((n + 31) / 32) * 32, 0, stream>>>(
-      out, x, w, n, eps);
+  int b = ((n + 31) / 32) * 32;
+  if (b > 1024) b = 1024;
+  rmsnorm_batched_kernel<<<n_rows, b, 0, stream>>>(out, x, w, n, eps);
 }
 
 void add_f16(uint16_t* in_out, const uint16_t* residual, int n,

@@ -422,6 +422,17 @@ void Session::moe_dispatch_row(int layer, int row) {
                   cudaMemcpyDeviceToHost, s);
   stream_.sync();
 
+  // Host-side guard: a corrupted router output must never reach the cache or
+  // the pointer tables (turns a would-be OOB into a logged, skippable row).
+  for (int kk = 0; kk < K; ++kk) {
+    const int e0 = h_route_idx_[kk];
+    if (e0 < 0 || e0 >= E) {
+      SLOG_E("moe", "layer %d row %d: routed expert id %d outside [0,%d) - "
+                    "skipping MoE for this row", layer, row, e0, E);
+      return;
+    }
+  }
+
   int n_hit = 0, n_miss = 0;
   for (int kk = 0; kk < K; ++kk) {
     const int e = h_route_idx_[kk];

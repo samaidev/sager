@@ -43,14 +43,19 @@ __global__ void router_topk_kernel(const float* logits, int* idx,
       int best = -1;
       float bp = -1.f;
       for (int i = 0; i < n_expert; ++i) {
-        if (prob[i] > bp) { bp = prob[i]; best = i; }
+        const float p = prob[i];
+        // NaN-safe compare: a NaN prob (corrupt upstream logits) must never
+        // leave best = -1, which would become a host-side OOB in the cache.
+        if (p == p && p > bp) { bp = p; best = i; }
       }
+      if (best < 0) best = kk % n_expert;   // degenerate logits: deterministic
       prob[best] = -1.f;
       idx[kk] = best;
       weight[kk] = bp;
       wsum += bp;
     }
-    for (int kk = 0; kk < k; ++kk) weight[kk] /= wsum;  // renormalized top-k
+    if (wsum > 0.f)
+      for (int kk = 0; kk < k; ++kk) weight[kk] /= wsum;  // renormalized top-k
   }
 }
 
