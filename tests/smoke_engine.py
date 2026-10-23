@@ -122,12 +122,12 @@ def phase_long():
     print("SHUTDOWN:", json.dumps(e.resp()))
 
 
-def run_gen(mtp_flag, n, **gen_kw):
+def run_gen(mtp_flag, n, suffix=True, **gen_kw):
     """One generation on a fresh engine; gen params via kwargs."""
     e = Engine()
     e.send({"cmd": "load", "model": MODEL, "ctx": 4096, "vram_mb": 10240,
-            "threads": 2, "graphs": True, "mtp": mtp_flag, "chunk": 8192,
-            "kv_q8": True})
+            "threads": 2, "graphs": True, "mtp": mtp_flag, "suffix": suffix,
+            "chunk": 8192, "kv_q8": True})
     r = e.resp("load")
     assert r.get("type") == "loaded", r
     rng = np.random.default_rng(101)
@@ -175,24 +175,23 @@ def phase_mtp():
         raise SystemExit("FAIL: speculative stream diverged from plain decode")
     print(f"  STREAMS IDENTICAL ({len(ta)} tokens) - bit-exact greedy chain")
 
-    # Isolate the MTP drafter from the suffix drafter: at temp=1.0 the token
-    # stream is non-repetitive, so the 3-gram suffix table goes quiet and any
-    # drafted candidates must come from the MTP head.
-    sa, ra2 = run_gen(True, 40, temperature=1.0, top_k=20, top_p=0.95,
-                      presence_penalty=0.0, repeat_penalty=1.0)
-    sb, rb2 = run_gen(False, 40, temperature=1.0, top_k=20, top_p=0.95,
-                      presence_penalty=0.0, repeat_penalty=1.0)
+    # Isolate the MTP drafter: disable the suffix drafter and sample at
+    # temp=1.0. drafted>0 with suffix drafting off can only come from the
+    # MTP head; the mtp:off baseline must draft nothing.
+    sa, ra2 = run_gen(True, 40, suffix=False, temperature=1.0, top_k=20,
+                      top_p=0.95, presence_penalty=0.0, repeat_penalty=1.0)
+    sb, rb2 = run_gen(False, 40, suffix=False, temperature=1.0, top_k=20,
+                      top_p=0.95, presence_penalty=0.0, repeat_penalty=1.0)
     print(f"  temp   mtp:on  drafted={ra2.get('drafted')} "
           f"accepted={ra2.get('accepted')}")
     print(f"  temp   mtp:off drafted={rb2.get('drafted')} "
           f"accepted={rb2.get('accepted')}")
-    assert ra2.get("drafted", 0) > 0, "MTP head drafted nothing at temp"
+    assert ra2.get("drafted", 0) > 0, "MTP head drafted nothing (suffix off)"
     if rb2.get("drafted", 0) == 0 and sa == sb:
-        print("  MTP DRAFTER CONFIRMED (all temp-run drafts from the MTP head, "
-              "streams still identical)")
+        print("  MTP DRAFTER CONFIRMED (drafts only with the MTP head enabled, "
+              "streams identical)")
     else:
-        print("  note: suffix drafter also active at temp, or one speculative "
-              "acceptance shifted the rng stream (benign)")
+        print("  note: an MTP acceptance shifted the rng stream (benign)")
     print("PHASE mtp: PASS")
 
 

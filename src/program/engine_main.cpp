@@ -93,6 +93,8 @@ json::Value load_cmd(EngineState& es, const json::Value& req) {
   if (const auto* v = req.find("kv_q8")) cp.kv_q8 = v->as_bool(true);
   if (const auto* v = req.find("graphs")) cp.capture_graphs = v->as_bool(true);
   if (const auto* v = req.find("mtp")) cp.enable_mtp = v->as_bool(true);
+  if (const auto* v = req.find("suffix"))
+    cp.enable_suffix_draft = v->as_bool(true);
   if (const auto* v = req.find("mtp_max_draft"))
     cp.mtp_max_draft = static_cast<int>(v->as_int(3));
 
