@@ -46,6 +46,16 @@ cmake --build build -j
 ctest --test-dir build          # host-side Q4 contract tests (no GPU needed)
 ```
 
+Optional end-to-end GPU smoke (synthetic 1.3B model; exercises graph capture,
+chunked prefill, the hot/miss tiers and the CPU pool on real hardware):
+
+```bash
+python tools/make_smoke_gguf.py smoke.gguf
+python tests/smoke_engine.py hot    # all experts VRAM-resident
+python tests/smoke_engine.py cold   # 300 MB hot tier -> CPU-pool miss path
+python tests/smoke_engine.py long   # 9000-token prompt crosses the 8192 chunk
+```
+
 Requirements: CUDA toolkit 12.x (compute capability 7.5+), CMake ≥ 3.24, GCC/Clang with C++20. The AVX2 CPU pool needs AVX2/FMA (any x86-64 server since ~2013).
 
 ## Run (target: single T4)
