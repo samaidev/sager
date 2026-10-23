@@ -42,24 +42,36 @@ def read_gguf_dir(path: str):
         return f.read(n).decode()
 
     def rd_val(t: int):
-        if t == 8:
-            return rd_str()
+        # GGUF v3 spec ids (llama.cpp enum gguf_type): sizes must match exactly
+        # or the stream desyncs before the tensor directory.
+        if t == 0:
+            return f.read(1)[0]
+        if t == 1:
+            return struct.unpack("<b", f.read(1))[0]
+        if t == 2:
+            return struct.unpack("<H", f.read(2))[0]
+        if t == 3:
+            return struct.unpack("<h", f.read(2))[0]
         if t == 4:
             return struct.unpack("<I", f.read(4))[0]
         if t == 5:
+            return struct.unpack("<i", f.read(4))[0]
+        if t == 6:
             return struct.unpack("<f", f.read(4))[0]
         if t == 7:
             return bool(f.read(1)[0])
-        if t == 10:
-            return struct.unpack("<Q", f.read(8))[0]
-        if t == 3:
-            return struct.unpack("<i", f.read(4))[0]
-        if t == 6:
-            return struct.unpack("<d", f.read(8))[0]
+        if t == 8:
+            return rd_str()
         if t == 9:  # array
             et = struct.unpack("<I", f.read(4))[0]
             n = struct.unpack("<Q", f.read(8))[0]
             return [rd_val(et) for _ in range(n)]
+        if t == 10:
+            return struct.unpack("<Q", f.read(8))[0]
+        if t == 11:
+            return struct.unpack("<q", f.read(8))[0]
+        if t == 12:
+            return struct.unpack("<d", f.read(8))[0]
         raise ValueError(f"kv type {t}")
 
     kv = {}

@@ -16,9 +16,13 @@
 #     output.weight                          (v0.1 requires a Q4_K head)
 #
 # Usage:
-#   python tools/convert_hf_to_sager.py <hf_dir> <out.gguf> [--workers N]
+#   python tools/convert_hf_to_sager.py <hf_dir> <out.gguf> [--workers N] [--fast]
 #
-# Requires: torch, safetensors (pip install torch safetensors)
+# --fast: vectorized anchored quantization (no per-sub-block grid search).
+# ~100x faster; slightly worse RMSE. Intended for CI / smoke pipelines -
+# real conversions should keep the searched quantizer (default).
+#
+# Requires: numpy, safetensors (pip install numpy safetensors)
 from __future__ import annotations
 
 import argparse
@@ -32,11 +36,9 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 try:
-    import torch  # noqa: F401
+    from safetensors import safe_open  # type: ignore
 except ImportError:
-    sys.exit("torch is required: pip install torch")
-
-from safetensors import safe_open  # type: ignore
+    sys.exit("safetensors is required: pip install safetensors")
 
 GGUF_MAGIC = b"GGUF"
 T_F32, T_F16, T_Q4_K = 0, 1, 12
@@ -129,6 +131,48 @@ def quantize_q4_k(w: np.ndarray) -> bytes:
                     for r in range(rows))
 
 
+# Vectorized anchored quantization for --fast: same reconstruction contract
+# (w = d*d6*q - dmin*m6, spec bit layout) without the coarse/fine search.
+_QUANT_FAST = False   # set from --fast; inherited by forked pool workers
+
+
+def quantize_q4_k_fast(w: np.ndarray) -> bytes:
+    """[rows, cols] float32 -> Q4_K bytes, all super-blocks vectorized."""
+    assert w.shape[1] % 256 == 0, w.shape
+    x = np.ascontiguousarray(w, dtype=np.float32).reshape(-1)
+    nb = x.size // 256
+    xb = x.reshape(nb, 8, 32)
+    mn = xb.min(axis=2, keepdims=True)
+    mx = xb.max(axis=2, keepdims=True)
+    rng_ = np.maximum(mx - mn, 1e-30)
+    d = rng_.max(axis=1, keepdims=True)[:, 0:1] / 63.0
+    dmin = d
+    is_ = np.clip(np.rint(((mx - mn) / 15.0) / d), 1, 63)
+    im_ = np.clip(np.rint(-mn / dmin), 0, 63)
+    dd = d * is_
+    mm = dmin * im_
+    q = np.clip(np.rint((xb + mm) / dd), 0, 15).astype(np.uint8)
+    qs = (q[:, :, 0::2] & 0xF) | ((q[:, :, 1::2] & 0xF) << 4)
+    sc = np.zeros((nb, 12), dtype=np.uint8)
+    d6 = is_.astype(np.uint8).reshape(nb, 8)
+    m6 = im_.astype(np.uint8).reshape(nb, 8)
+    for j in range(4):
+        sc[:, j] |= d6[:, j] & 63
+        sc[:, j + 4] |= m6[:, j] & 63
+    for j in range(4, 8):
+        sc[:, j + 4] |= d6[:, j] & 0xF
+        sc[:, j - 4] |= (d6[:, j] >> 4) << 6
+        sc[:, j + 4] |= (m6[:, j] & 0xF) << 4
+        sc[:, j] |= (m6[:, j] >> 4) << 6
+    d16 = np.ascontiguousarray(d[:, 0], dtype=np.float16).view(np.uint8).reshape(-1)
+    block = np.zeros((nb, 144), dtype=np.uint8)
+    block[:, 0:2] = d16.reshape(nb, 2)
+    block[:, 2:4] = d16.reshape(nb, 2)   # dmin = d
+    block[:, 4:16] = sc
+    block[:, 16:] = qs.reshape(nb, 128)
+    return block.tobytes()
+
+
 # ---------------------------------------------------------------------------
 # GGUF writer
 # ---------------------------------------------------------------------------
@@ -163,7 +207,8 @@ class GGUFWriter:
 
     def add_tensor(self, name: str, w: np.ndarray, qtype: int) -> None:
         if qtype == T_Q4_K:
-            data = quantize_q4_k(np.ascontiguousarray(w, dtype=np.float32))
+            a = np.ascontiguousarray(w, dtype=np.float32)
+            data = (quantize_q4_k_fast(a) if _QUANT_FAST else quantize_q4_k(a))
             dims = [w.shape[1], w.shape[0]]           # gguf: fastest first
         elif qtype == T_F16:
             data = np.ascontiguousarray(w, dtype=np.float16).tobytes()
@@ -284,7 +329,9 @@ def _convert_expert_layer(args) -> List[Tuple[str, np.ndarray, int]]:
     ]
 
 
-def convert(hf_dir: str, out_path: str, workers: int) -> None:
+def convert(hf_dir: str, out_path: str, workers: int, fast: bool = False) -> None:
+    global _QUANT_FAST
+    _QUANT_FAST = fast
     cfg = cfg_from_hf(hf_dir)
     mapping = find_weights(hf_dir)
     w = GGUFWriter()
@@ -355,7 +402,6 @@ def convert(hf_dir: str, out_path: str, workers: int) -> None:
         w.add_tensor("mtp.fc.weight", src("mtp.fc.weight"), T_F16)
     if "mtp.proj_out.weight" in mapping:
         w.add_tensor("mtp.proj_out.weight", src("mtp.proj_out.weight"), T_F16)
-
     L = cfg["n_layer"]
     for layer in range(L):
         p = f"model.layers.{layer}."
@@ -377,21 +423,23 @@ def convert(hf_dir: str, out_path: str, workers: int) -> None:
             w.add_tensor(f"blk.{layer}.ffn_down_shexp", src(p + "mlp.shared_expert.down_proj.weight"), T_Q4_K)
 
     # experts in parallel (the expensive part)
-    print(f"[convert] quantizing {L} expert stacks with {workers} workers ...")
+    print(f"[convert] quantizing {L} expert stacks with {workers} workers "
+          f"({'fast' if fast else 'searched'}) ...")
     jobs = [(layer, mapping, cfg["n_expert"]) for layer in range(L)]
+    qexp = quantize_q4_k_fast if fast else quantize_q4_k
     if workers <= 1:
         for j in jobs:
             for name, arr, t in _convert_expert_layer(j):
                 print(f"[convert]   {name} {arr.shape}")
                 w.tensors.append((name, list(reversed(arr.shape)), t,
-                                  quantize_q4_k(np.ascontiguousarray(arr, dtype=np.float32))))
+                                  qexp(np.ascontiguousarray(arr, dtype=np.float32))))
     else:
         with ProcessPoolExecutor(max_workers=workers) as ex:
             for res in ex.map(_convert_expert_layer, jobs):
                 for name, arr, t in res:
                     print(f"[convert]   {name} {arr.shape}")
                     w.tensors.append((name, list(reversed(arr.shape)), t,
-                                      quantize_q4_k(np.ascontiguousarray(arr, dtype=np.float32))))
+                                      qexp(np.ascontiguousarray(arr, dtype=np.float32))))
 
     w.write(out_path)
     print(f"[convert] done. Validate with: "
@@ -404,5 +452,8 @@ if __name__ == "__main__":
     ap.add_argument("hf_dir")
     ap.add_argument("out_gguf")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) // 2))
+    ap.add_argument("--fast", action="store_true",
+                    help="vectorized anchored quantization (no grid search); "
+                         "~100x faster, slightly worse RMSE - for CI/smoke")
     a = ap.parse_args()
-    convert(a.hf_dir, a.out_gguf, a.workers)
+    convert(a.hf_dir, a.out_gguf, a.workers, a.fast)
