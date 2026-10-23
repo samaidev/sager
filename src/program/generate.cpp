@@ -145,7 +145,9 @@ Status run_generation(Session& s, SpecController& ctrl, MtpDrafter& mtp,
   ctx.insert(ctx.end(), p.prompt_ids.end() - std::min<size_t>(p.prompt_ids.size(), 4096),
              p.prompt_ids.end());
   suffix.reset();
-  suffix.set_max_draft(5);
+  // max_draft comes from the load-time config (enable_suffix_draft /
+  // suffix_max_draft); do not override it here - the disable switch and the
+  // MTP-isolation smoke both rely on it being respected.
   suffix.update(ctx, 3);
 
   std::vector<float> cur_logits(s.last_logits(), s.last_logits() + n_vocab);
