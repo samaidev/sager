@@ -17,6 +17,7 @@ namespace sager {
 class SuffixDrafter {
  public:
   void set_max_draft(int n) { max_draft_ = n; }
+  int  max_draft() const { return max_draft_; }
 
   // Rebuild (incrementally) the n-gram index from `context` (recent tokens).
   void update(const std::vector<int>& context, int from_pos);

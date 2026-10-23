@@ -152,6 +152,8 @@ Status run_generation(Session& s, SpecController& ctrl, MtpDrafter& mtp,
 
   std::vector<float> cur_logits(s.last_logits(), s.last_logits() + n_vocab);
   const double decode_t0 = now_ms();
+  SLOG_I("gen", "drafters: suffix_max=%d mtp_ready=%d mtp_max=%d",
+         suffix.max_draft(), mtp.ready() ? 1 : 0, mtp.max_draft());
 
   while (out->tokens < p.max_tokens) {
     if (abort && *abort) { out->status = Status::kAborted; break; }
