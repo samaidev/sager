@@ -221,6 +221,17 @@ Status Session::prepare() {
   s = alloc_scratch();
   if (s != Status::kOk) return s;
 
+  // Zero the graph-safe decode param block and position ids BEFORE any warmup
+  // or capture: the dense body indexes the KV slab at SeqParams.pos, and an
+  // uninitialized block sends the warmup launches out of bounds, which
+  // poisons the CUDA context (every later kernel silently no-ops).
+  cudaMemset(d_params_.get(), 0, sizeof(SeqParams));
+  cudaMemset(d_pos_ids_.get(), 0, 3 * sizeof(int));
+  cudaMemset(d_recent_.get(), 0, kMaxRecent * sizeof(int));
+  cudaMemset(x_.get(), 0, static_cast<size_t>(cp_.chunk_prefill) * d.hidden *
+                              sizeof(uint16_t));
+  cudaMemset(route_idx_.get(), 0, (d.n_expert_used + 1) * sizeof(int));
+
   // Static combine extension: slot K carries the shared expert with weight 1.
   // (Buffers above are sized [K+1]; these writes must come after alloc_scratch,
   //  which allocates both the pinned staging and the device route slots.)
@@ -338,11 +349,13 @@ Status Session::capture_graphs() {
     dense_layer_launch(L, 1);
     cudaGraph_t graph = nullptr;
     if (cudaStreamEndCapture(stream_.get(), &graph) != cudaSuccess) {
-      return Status::kCudaError;
+      cudaGetLastError();   // pop the capture error: keep the stream usable
+      return Status::kCudaError;   // for the eager fallback path
     }
     cudaGraphExec_t exec = nullptr;
     if (cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) != cudaSuccess) {
       cudaGraphDestroy(graph);
+      cudaGetLastError();
       return Status::kCudaError;
     }
     cudaGraphDestroy(graph);
