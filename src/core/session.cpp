@@ -213,14 +213,6 @@ Status Session::prepare() {
   // mrope section boundaries -> device constant memory (graph-safe: fixed).
   cuda::set_mrope_section(mc_.mrope_section.data());
 
-  // Static combine extension: slot K carries the shared expert with weight 1.
-  h_route_idx_[d.n_expert_used] = 0;
-  h_route_w_[d.n_expert_used] = 1.0f;
-  cudaMemcpy(route_idx_.get(), h_route_idx_.get(),
-             (d.n_expert_used + 1) * sizeof(int), cudaMemcpyHostToDevice);
-  cudaMemcpy(route_w_.get(), h_route_w_.get(),
-             (d.n_expert_used + 1) * sizeof(float), cudaMemcpyHostToDevice);
-
   // CPU expert pool (C4: geometry validated at bind time).
   const PoolGeometry want{d.hidden, d.n_ff_exp, E, q4k::kBlockBytes};
   s = pool_.start(cp_.batch_threads, want);
@@ -228,6 +220,16 @@ Status Session::prepare() {
 
   s = alloc_scratch();
   if (s != Status::kOk) return s;
+
+  // Static combine extension: slot K carries the shared expert with weight 1.
+  // (Buffers above are sized [K+1]; these writes must come after alloc_scratch,
+  //  which allocates both the pinned staging and the device route slots.)
+  h_route_idx_[d.n_expert_used] = 0;
+  h_route_w_[d.n_expert_used] = 1.0f;
+  cudaMemcpy(route_idx_.get(), h_route_idx_.get(),
+             (d.n_expert_used + 1) * sizeof(int), cudaMemcpyHostToDevice);
+  cudaMemcpy(route_w_.get(), h_route_w_.get(),
+             (d.n_expert_used + 1) * sizeof(float), cudaMemcpyHostToDevice);
 
   kv_.init({d.n_layer, d.n_head_kv, d.head_dim, cp_.n_ctx, cp_.kv_q8});
 
