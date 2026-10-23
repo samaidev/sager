@@ -1,0 +1,45 @@
+# GitHub Actions workflow for SAGER.
+#
+# To enable: copy this file to .github/workflows/ci.yml. Pushing a workflow
+# file requires the PAT to carry the `workflow` scope, which the initial
+# push token did not - hence it ships as an example.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ python3-pip
+          pip install numpy
+      - name: Configure (CPU-only, no GPU on runners)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DSAGER_ENABLE_CUDA=OFF
+      - name: Build
+        run: cmake --build build -j
+      - name: Q4 host contract tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Python syntax (serve, tools, bench)
+        run: |
+          python3 -m py_compile serve/server.py serve/engine_proc.py serve/tokenizer.py
+          python3 -m py_compile tools/convert_hf_to_sager.py tools/validate_quant.py tools/chat.py
+          python3 -m py_compile bench/bench.py
+
+  cuda-build:
+    runs-on: [self-hosted, gpu, t4]
+    if: false   # enable when a T4 runner is attached
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j
+      - name: Tests (host suite)
+        run: ctest --test-dir build --output-on-failure

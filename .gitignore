@@ -1,0 +1,50 @@
+# Build artifacts
+build/
+build-*/
+out/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# CUDA build junk
+*.cu.o
+*.d
+.ninja*
+compile_commands.json
+CMakeUserPresets.json
+
+# Model weights & caches (never commit weights)
+*.gguf
+*.safetensors
+*.bin
+weights/
+models/
+.cache/
+expert_profiles/*.sagerprof
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Runtime logs
+logs/
+*.log
+sager.conf.local
