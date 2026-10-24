@@ -944,7 +944,20 @@ void Session::moe_dispatch_batched(int layer, int n) {
           hot_->tables_host[base + 2 * static_cast<size_t>(E)]);
     } else if (streaming) {
       // tier 0b: stream-all ring (the pair was planned at chunk start)
-      const int slot = pump_->stream_lookup(layer, e);
+      // v0.2.4b: a lookup timeout on the CURRENT layer's pair means the
+      // loader is merely BEHIND (the walk is sequential and the pair is
+      // still ahead of it - the loader only skips pairs of layers that
+      // already passed, and we ARE the current layer). Waiting for the
+      // copy is strictly better than the CPU pool on a weak host:
+      // measured on a 2-vCPU Colab T4, one cold chunk stalled 152 pairs
+      // x 2 s and then paid ~1.5 s per expert on the CPU pool (316 s for
+      // a 5.8 GB chunk); the disk itself only needed 22 s. Retry the
+      // lookup - each attempt is cv-driven and returns as soon as the
+      // slot publishes - with a ~120 s budget before truly giving up.
+      int slot = pump_->stream_lookup(layer, e);
+      for (int retry = 0; slot < 0 && retry < 60; ++retry) {
+        slot = pump_->stream_lookup(layer, e);
+      }
       if (slot >= 0) {
         pump_->stream_wait(s, slot);
         j.ring_slot = slot;
@@ -953,8 +966,9 @@ void Session::moe_dispatch_batched(int layer, int n) {
         j.wu = base + (hot_->per_expert_bytes / 3) / q4k::kBlockBytes;
         j.wo = base + 2 * (hot_->per_expert_bytes / 3) / q4k::kBlockBytes;
       } else {
-        // Arm timeout: give up on the pair for this chunk AND release its
-        // slot if the loader did land it meanwhile (no GEMM will read it).
+        // Loader genuinely failed (read error / wedged session): give up
+        // on the pair for this chunk AND release its slot if the loader
+        // did land it meanwhile (no GEMM will read it).
         pump_->stream_consume_drop(layer, e);
       }
     } else if (pump_) {
