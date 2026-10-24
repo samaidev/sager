@@ -242,7 +242,8 @@ void gdn_conv_step_f16(uint16_t* conv_out, uint16_t* conv_state,
 void gdn_l2_norm_f16(uint16_t* qn, uint16_t* kn, const uint16_t* conv_out,
                      int nk, int K, float eps, cudaStream_t stream) {
   const int block = 128;
-  const size_t smem = (static_cast<size_t>(K) + 1) * sizeof(float);
+  // vals[K] + red[block]: block_sum_reduce writes red[tid] for every thread.
+  const size_t smem = (static_cast<size_t>(K) + block) * sizeof(float);
   gdn_l2_norm_kernel<<<nk, block, smem, stream>>>(qn, kn, conv_out, K, eps);
 }
 
@@ -261,7 +262,8 @@ void gdn_out_norm_f16(uint16_t* out, const uint16_t* y, const uint16_t* z,
                       const uint16_t* w_on, int nv, int V, float eps,
                       cudaStream_t stream) {
   const int block = pow2_block(V);
-  const size_t smem = (static_cast<size_t>(V) + 1) * sizeof(float);
+  // vals[V] + red[block]: block_sum_reduce writes red[tid] for every thread.
+  const size_t smem = (static_cast<size_t>(V) + block) * sizeof(float);
   gdn_out_norm_kernel<<<nv, block, smem, stream>>>(out, y, z, w_on, V, eps);
 }
 
