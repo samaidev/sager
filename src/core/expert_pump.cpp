@@ -507,6 +507,24 @@ void ExpertPump::loader_loop(int tid) {
     const int e = packed % n_experts_;
     const size_t p = static_cast<size_t>(packed);
 
+    // v0.2.4: prime the page cache AHEAD of the walk (fd-based, no mmap).
+    // Steady state on hosts whose RAM is smaller than the pool (12.7 GB RAM
+    // vs the 16.9 GB pool on a Colab T4) re-reads the cold fraction of every
+    // chunk from disk (~261 MB/s measured) - a POSIX_FADV_WILLNEED hint ~64
+    // pairs (~108 MB) ahead turns those cold preads into overlapping
+    // readahead instead of loader-thread stalls. Fire-and-forget: the
+    // syscall is a hint and its return value carries no actionable error.
+    {
+      const size_t ahead = i + 64;
+      if (ahead < plan_.pairs.size()) {
+        const size_t pa = static_cast<size_t>(plan_.pairs[ahead]);
+        posix_fadvise(pool_fd_,
+                      static_cast<off_t>(pa) *
+                          static_cast<off_t>(per_expert_bytes_),
+                      per_expert_bytes_, POSIX_FADV_WILLNEED);
+      }
+    }
+
     // Session progress check 1: the session already passed this layer - the
     // pair will never be consumed, loading it would only clog a slot.
     if (L < done_layer_.load(std::memory_order_relaxed)) {
