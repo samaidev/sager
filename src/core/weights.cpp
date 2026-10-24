@@ -12,6 +12,7 @@
 #ifndef _WIN32
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -544,6 +545,7 @@ Status Weights::load_expert_pool(gguf::File& f, const ModelConfig& cfg) {
   // the full expert set (e.g. a 12 GB Colab against a 17 GB expert pool):
   // the kernel pages cold experts out, the pump faults them back on demand.
   // Slower than pinned RAM, but it keeps every address stable.
+  bool fill_pool = true;
   const auto pool_file_opt = env_get("SAGER_EXPERT_POOL_FILE");
   if (pool_file_opt) {
     const char* pool_file = pool_file_opt->c_str();
@@ -552,19 +554,51 @@ Status Weights::load_expert_pool(gguf::File& f, const ModelConfig& cfg) {
     // MAP_SHARED - the kernel pages it in/out through the page cache, so a
     // box whose RAM is smaller than the expert set still loads (no swap
     // needed). Cold experts fault back from the file on demand.
-    const int fd = ::open(pool_file, O_RDWR | O_CREAT, 0644);
-    if (fd >= 0 && ::ftruncate(fd, static_cast<off_t>(expert_pool_bytes_)) == 0) {
-      void* m = ::mmap(nullptr, expert_pool_bytes_, PROT_READ | PROT_WRITE,
-                       MAP_SHARED, fd, 0);
-      if (m != MAP_FAILED) {
-        expert_pool_host_ = static_cast<uint8_t*>(m);
-        pool_map_fd_ = fd;
-        pool_map_size_ = expert_pool_bytes_;
-        SLOG_I("weights", "expert pool backing: file %s (%.1f GB, page cache)",
-               pool_file, expert_pool_bytes_ / 1073741824.0);
+    //
+    // Fast path (SAGER_EXPERT_POOL_REUSE=1): a same-size pool file from a
+    // previous identical build is trusted as-is - the fill below is
+    // deterministic from the GGUF + requant code - which turns a ~30 min
+    // cold load into ~3 min on ephemeral boxes. Delete the file (or unset
+    // the flag) to force a rebuild.
+    if (env_flag("SAGER_EXPERT_POOL_REUSE")) {
+      const int rfd = ::open(pool_file, O_RDWR);
+      if (rfd >= 0) {
+        struct stat rst {};
+        bool reused = false;
+        if (::fstat(rfd, &rst) == 0 &&
+            static_cast<unsigned long long>(rst.st_size) ==
+                static_cast<unsigned long long>(expert_pool_bytes_)) {
+          void* m = ::mmap(nullptr, expert_pool_bytes_, PROT_READ | PROT_WRITE,
+                           MAP_SHARED, rfd, 0);
+          if (m != MAP_FAILED) {
+            expert_pool_host_ = static_cast<uint8_t*>(m);
+            pool_map_fd_ = rfd;
+            pool_map_size_ = expert_pool_bytes_;
+            fill_pool = false;
+            reused = true;
+            SLOG_I("weights", "expert pool REUSED: %s (%.1f GB, size match) - "
+                   "remove the file or unset SAGER_EXPERT_POOL_REUSE to rebuild",
+                   pool_file, expert_pool_bytes_ / 1073741824.0);
+          }
+        }
+        if (!reused) ::close(rfd);
       }
     }
-    if (!expert_pool_host_ && fd >= 0) ::close(fd);
+    if (!expert_pool_host_) {
+      const int fd = ::open(pool_file, O_RDWR | O_CREAT, 0644);
+      if (fd >= 0 && ::ftruncate(fd, static_cast<off_t>(expert_pool_bytes_)) == 0) {
+        void* m = ::mmap(nullptr, expert_pool_bytes_, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, fd, 0);
+        if (m != MAP_FAILED) {
+          expert_pool_host_ = static_cast<uint8_t*>(m);
+          pool_map_fd_ = fd;
+          pool_map_size_ = expert_pool_bytes_;
+          SLOG_I("weights", "expert pool backing: file %s (%.1f GB, page cache)",
+                 pool_file, expert_pool_bytes_ / 1073741824.0);
+        }
+      }
+      if (!expert_pool_host_ && fd >= 0) ::close(fd);
+    }
 #endif
   }
   if (!expert_pool_host_) {
@@ -581,6 +615,7 @@ Status Weights::load_expert_pool(gguf::File& f, const ModelConfig& cfg) {
   const size_t gu = tile(static_cast<size_t>(d.n_ff_exp), static_cast<size_t>(d.hidden));
   const size_t dn = tile(static_cast<size_t>(d.hidden), static_cast<size_t>(d.n_ff_exp));
 
+  if (fill_pool) {
   for (int L = 0; L < d.n_moe_layer; ++L) {
     for (int e = 0; e < d.n_expert; ++e) {
       uint8_t* dst = expert_pool_host_ +
@@ -622,6 +657,9 @@ Status Weights::load_expert_pool(gguf::File& f, const ModelConfig& cfg) {
   }
   SLOG_I("weights", "expert pool: %d experts x %.2f MB = %.1f GB pinned host RAM",
          d.experts_total(), ebytes / 1048576.0, expert_pool_bytes_ / 1073741824.0);
+  } else {
+    SLOG_I("weights", "expert pool fill skipped (reused existing file)");
+  }
   return Status::kOk;
 }
 
