@@ -100,9 +100,17 @@ void out_norm(uint16_t* out, const uint16_t* y, const uint16_t* z,
 
 }  // namespace gdn_cpu
 
+}  // namespace sager
+
 // ---- CUDA launchers (decode step, one token; prefill loops per token) ------
+// NOTE: this include MUST stay at global scope. Putting <cuda_runtime.h>
+// inside `namespace sager` makes CUDA 13's cuda_runtime.h (line 148) pull
+// libstdc++'s <utility> INSIDE the namespace - std::pair becomes
+// sager::std::pair and GCC 13 emits ~79 "is_nothrow_move_constructible was
+// not declared in this scope" errors. First caught by the T4 build.
 #if defined(SAGER_HAVE_CUDA)
 #include <cuda_runtime.h>
+namespace sager {
 namespace cuda {
 
 void gdn_gate_f32(const uint16_t* ba, const float* A_log, const float* dt_bias,
@@ -127,6 +135,6 @@ void gdn_out_norm_f16(uint16_t* out, const uint16_t* y, const uint16_t* z,
                       cudaStream_t stream);
 
 }  // namespace cuda
-#endif  // SAGER_HAVE_CUDA
 
 }  // namespace sager
+#endif  // SAGER_HAVE_CUDA
