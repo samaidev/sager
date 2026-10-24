@@ -576,6 +576,25 @@ Status Weights::load_expert_pool(gguf::File& f, const ModelConfig& cfg) {
             pool_map_size_ = expert_pool_bytes_;
             fill_pool = false;
             reused = true;
+            // v0.2.3: the prefill streamer reads this file strictly in
+            // (layer, expert) order = increasing offsets - tell the kernel
+            // so its readahead tracks the walk, and start pulling the first
+            // SAGER_PF_WARM_MB into the page cache while the GGUF load runs.
+            ::posix_fadvise(rfd, 0, 0, POSIX_FADV_SEQUENTIAL);
+            if (!env_flag("SAGER_PF_WARM_OFF")) {
+              const long warm_mb = env_get("SAGER_PF_WARM_MB")
+                  ? std::max(0L, std::atol(env_get("SAGER_PF_WARM_MB")->c_str()))
+                  : 3072L;
+              if (warm_mb > 0) {
+                const long long warm_bytes =
+                    std::min<long>(warm_mb, 8192L) * 1024LL * 1024LL;
+                ::posix_fadvise(rfd, 0,
+                                static_cast<off_t>(std::min<long long>(
+                                    warm_bytes,
+                                    static_cast<long long>(expert_pool_bytes_))),
+                                POSIX_FADV_WILLNEED);
+              }
+            }
             SLOG_I("weights", "expert pool REUSED: %s (%.1f GB, size match) - "
                    "remove the file or unset SAGER_EXPERT_POOL_REUSE to rebuild",
                    pool_file, expert_pool_bytes_ / 1073741824.0);

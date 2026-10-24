@@ -156,6 +156,46 @@ void attention_prefill_f16(uint16_t* out, const uint16_t* q,
 void router_topk(const float* logits, int* idx, float* weight, int n_expert,
                  int n_expert_used, cudaStream_t stream);
 
+// v0.2.3 batched prefill path:
+// Top-k for n_rows routers at once; logits [n_rows x n_expert], results at
+// [row * idx_stride + kk] (idx_stride is usually K+1 so the shared-expert
+// combine slot stays host-managed).
+void router_topk_batched(const float* logits, int* idx, float* weight,
+                         int n_expert, int n_expert_used, int idx_stride,
+                         int n_rows, cudaStream_t stream);
+
+// dst[r] = src[src_rows[r]] for whole BlockQ8K activation rows (the routed
+// rows are compacted expert-major before the per-expert GEMMs).
+void gather_rows_q8(q4k::BlockQ8K* dst, const q4k::BlockQ8K* src,
+                    const int* src_rows, int n_rows, int row_blocks,
+                    cudaStream_t stream);
+
+// Compact per-expert outputs back into the combine slab:
+// expert_y[row * (k_slots) * hidden + kk * hidden + i] =
+//     grouped_out[gslot[row * n_used + kk] * hidden + i]   (gslot < 0: skip)
+// where k_slots = n_used + 1 (last slot = shared expert, host-copied).
+void scatter_routed_f16(uint16_t* expert_y, const uint16_t* grouped_out,
+                        const int* gslot, int n_rows, int n_used, int hidden,
+                        cudaStream_t stream);
+
+// Batched combine: out[row] = residual + sum_kk weight[row, kk] * expert_y
+// [row, kk]; slots are positional (k_slots = n_used, shared folded in by the
+// caller), no idx indirection needed.
+void moe_combine_batched_f16(uint16_t* out, const uint16_t* expert_y,
+                             const float* weight, int n_used, int hidden,
+                             int n_rows, cudaStream_t stream);
+
+// Batched shared-expert scalar gate: out[row * hidden + i] *= sigmoid(g[row]).
+void sigmoid_gate_scalar_batched_f16(uint16_t* out, const float* g,
+                                     int n_rows, int hidden,
+                                     cudaStream_t stream);
+
+// CPU-pool fallback results into the batched combine slab:
+// dst[dst_flat[i]] = fp16(src row i); dst_flat holds full element offsets.
+void scatter_rows_generic_f16(uint16_t* dst, const uint16_t* src,
+                              const int* dst_flat, int n_list, int hidden,
+                              cudaStream_t stream);
+
 // Combine: out = residual + sum_k weight[k] * expert_out[k]
 // (+ shared_out already folded into expert_out by the caller's row setup).
 void moe_combine_f16(uint16_t* out, const uint16_t* expert_out,

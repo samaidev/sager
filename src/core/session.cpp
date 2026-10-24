@@ -147,14 +147,34 @@ Status Session::alloc_scratch() {
   if (!ok(d_m1_.alloc(H), "d_m1_")) return Status::kOomVram;
 
   // MoE working set
+  // v0.2.3: slabs sized for the batched prefill walk (RT-token chunks; the
+  // per-row decode path only ever touches the first K rows of each).
+  const int RT = pf_batched_
+      ? std::max(1, std::min(T > 0 ? T : 1, pf_chunk_cap_))
+      : 1;
+  const long Rmax = static_cast<long>(RT) * K;
+  if (!ok(expert_g2_.alloc(static_cast<size_t>(Rmax) * FFX), "expert_g2_")) return Status::kOomVram;
+  if (!ok(expert_u2_.alloc(static_cast<size_t>(Rmax) * FFX), "expert_u2_")) return Status::kOomVram;
   if (!ok(expert_g_.alloc(static_cast<size_t>(K) * FFX), "expert_g_")) return Status::kOomVram;
   if (!ok(expert_u_.alloc(static_cast<size_t>(K) * FFX), "expert_u_")) return Status::kOomVram;
-  if (!ok(expert_y_.alloc(static_cast<size_t>(K + 1) * H), "expert_y_")) return Status::kOomVram;
+  if (!ok(expert_y_.alloc(static_cast<size_t>(RT) * (K + 1) * H), "expert_y_")) return Status::kOomVram;
+  if (!ok(shared_yb_.alloc(static_cast<size_t>(RT) * H), "shared_yb_")) return Status::kOomVram;
+  if (!ok(sh_g_.alloc(static_cast<size_t>(RT) * FFX), "sh_g_")) return Status::kOomVram;
+  if (!ok(sh_u_.alloc(static_cast<size_t>(RT) * FFX), "sh_u_")) return Status::kOomVram;
+  if (!ok(y_grouped_.alloc(static_cast<size_t>(Rmax) * H), "y_grouped_")) return Status::kOomVram;
+  if (!ok(d_xqg_.alloc(static_cast<size_t>(Rmax) * (H / q4k::kQK_K)), "d_xqg_")) return Status::kOomVram;
+  if (!ok(d_hqg_.alloc(std::max<size_t>(static_cast<size_t>(Rmax) * (FFX / q4k::kQK_K),
+                                        static_cast<size_t>(RT) * (FFX / q4k::kQK_K))),
+         "d_hqg_")) return Status::kOomVram;
+  if (!ok(d_sgate_.alloc(RT), "d_sgate_")) return Status::kOomVram;
+  if (!ok(d_grows_.alloc(Rmax), "d_grows_")) return Status::kOomVram;
+  if (!ok(d_gslot_.alloc(static_cast<size_t>(RT) * K), "d_gslot_")) return Status::kOomVram;
+  if (!ok(d_cflat_.alloc(pf_cpu_cap_), "d_cflat_")) return Status::kOomVram;
   if (!ok(shared_y_.alloc(static_cast<size_t>(H) + 2 * FFX), "shared_y_")) return Status::kOomVram;
-  if (!ok(route_logits_.alloc(E), "route_logits_")) return Status::kOomVram;
-  if (!ok(route_idx_.alloc(K + 1), "route_idx_")) return Status::kOomVram;
-  if (!ok(route_w_.alloc(K + 1), "route_w_")) return Status::kOomVram;
-  if (!ok(d_miss_y_.alloc(static_cast<size_t>(K) * H), "d_miss_y_")) return Status::kOomVram;
+  if (!ok(route_logits_.alloc(static_cast<size_t>(RT) * E), "route_logits_")) return Status::kOomVram;
+  if (!ok(route_idx_.alloc(static_cast<size_t>(RT) * (K + 1)), "route_idx_")) return Status::kOomVram;
+  if (!ok(route_w_.alloc(static_cast<size_t>(RT) * (K + 1)), "route_w_")) return Status::kOomVram;
+  if (!ok(d_miss_y_.alloc(static_cast<size_t>(pf_cpu_cap_) * H), "d_miss_y_")) return Status::kOomVram;
   if (!ok(d_slot_of_k_.alloc(K), "d_slot_of_k_")) return Status::kOomVram;
   if (!ok(d_hit_rows_.alloc(K), "d_hit_rows_")) return Status::kOomVram;
   if (!ok(d_ptrs_hit_.alloc(3 * K), "d_ptrs_hit_")) return Status::kOomVram;
@@ -180,7 +200,7 @@ Status Session::alloc_scratch() {
   // v0.2 expert pump staging
   if (!ok(d_ptrs_pump_.alloc(3 * K), "d_ptrs_pump_")) return Status::kOomVram;
   if (!ok(d_pump_rows_.alloc(K), "d_pump_rows_")) return Status::kOomVram;
-  if (!ok(d_xq_moe_.alloc(H / q4k::kQK_K), "d_xq_moe_")) return Status::kOomVram;
+  if (!ok(d_xq_moe_.alloc(static_cast<size_t>(RT) * (H / q4k::kQK_K)), "d_xq_moe_")) return Status::kOomVram;
 
   // v0.2 GDN working set (fixed addresses; state slabs are per linear layer)
   const GdnParams g = mc_.gdn();
@@ -199,9 +219,13 @@ Status Session::alloc_scratch() {
                                  g.state_elems()), "lin_delta_state_")) return Status::kOomVram;
 
   // Host staging (pinned, C1: the SAME regions every call)
-  if (!h_route_idx_.alloc(K + 1) || !h_route_w_.alloc(K + 1) ||
-      !h_x16_.alloc(H) || !miss_x_.alloc(H) ||
-      !miss_y_.alloc(static_cast<size_t>(K) * H) ||
+  if (!h_route_idx_.alloc(static_cast<size_t>(RT) * (K + 1)) ||
+      !h_route_w_.alloc(static_cast<size_t>(RT) * (K + 1)) ||
+      !h_grows_.alloc(Rmax) || !h_gslot_.alloc(static_cast<size_t>(RT) * K) ||
+      !h_cflat_.alloc(pf_cpu_cap_) ||
+      !h_x16_.alloc(static_cast<size_t>(RT) * H) ||
+      !miss_x_.alloc(static_cast<size_t>(pf_cpu_cap_) * H) ||
+      !miss_y_.alloc(static_cast<size_t>(pf_cpu_cap_) * H) ||
       !logits_host_.alloc(V) || !h_ptrs_.alloc(3 * K) ||
       !h_hit_rows_.alloc(K) || !h_slot_of_k_.alloc(K) ||
       !h_pump_ptrs_.alloc(3 * K) || !h_pump_rows_.alloc(K)) {
@@ -216,6 +240,29 @@ Status Session::prepare() {
     SLOG_E("session", "prepare called before weights load");
     return Status::kInvalidArgument;
   }
+
+  // v0.2.3 prefill knobs (before alloc_scratch - they size the route slabs).
+  {
+    const auto b = env_get("SAGER_PF_BATCHED");
+    if (b) pf_batched_ = (*b != "0");
+    const auto sm = env_get("SAGER_PF_STREAM_MIN");
+    if (sm) pf_stream_min_ = std::max(1, std::atoi(sm->c_str()));
+    const auto cc = env_get("SAGER_PF_CHUNK");
+    if (cc) pf_chunk_cap_ = std::max(64, std::atoi(cc->c_str()));
+    const auto crc = env_get("SAGER_PF_CPU_ROWS");
+    if (crc) pf_cpu_cap_ = std::clamp(std::atoi(crc->c_str()), 16, 4096);
+    const EngineDims& dd0 = mc_.dims;
+    if (pf_batched_ &&
+        (dd0.hidden % q4k::kQK_K != 0 || dd0.n_ff_exp % q4k::kQK_K != 0)) {
+      SLOG_W("session", "batched prefill needs 256-aligned hidden/ff "
+             "(%d/%d) - per-row walk stays", dd0.hidden, dd0.n_ff_exp);
+      pf_batched_ = false;
+    }
+    SLOG_I("session", "prefill v0.2.3: batched=%d stream_min=%d chunk_cap=%d "
+           "cpu_rows=%d", (int)pf_batched_, pf_stream_min_, pf_chunk_cap_,
+           pf_cpu_cap_);
+  }
+
   if (w_.head_type_ != 12 && w_.head_type_ != 1) {
     SLOG_E("session", "unsupported output head dtype %u (need Q4_K=12); "
                       "re-convert with tools/convert_hf_to_sager.py",
@@ -754,6 +801,309 @@ void Session::moe_dispatch_row(int layer, int row) {
 }
 
 // ---------------------------------------------------------------------------
+// v0.2.3 batched whole-chunk MoE (Strata-style streamed walk)
+//
+// One route sync per LAYER instead of per row: quantize+route every row of
+// the chunk, bring the routing decision to the host once, then
+//   * hot experts      -> computed in place from the hot-slab pointer table,
+//   * stream-all ring  -> slot waited via its ready event, consumed after the
+//                         down projection frees it for the loader,
+//   * pump LRU         -> (no active session: verify windows / tiny chunks)
+//                         per-EXPERT submit + one arm_wait,
+//   * CPU pool         -> last resort, capped rows (pf_cpu_cap_).
+// All routed rows of an expert are compacted expert-major and computed with
+// the batched GEMV kernels - no per-row dispatch, no per-row sync.
+// ---------------------------------------------------------------------------
+void Session::moe_dispatch_batched(int layer, int n) {
+  const EngineDims& d = mc_.dims;
+  const LayerWeights& lw = w_.layers()[static_cast<size_t>(layer)];
+  const int H = d.hidden;
+  const int FFX = d.n_ff_exp;
+  const int E = d.n_expert;
+  const int K = d.n_expert_used;
+  cudaStream_t s = stream_.get();
+  const int gu_blocks = FFX / q4k::kQK_K;
+  const int h_blocks = H / q4k::kQK_K;
+
+  // 1) quantize the whole chunk's post-attention rows once.
+  cuda::quantize_q8_k(xn_.get(), d_xq_moe_.get(),
+                      static_cast<size_t>(n) * H, s);
+
+  // 2) batched router: logits + top-k for every row (stride K+1 so the
+  //    shared-expert combine slot stays host-managed).
+  cuda::gemv_f32_out_f16x_batched(lw.router, xn_.get(), route_logits_.get(),
+                                  E, H, n, s);
+  cuda::router_topk_batched(route_logits_.get(), route_idx_.get(),
+                            route_w_.get(), E, K, K + 1, n, s);
+
+  // 3) the ONE per-layer sync: routing decision to the host.
+  cudaMemcpyAsync(h_route_idx_.get(), route_idx_.get(),
+                  static_cast<size_t>(n) * (K + 1) * sizeof(int),
+                  cudaMemcpyDeviceToHost, s);
+  cudaMemcpyAsync(h_route_w_.get(), route_w_.get(),
+                  static_cast<size_t>(n) * (K + 1) * sizeof(float),
+                  cudaMemcpyDeviceToHost, s);
+  stream_.sync();
+
+  // 4) host pass: validate, count, classify. Everything below is plain host
+  //    bookkeeping over n*K routes (~4k ints for a 512-token chunk).
+  std::vector<int> count(static_cast<size_t>(E), 0);
+  bool row_bad = false;
+  for (int r = 0; r < n; ++r) {
+    int* ids = h_route_idx_.get() + static_cast<size_t>(r) * (K + 1);
+    float* wts = h_route_w_.get() + static_cast<size_t>(r) * (K + 1);
+    row_bad = false;
+    for (int kk = 0; kk < K; ++kk) {
+      if (ids[kk] < 0 || ids[kk] >= E) { row_bad = true; break; }
+    }
+    if (row_bad) {
+      SLOG_E("moe", "layer %d row %d: router id out of range - zeroing row",
+             layer, r);
+      for (int kk = 0; kk <= K; ++kk) { ids[kk] = 0; wts[kk] = 0.f; }
+      continue;
+    }
+    wts[K] = lw.shared_gate ? 1.0f : 0.0f;   // shared-expert combine slot
+    for (int kk = 0; kk < K; ++kk) ++count[static_cast<size_t>(ids[kk])];
+  }
+
+  // Expert-major compaction plan: offset per expert (id order), source rows.
+  std::vector<int> off(static_cast<size_t>(E) + 1, 0);
+  {
+    int acc = 0;
+    for (int e = 0; e < E; ++e) {
+      off[static_cast<size_t>(e)] = acc;
+      acc += count[static_cast<size_t>(e)];
+    }
+    off[static_cast<size_t>(E)] = acc;
+  }
+  const int R_gpu = off[static_cast<size_t>(E)];   // all valid routes (GPU +
+                                                   // CPU rows both compact;
+                                                   // CPU rows scatter nothing)
+  // gslot map: route (r, kk) -> grouped slot; grows: slot -> source row.
+  {
+    std::vector<int> fill(off.begin(), off.end() - 1);
+    int* gs = h_gslot_.get();
+    int* gr = h_grows_.get();
+    for (int r = 0; r < n; ++r) {
+      const int* ids = h_route_idx_.get() + static_cast<size_t>(r) * (K + 1);
+      for (int kk = 0; kk < K; ++kk) {
+        const int e = ids[kk];
+        int* slotp = gs + static_cast<size_t>(r) * K + kk;
+        if (e < 0) { *slotp = -1; continue; }
+        const int pos = fill[static_cast<size_t>(e)]++;
+        *slotp = pos;
+        gr[pos] = r;
+      }
+    }
+  }
+  cudaMemcpyAsync(d_gslot_.get(), h_gslot_.get(),
+                  static_cast<size_t>(n) * K * sizeof(int),
+                  cudaMemcpyHostToDevice, s);
+  cudaMemcpyAsync(d_grows_.get(), h_grows_.get(),
+                  static_cast<size_t>(R_gpu) * sizeof(int),
+                  cudaMemcpyHostToDevice, s);
+  // validated weights back to the device (combine reads them) - uploaded
+  // after the CPU-fallback cap decision so dropped rows carry weight 0.
+
+  // 5) classify experts + build the per-expert job list (id order).
+  struct Job {
+    const q4k::BlockQ4K* wg;
+    const q4k::BlockQ4K* wu;
+    const q4k::BlockQ4K* wo;
+    int off;
+    int m;
+    int ring_slot;   // >= 0: consume after the down projection
+  };
+  std::vector<Job> jobs;
+  std::vector<int> cpu_rows;      // (r * K + kk) packed, CPU-pool fallback
+  jobs.reserve(static_cast<size_t>(E));
+  const bool streaming = pump_ && pump_->stream_active();
+  const uint64_t step = static_cast<uint64_t>(perf.steps) + 1;
+  for (int e = 0; e < E; ++e) {
+    const int m = count[static_cast<size_t>(e)];
+    if (m <= 0) {
+      // Zero-row pair inside a live session: release its ring slot early so
+      // the loaders never clog on pairs the router skipped.
+      if (streaming && !cache_.resident(layer, e)) {
+        pump_->stream_consume_drop(layer, e);
+      }
+      continue;
+    }
+    cache_.touch(layer, e);
+    Job j{};
+    j.off = off[static_cast<size_t>(e)];
+    j.m = m;
+    j.ring_slot = -1;
+    if (cache_.resident(layer, e)) {
+      // tier 0a: hot slab, computed in place
+      const size_t base = (static_cast<size_t>(layer) * 3 + 0) * E + e;
+      j.wg = hot_->tables_host[base];
+      j.wu = hot_->tables_host[base + static_cast<size_t>(E)];
+      j.wo = hot_->tables_host[base + 2 * static_cast<size_t>(E)];
+    } else if (streaming) {
+      // tier 0b: stream-all ring (the pair was planned at chunk start)
+      const int slot = pump_->stream_lookup(layer, e);
+      if (slot >= 0) {
+        pump_->stream_wait(s, slot);
+        j.ring_slot = slot;
+        auto* base = const_cast<q4k::BlockQ4K*>(pump_->dev_base(slot));
+        j.wg = base;
+        j.wu = base + (hot_->per_expert_bytes / 3) / q4k::kBlockBytes;
+        j.wo = base + 2 * (hot_->per_expert_bytes / 3) / q4k::kBlockBytes;
+      }
+      // slot < 0 (arm timeout): fall through to the CPU pool below
+    } else if (pump_) {
+      // tier 0c: per-expert pump submit (verify windows / small chunks)
+      const int slot = pump_->submit(layer, e, step);
+      if (slot >= 0) {
+        auto* base = const_cast<q4k::BlockQ4K*>(pump_->dev_base(slot));
+        j.wg = base;
+        j.wu = base + (hot_->per_expert_bytes / 3) / q4k::kBlockBytes;
+        j.wo = base + 2 * (hot_->per_expert_bytes / 3) / q4k::kBlockBytes;
+      }
+    }
+    if (!j.wg) {
+      for (int r = 0; r < n; ++r) {
+        const int* ids = h_route_idx_.get() + static_cast<size_t>(r) * (K + 1);
+        for (int kk = 0; kk < K; ++kk) {
+          if (ids[kk] == e) cpu_rows.push_back(r * K + kk);
+        }
+      }
+    } else {
+      jobs.push_back(j);
+    }
+  }
+  if (pump_ && pump_->pending()) pump_->arm_wait(s);
+
+  // CPU-fallback cap decision BEFORE the weight upload: rows beyond the cap
+  // get their routed weight zeroed (their combine slots stay stale). Build
+  // the (r, kk) list first, then upload the final weights.
+  int n_cpu = 0;
+  if (!cpu_rows.empty()) {
+    if (static_cast<int>(cpu_rows.size()) > pf_cpu_cap_) {
+      SLOG_W("moe", "layer %d: %zu CPU rows exceed cap %d - dropping tail",
+             layer, cpu_rows.size(), pf_cpu_cap_);
+      for (size_t i = static_cast<size_t>(pf_cpu_cap_); i < cpu_rows.size(); ++i) {
+        const int rk = cpu_rows[i];
+        h_route_w_.get()[static_cast<size_t>(rk / K) * (K + 1) + rk % K] = 0.f;
+      }
+      cpu_rows.resize(static_cast<size_t>(pf_cpu_cap_));
+    }
+    n_cpu = static_cast<int>(cpu_rows.size());
+    // host copy of the chunk rows (fp16) for the CPU GEMVs
+    cudaMemcpyAsync(h_x16_.get(), xn_.get(),
+                    static_cast<size_t>(n) * H * sizeof(uint16_t),
+                    cudaMemcpyDeviceToHost, s);
+  }
+  cudaMemcpyAsync(route_w_.get(), h_route_w_.get(),
+                  static_cast<size_t>(n) * (K + 1) * sizeof(float),
+                  cudaMemcpyHostToDevice, s);
+
+  // 6) compact the routed activation rows expert-major (one D2D gather).
+  if (R_gpu > 0) {
+    cuda::gather_rows_q8(d_xqg_.get(), d_xq_moe_.get(), d_grows_.get(),
+                         R_gpu, h_blocks, s);
+  }
+
+  // 7) gate + up for every GPU expert (id order = stream order: the waits
+  //    were armed above, so copies stream ahead of these launches).
+  for (const Job& j : jobs) {
+    cuda::gemv_q4_k_q8_f16out_batched(
+        j.wg, d_xqg_.get() + static_cast<size_t>(j.off) * h_blocks,
+        expert_g2_.get() + static_cast<size_t>(j.off) * FFX, FFX, H, j.m, s);
+    cuda::gemv_q4_k_q8_f16out_batched(
+        j.wu, d_xqg_.get() + static_cast<size_t>(j.off) * h_blocks,
+        expert_u2_.get() + static_cast<size_t>(j.off) * FFX, FFX, H, j.m, s);
+  }
+
+  // 8) fused activation + requant over the whole compacted slab.
+  if (R_gpu > 0) {
+    cuda::silu_mul_f16(expert_g2_.get(), expert_g2_.get(), expert_u2_.get(),
+                       1, R_gpu * FFX, s);
+    cuda::quantize_q8_k(expert_g2_.get(), d_hqg_.get(),
+                        static_cast<size_t>(R_gpu) * FFX, s);
+  }
+
+  // 9) down projection per expert; ring slots are consumed right after.
+  for (const Job& j : jobs) {
+    cuda::gemv_q4_k_q8_f16out_batched(
+        j.wo, d_hqg_.get() + static_cast<size_t>(j.off) * gu_blocks,
+        y_grouped_.get() + static_cast<size_t>(j.off) * H, H, FFX, j.m, s);
+    if (j.ring_slot >= 0) pump_->stream_consume(s, j.ring_slot);
+  }
+
+  // 10) compact outputs into the combine slab (expert_y_ [n x (K+1) x H]).
+  if (R_gpu > 0) {
+    cuda::scatter_routed_f16(expert_y_.get(), y_grouped_.get(),
+                             d_gslot_.get(), n, K, H, s);
+  }
+
+  // 11) shared expert, batched (dense MLP over all chunk rows).
+  if (lw.shared_gate) {
+    cuda::gemv_q4_k_q8_f16out_batched(lw.shared_gate, d_xq_moe_.get(),
+                                      sh_g_.get(), FFX, H, n, s);
+    cuda::gemv_q4_k_q8_f16out_batched(lw.shared_up, d_xq_moe_.get(),
+                                      sh_u_.get(), FFX, H, n, s);
+    cuda::silu_mul_f16(sh_g_.get(), sh_g_.get(), sh_u_.get(), 1, n * FFX, s);
+    cuda::quantize_q8_k(sh_g_.get(), d_hqg_.get(),
+                        static_cast<size_t>(n) * FFX, s);
+    cuda::gemv_q4_k_q8_f16out_batched(lw.shared_out, d_hqg_.get(),
+                                      shared_yb_.get(), H, FFX, n, s);
+    if (lw.shared_gate_w) {
+      cuda::gemv_f32_out_f16x_batched(lw.shared_gate_w, xn_.get(),
+                                      d_sgate_.get(), 1, H, n, s);
+      cuda::sigmoid_gate_scalar_batched_f16(shared_yb_.get(), d_sgate_.get(),
+                                            n, H, s);
+    }
+    // shared plane (slot K) of the combine slab, strided D2D copy
+    cudaMemcpy2DAsync(
+        expert_y_.get() + static_cast<size_t>(K) * H,
+        static_cast<size_t>(K + 1) * H * sizeof(uint16_t),
+        shared_yb_.get(), H * sizeof(uint16_t),
+        H * sizeof(uint16_t), n, cudaMemcpyDeviceToDevice, s);
+  }
+
+  // 12) CPU-pool fallback (rare: arm timeouts / read errors). Capped rows.
+  if (n_cpu > 0) {
+    stream_.sync();   // h_x16_ D2H complete
+    const size_t gu = hot_->per_expert_bytes / 3;
+    std::vector<MissJob> mjobs;
+    mjobs.reserve(cpu_rows.size());
+    for (int i = 0; i < n_cpu; ++i) {
+      const int rk = cpu_rows[static_cast<size_t>(i)];
+      const int r = rk / K, kk = rk % K;
+      const int e = h_route_idx_.get()[static_cast<size_t>(r) * (K + 1) + kk];
+      float* mx = miss_x_.get() + static_cast<size_t>(i) * H;   // per-row slice
+      const uint16_t* x16 = h_x16_.get() + static_cast<size_t>(r) * H;
+      for (int t = 0; t < H; ++t) mx[t] = q4k::half_to_float(x16[t]);
+      const uint8_t* exp = w_.host_expert_base() +
+          (static_cast<size_t>(layer) * E + e) * hot_->per_expert_bytes;
+      mjobs.push_back(MissJob{
+          layer, e, reinterpret_cast<const q4k::BlockQ4K*>(exp),
+          reinterpret_cast<const q4k::BlockQ4K*>(exp + gu),
+          reinterpret_cast<const q4k::BlockQ4K*>(exp + 2 * gu), mx,
+          miss_y_.get() + static_cast<size_t>(i) * H, H, FFX});
+      h_cflat_.get()[i] = static_cast<int>(
+          (static_cast<size_t>(r) * (K + 1) + kk) * H);
+    }
+    pool_.submit(std::move(mjobs));
+    pool_.wait_done(nullptr);
+    cudaMemcpyAsync(d_miss_y_.get(), miss_y_.get(),
+                    static_cast<size_t>(n_cpu) * H * sizeof(float),
+                    cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(d_cflat_.get(), h_cflat_.get(),
+                    static_cast<size_t>(n_cpu) * sizeof(int),
+                    cudaMemcpyHostToDevice, s);
+    cuda::scatter_rows_generic_f16(expert_y_.get(), d_miss_y_.get(),
+                                   d_cflat_.get(), n_cpu, H, s);
+  }
+
+  // 13) combine: x_ = residual + sum_k w * expert_y (shared slot folded in).
+  cuda::moe_combine_batched_f16(x_.get(), expert_y_.get(), route_w_.get(),
+                                K, H, n, s);
+}
+
+// ---------------------------------------------------------------------------
 // Head
 // ---------------------------------------------------------------------------
 void Session::head_launch() {
@@ -898,11 +1248,20 @@ Status Session::forward_window(const std::vector<int>& window,
   cuda::gather_embed(x_.get(), w_.tok_embd, d_ids_.get(), n, d.hidden, s);
 
   pump_ ? pump_->begin_step(static_cast<uint64_t>(pos_) + 1) : void(0);
+  // Batched route slabs are sized for pf_chunk_cap_ tokens; a caller that
+  // bypasses prefill()'s chunking (verify windows) with more rows than that
+  // stays on the per-row walk rather than overflowing the slabs.
+  const bool batched = pf_batched_ && pump_ != nullptr &&
+                       n <= pf_chunk_cap_;
   for (int L = 0; L < d.n_layer; ++L) {
     if (abort_flag && *abort_flag) return Status::kAborted;
     if (mc_.is_linear(L)) linear_layer_launch(L, n);
     else                  dense_layer_launch(L, n);
-    for (int t = 0; t < n; ++t) moe_dispatch_row(L, t);
+    if (batched) {
+      moe_dispatch_batched(L, n);
+    } else {
+      for (int t = 0; t < n; ++t) moe_dispatch_row(L, t);
+    }
   }
   pos_ = p + n;
   // NOTE: recent_ids_ is NOT touched here - rejected speculative tokens must
@@ -977,6 +1336,7 @@ Status Session::forward_window(const std::vector<int>&, float*,
 }
 void Session::reset() {}
 void Session::push_recent(int) {}
+void Session::moe_dispatch_batched(int, int) {}
 const float* Session::last_logits() const { return nullptr; }
 
 #endif  // SAGER_HAVE_CUDA

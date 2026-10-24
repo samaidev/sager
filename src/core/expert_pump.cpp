@@ -8,14 +8,45 @@
 
 #include <cstring>
 
+#include <algorithm>
+#include <chrono>
+#include <thread>
+
 #include "sager/log.hpp"
+
+#if defined(SAGER_HAVE_CUDA)
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace sager {
 
+// SAGER_PF_* knobs (read once at init; seconds/counts are deliberately
+// conservative defaults tuned on a 2-vCPU Colab T4).
+namespace {
+int env_int(const char* name, int dflt, int lo, int hi) {
+  const auto v = env_get(name);
+  if (!v) return dflt;
+  const int x = std::atoi(v->c_str());
+  return x < lo ? lo : (x > hi ? hi : x);
+}
+}  // namespace
+
 ExpertPump::~ExpertPump() {
 #if defined(SAGER_HAVE_CUDA)
+  stream_finish();  // no-op unless a session is somehow still live
   for (cudaEvent_t e : events_) {
     if (e) cudaEventDestroy(e);
+  }
+  for (cudaEvent_t e : consumed_ev_) {
+    if (e) cudaEventDestroy(e);
+  }
+  for (auto& slabs : loader_slabs_) {
+    for (Slab& sb : slabs) {
+      if (sb.ev) cudaEventDestroy(sb.ev);
+      if (sb.ptr) cudaFreeHost(sb.ptr);
+    }
   }
   if (copy_stream_) cudaStreamDestroy(copy_stream_);
   if (arena_) cudaFree(arena_);
@@ -40,6 +71,9 @@ Status ExpertPump::init(const Config& cfg, const uint8_t* host_pool_base) {
   n_experts_ = cfg.n_experts;
   per_expert_bytes_ = cfg.per_expert_bytes;
   slot_count_ = cfg.arena_bytes / cfg.per_expert_bytes;
+  arm_timeout_ms_ = env_int("SAGER_PF_ARM_TIMEOUT_MS", 2000, 100, 60000);
+  n_readers_ = env_int("SAGER_PF_READERS", 2, 1, 4);
+  slabs_per_reader_ = env_int("SAGER_PF_SLABS", 16, 2, 64);
 
   const size_t pairs =
       static_cast<size_t>(cfg.n_layers) * static_cast<size_t>(cfg.n_experts);
@@ -62,13 +96,20 @@ Status ExpertPump::init(const Config& cfg, const uint8_t* host_pool_base) {
     }
     cudaStreamCreate(&copy_stream_);
     events_.resize(slot_count_, nullptr);
+    consumed_ev_.resize(slot_count_, nullptr);
     for (size_t i = 0; i < slot_count_; ++i) {
       cudaEventCreateWithFlags(&events_[i], cudaEventDisableTiming);
+      cudaEventCreateWithFlags(&consumed_ev_[i], cudaEventDisableTiming);
     }
+    ring_state_.assign(slot_count_, kRingFree);
+    ring_owned_.assign(slot_count_, 0);
+    consumed_rec_.assign(slot_count_, 0);
   }
-  SLOG_I("pump", "arena ready: %zu slots x %.2f MB (%.0f MB VRAM)",
+  SLOG_I("pump", "arena ready: %zu slots x %.2f MB (%.0f MB VRAM), stream-all "
+         "prefill: %d readers x %d slabs, arm timeout %d ms",
          slot_count_, per_expert_bytes_ / 1048576.0,
-         slot_count_ * per_expert_bytes_ / 1048576.0);
+         slot_count_ * per_expert_bytes_ / 1048576.0,
+         n_readers_, slabs_per_reader_, arm_timeout_ms_);
 #else
   SLOG_I("pump", "CPU-only build: pump bookkeeping active, copies are no-ops");
 #endif
@@ -183,8 +224,353 @@ void ExpertPump::clear() {
   }
   pending_.clear();
   cursor_ = 0;
+#if defined(SAGER_HAVE_CUDA)
+  // No live session may reach here (stream_finish() runs first in every
+  // lifecycle); reset ring bookkeeping so a stale session can't steal slots.
+  ring_state_.assign(slot_count_, kRingFree);
+  ring_owned_.assign(slot_count_, 0);
+  consumed_rec_.assign(slot_count_, 0);
+#endif
   // NOTE: stats are intentionally kept across reset() - they are lifetime
   // counters for the /props monitor.
 }
+
+// ---------------------------------------------------------------------------
+// v0.2.3 prefill stream-all ring (Strata-style streamed walk)
+// ---------------------------------------------------------------------------
+ExpertPump::StreamPlan ExpertPump::build_stream_plan(
+    const std::vector<uint8_t>& resident, int n_layers, int n_experts) {
+  StreamPlan plan;
+  plan.n_layers = n_layers;
+  plan.n_experts = n_experts;
+  plan.pairs.reserve(resident.size());
+  for (int l = 0; l < n_layers; ++l) {
+    for (int e = 0; e < n_experts; ++e) {
+      const size_t p = static_cast<size_t>(l) * n_experts + e;
+      if (p < resident.size() && !resident[p]) {
+        plan.pairs.push_back(static_cast<int32_t>(p));
+      }
+    }
+  }
+  return plan;
+}
+
+void ExpertPump::begin_stream(const StreamPlan& plan) {
+#if defined(SAGER_HAVE_CUDA)
+  if (stream_active_) stream_finish();   // defensive: never two live sessions
+  // The ring owns the whole arena for the prompt: LRU residency from decode
+  // (or a previous prompt) is dropped, non-hot pairs re-stream per chunk -
+  // the same "every expert streams once per chunk" rule Strata uses.
+  for (size_t p = 0; p < slot_of_.size(); ++p) slot_of_[p] = -1;
+  for (size_t s = 0; s < owner_l_.size(); ++s) {
+    owner_l_[s] = -1;
+    owner_e_[s] = -1;
+  }
+  pending_.clear();
+  cursor_ = 0;
+  ring_state_.assign(slot_count_, kRingFree);
+  ring_owned_.assign(slot_count_, 0);
+  consumed_rec_.assign(slot_count_, 0);
+  plan_ = plan;
+  stream_next_ = 0;
+  stream_active_ = true;
+#else
+  (void)plan;
+#endif
+}
+
+#if defined(SAGER_HAVE_CUDA)
+namespace {
+
+// pread the full blob; returns false on short read / error (caller marks the
+// pair failed and the dispatch layer falls back to the CPU pool).
+bool pread_full(int fd, void* dst, size_t n, off_t off) {
+  uint8_t* p = static_cast<uint8_t*>(dst);
+  size_t done = 0;
+  while (done < n) {
+    const ssize_t r = ::pread(fd, p + done, n - done, off + static_cast<off_t>(done));
+    if (r <= 0) {
+      if (r < 0 && (errno == EINTR)) continue;
+      return false;
+    }
+    done += static_cast<size_t>(r);
+  }
+  return true;
+}
+
+}  // namespace
+
+void ExpertPump::stream_start(int pool_fd) {
+  if (!stream_active_) return;
+  if (pool_fd < 0 || plan_.pairs.empty() || slot_count_ == 0) {
+    SLOG_W("pump", "stream-all prefill: nothing to stream (fd=%d pairs=%zu slots=%zu)",
+           pool_fd, plan_.pairs.size(), slot_count_);
+    stream_active_ = false;
+    return;
+  }
+  pool_fd_ = pool_fd;
+  loader_slabs_.assign(static_cast<size_t>(n_readers_), {});
+  int readers_with_slabs = 0;
+  for (int t = 0; t < n_readers_; ++t) {
+    auto& slabs = loader_slabs_[static_cast<size_t>(t)];
+    slabs.resize(static_cast<size_t>(slabs_per_reader_));
+    int ok = 0;
+    for (Slab& sb : slabs) {
+      if (cudaHostAlloc(&sb.ptr, per_expert_bytes_, cudaHostAllocDefault) !=
+          cudaSuccess) {
+        sb.ptr = nullptr;
+        cudaGetLastError();
+        break;   // this reader runs with fewer slabs; pread still works
+      }
+      cudaEventCreateWithFlags(&sb.ev, cudaEventDisableTiming);
+      sb.used = false;
+      ++ok;
+    }
+    if (ok > 0) ++readers_with_slabs;
+  }
+  if (readers_with_slabs == 0) {
+    // No pinned staging at all: a pageable copy would serialize the whole
+    // walk anyway - disable the session, dispatch falls back to submit()/CPU.
+    SLOG_W("pump", "stream-all prefill: pinned slab alloc failed - session off");
+    stream_active_ = false;
+    return;
+  }
+  loaders_.reserve(static_cast<size_t>(readers_with_slabs));
+  for (int t = 0; t < n_readers_; ++t) {
+    bool any = false;
+    for (const Slab& sb : loader_slabs_[static_cast<size_t>(t)]) any = sb.ptr != nullptr;
+    if (!any) continue;
+    loaders_.emplace_back([this, t] { loader_loop(t); });
+  }
+  SLOG_I("pump", "stream-all prefill: %zu pairs (%.1f GB), ring %zu slots, "
+         "%zu readers, %d slabs/reader",
+         plan_.pairs.size(),
+         plan_.pairs.size() * per_expert_bytes_ / 1073741824.0,
+         slot_count_, loaders_.size(), slabs_per_reader_);
+}
+
+int ExpertPump::stream_lookup(int layer, int expert) {
+  if (!stream_active_) return -1;
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(arm_timeout_ms_);
+  std::unique_lock<std::mutex> lk(stream_mu_);
+  const size_t p = sidx(layer, expert);
+  while (slot_of_[p] < 0) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      ++stats_.arm_timeouts;
+      return -1;   // loader stalled (or pair dropped): CPU-pool fallback
+    }
+    stream_cv_.wait_for(lk, std::chrono::milliseconds(2));
+  }
+  return slot_of_[p];
+}
+
+void ExpertPump::stream_wait(cudaStream_t compute, int slot) {
+  cudaStreamWaitEvent(compute, events_[static_cast<size_t>(slot)], 0);
+}
+
+void ExpertPump::stream_consume(cudaStream_t compute, int slot) {
+  const size_t s = static_cast<size_t>(slot);
+  cudaEventRecord(consumed_ev_[s], compute);
+  std::lock_guard<std::mutex> lk(stream_mu_);
+  consumed_rec_[s] = 1;
+  ring_state_[s] = kRingLoaded;
+}
+
+void ExpertPump::stream_consume_drop(int layer, int expert) {
+  std::lock_guard<std::mutex> lk(stream_mu_);
+  const size_t p = sidx(layer, expert);
+  const int slot = slot_of_[p];
+  if (slot < 0) return;
+  const size_t s = static_cast<size_t>(slot);
+  if (ring_state_[s] == kRingLoading) return;  // copy in flight; leave it be
+  // The pair will never be consumed on the compute stream: park it as free
+  // for the loaders (no event exists - the ring_state_ guard above is what
+  // keeps an in-flight copy from being torn).
+  ring_state_[s] = kRingFree;
+  ring_owned_[s] = 0;
+  consumed_rec_[s] = 0;
+  owner_l_[s] = -1;
+  owner_e_[s] = -1;
+  slot_of_[p] = -1;
+  ++stats_.stream_drop;
+}
+
+void ExpertPump::stream_finish() {
+  if (!stream_active_) return;
+  stream_active_ = false;
+  {
+    std::lock_guard<std::mutex> lk(stream_mu_);
+    stream_cv_.notify_all();
+  }
+  for (auto& t : loaders_) t.join();
+  loaders_.clear();
+  for (auto& slabs : loader_slabs_) {
+    for (Slab& sb : slabs) {
+      if (sb.ev) cudaEventDestroy(sb.ev);
+      if (sb.ptr) cudaFreeHost(sb.ptr);
+      sb.ptr = nullptr;
+      sb.ev = nullptr;
+      sb.used = false;
+    }
+  }
+  loader_slabs_.clear();
+  pool_fd_ = -1;
+  // Surviving ring slots are plain LRU residents now: stamp them so decode's
+  // eviction clock sees them as freshly used.
+  for (size_t s = 0; s < owner_l_.size(); ++s) {
+    if (owner_l_[s] >= 0) {
+      last_use_[s] = step_;
+      last_step_[sidx(owner_l_[s], owner_e_[s])] = step_;
+    }
+    ring_owned_[s] = 0;
+    consumed_rec_[s] = 0;
+    ring_state_[s] = kRingFree;
+  }
+  SLOG_I("pump", "stream-all prefill done: %llu pairs, %.2f GB H2D, %llu steals, "
+         "%llu drops, %llu arm timeouts, %llu read errors",
+         (unsigned long long)stats_.stream_pairs,
+         stats_.bytes_copied / 1073741824.0,
+         (unsigned long long)stats_.stream_steals,
+         (unsigned long long)stats_.stream_drop,
+         (unsigned long long)stats_.arm_timeouts,
+         (unsigned long long)stats_.read_errors);
+}
+
+// Loader body: pull the next pair, take a slot (free, or steal a consumed
+// one), stage pool -> pinned slab -> VRAM on the copy stream, publish.
+// Each reader owns its slabs (no cross-thread slab sharing).
+void ExpertPump::loader_loop(int tid) {
+  const auto& slabs = loader_slabs_[static_cast<size_t>(tid)];
+  size_t slab_i = 0;
+  for (;;) {
+    if (!stream_active_.load(std::memory_order_relaxed)) return;
+    size_t i;
+    {
+      std::lock_guard<std::mutex> lk(stream_mu_);
+      if (stream_next_ >= plan_.pairs.size()) return;
+      i = stream_next_++;
+    }
+    const int32_t packed = plan_.pairs[i];
+    const int L = packed / n_experts_;
+    const int e = packed % n_experts_;
+    const size_t p = static_cast<size_t>(packed);
+
+    // 1. arena slot: a FREE one (never owned, or a dropped pair parked),
+    //    else steal a LOADED slot whose consumer event has completed.
+    int slot = -1;
+    for (;;) {
+      if (!stream_active_.load(std::memory_order_relaxed)) return;
+      {
+        std::lock_guard<std::mutex> lk(stream_mu_);
+        for (size_t k = 0; k < slot_count_; ++k) {
+          const size_t s = (cursor_ + k) % slot_count_;
+          if (ring_state_[s] != kRingFree) continue;
+          // FREE means no valid payload and nothing in flight (drop() and
+          // the failure paths below never free an LOADING slot).
+          slot = static_cast<int>(s);
+          break;
+        }
+        if (slot < 0) {
+          for (size_t k = 0; k < slot_count_; ++k) {
+            const size_t s = (cursor_ + k) % slot_count_;
+            if (!ring_owned_[s] || ring_state_[s] != kRingLoaded ||
+                !consumed_rec_[s]) {
+              continue;
+            }
+            if (cudaEventQuery(consumed_ev_[s]) != cudaSuccess) continue;
+            // invalidate the old pair mapping, then reuse the slot
+            slot_of_[sidx(owner_l_[s], owner_e_[s])] = -1;
+            ++stats_.stream_steals;
+            slot = static_cast<int>(s);
+            break;
+          }
+        }
+        if (slot >= 0) {
+          const size_t s = static_cast<size_t>(slot);
+          ring_state_[s] = kRingLoading;
+          ring_owned_[s] = 1;
+          consumed_rec_[s] = 0;
+          cursor_ = (s + 1) % slot_count_;
+          owner_l_[s] = L;
+          owner_e_[s] = e;
+          slot_of_[p] = slot;
+          break;
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(150));
+    }
+
+    // 2. pinned slab of this reader (its DMA must have completed). Bounded
+    //    wait: slabs free up as the copy engine drains; a pathological stall
+    //    fails the pair instead of hanging the session.
+    Slab* sb = nullptr;
+    for (int attempt = 0; attempt < 2000 && !sb; ++attempt) {
+      if (!stream_active_.load(std::memory_order_relaxed)) return;
+      for (int k = 0; k < static_cast<int>(slabs.size()); ++k) {
+        Slab& cand = slabs[static_cast<size_t>((slab_i + k) % slabs.size())];
+        if (!cand.ptr) continue;
+        if (cand.used && cudaEventQuery(cand.ev) != cudaSuccess) continue;
+        sb = &cand;
+        slab_i = (slab_i + k + 1) % slabs.size();
+        break;
+      }
+      if (!sb) std::this_thread::sleep_for(std::chrono::microseconds(500));
+    }
+    if (!sb) {
+      std::lock_guard<std::mutex> lk(stream_mu_);
+      slot_of_[p] = -1;
+      const size_t s = static_cast<size_t>(slot);
+      ring_state_[s] = kRingFree;
+      ring_owned_[s] = 0;
+      owner_l_[s] = -1;
+      owner_e_[s] = -1;
+      ++stats_.read_errors;
+      continue;   // dispatch layer's arm timeout routes this pair to the CPU
+    }
+
+    // 3. disk -> pinned slab -> VRAM (copy engine), then publish.
+    const off_t off = static_cast<off_t>(p) * static_cast<off_t>(per_expert_bytes_);
+    bool copy_ok = pread_full(pool_fd_, sb->ptr, per_expert_bytes_, off);
+    if (copy_ok) {
+      uint8_t* dst = static_cast<uint8_t*>(arena_) +
+                     static_cast<size_t>(slot) * per_expert_bytes_;
+      copy_ok = cudaMemcpyAsync(dst, sb->ptr, per_expert_bytes_,
+                                cudaMemcpyHostToDevice, copy_stream_) ==
+                cudaSuccess;
+      if (!copy_ok) cudaGetLastError();
+    }
+    if (!copy_ok) {
+      std::lock_guard<std::mutex> lk(stream_mu_);
+      slot_of_[p] = -1;
+      const size_t s = static_cast<size_t>(slot);
+      ring_state_[s] = kRingFree;
+      ring_owned_[s] = 0;
+      owner_l_[s] = -1;
+      owner_e_[s] = -1;
+      ++stats_.read_errors;
+      continue;   // dispatch layer's arm timeout routes this pair to the CPU
+    }
+    cudaEventRecord(events_[static_cast<size_t>(slot)], copy_stream_);
+    cudaEventRecord(sb->ev, copy_stream_);
+    sb->used = true;
+    {
+      std::lock_guard<std::mutex> lk(stream_mu_);
+      ring_state_[static_cast<size_t>(slot)] = kRingLoaded;
+      ++stats_.stream_pairs;
+      stats_.bytes_copied += per_expert_bytes_;
+    }
+    stream_cv_.notify_all();
+  }
+}
+#endif  // SAGER_HAVE_CUDA
+
+#if !defined(SAGER_HAVE_CUDA)
+// CPU-only builds: the streamer has no loaders and never activates, so the
+// session API degenerates to "not found / nothing to join" (the policy tests
+// exercise exactly these fallbacks).
+int ExpertPump::stream_lookup(int, int) { return -1; }
+void ExpertPump::stream_finish() {}
+#endif
 
 }  // namespace sager

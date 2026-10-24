@@ -153,6 +153,7 @@ class Session {
   void   linear_layer_launch(int layer, int n_tokens); // graph body (GDN, v0.2)
   void   moe_dispatch(int layer);                       // eager MoE half (row 0)
   void   moe_dispatch_row(int layer, int row);          // eager MoE for row r
+  void   moe_dispatch_batched(int layer, int n);        // v0.2.3 whole-chunk MoE
   void   head_launch();                                 // final norm+head
   void   head_launch_row(int row);                      // per-row head (prefill tail)
   void   zero_gdn_states();                             // conv + delta state reset
@@ -195,6 +196,25 @@ class Session {
   DeviceBuffer<q4k::BlockQ4K*> d_ptrs_pump_;  // compact pump ptr table (3*K)
   DeviceBuffer<int>      d_pump_rows_;         // pumped row -> routed slot k
   DeviceBuffer<q4k::BlockQ8K> d_xq_moe_;        // row activation snapshot
+  // v0.2.3 batched prefill (Strata-style streamed walk) - route slabs REUSE
+  // route_logits_/route_idx_/route_w_ + their pinned mirrors (resized to
+  // RT*(K+1) in alloc_scratch; the per-row decode path only ever touches
+  // row 0, which keeps its exact v0.2 layout). All slabs are sized by
+  // min(chunk_prefill, pf_chunk_cap_) so a big configured chunk cannot eat
+  // VRAM the arena needs; prefill() chunks at the same cap.
+  DeviceBuffer<int>      d_grows_;              // [Rmax] gather source rows
+  DeviceBuffer<int>      d_gslot_;              // [RT * K] route -> grouped slot
+  PinnedBuffer<int>      h_grows_;
+  PinnedBuffer<int>      h_gslot_;
+  DeviceBuffer<q4k::BlockQ8K> d_xqg_;          // [Rmax * H/256] compacted rows
+  DeviceBuffer<q4k::BlockQ8K> d_hqg_;          // [Rmax * FFX/256] silu'd rows
+  DeviceBuffer<uint16_t> expert_g2_, expert_u2_;  // [Rmax * FFX] gate/up outs
+  DeviceBuffer<uint16_t> y_grouped_;            // [Rmax * H] expert downs
+  DeviceBuffer<uint16_t> shared_yb_;            // [RT * H] shared expert outs
+  DeviceBuffer<uint16_t> sh_g_, sh_u_;          // [RT * FFX] shared gate/up
+  DeviceBuffer<float>    d_sgate_;              // [RT] shared scalar gates
+  DeviceBuffer<int>      d_cflat_;              // CPU-fallback dst offsets
+  PinnedBuffer<int>      h_cflat_;
   PinnedBuffer<int>      h_route_idx_, h_slot_of_k_;
   PinnedBuffer<float>    h_route_w_;
   PinnedBuffer<uint16_t> h_x16_;                 // xn_ row staging (miss path)
@@ -216,6 +236,12 @@ class Session {
   std::vector<int> recent_ids_;
   std::vector<int> h_pos_tmp_;   // pinned-less pos staging for window forwards
   static constexpr int kMaxRecent = 64;
+
+  // v0.2.3 prefill knobs (read once in prepare())
+  bool pf_batched_ = true;    // SAGER_PF_BATCHED=0 -> legacy per-row walk
+  int  pf_stream_min_ = 384;  // SAGER_PF_STREAM_MIN: tokens to arm stream-all
+  int  pf_chunk_cap_ = 2048;  // SAGER_PF_CHUNK: batched route-buffer chunk cap
+  int  pf_cpu_cap_ = 256;     // SAGER_PF_CPU_ROWS: CPU-pool fallback row cap
 
   bool prepared_ = false;
 };

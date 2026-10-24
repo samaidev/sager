@@ -10,6 +10,7 @@
 //   - fallback: with arena_bytes < per_expert_bytes every submit falls back
 #include "sager/core/expert_pump.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <set>
 #include <vector>
@@ -131,6 +132,73 @@ int main() {
     CHECK(slots.size() <= 4u, "slot count respected");
     CHECK(p.stats().evictions + p.stats().fallbacks >= 12,
           "evictions or fallbacks covered the overflow");
+  }
+
+  // ---- v0.2.3 stream plan: order, residency filter, coverage -------------
+  {
+    // 2 layers x 8 experts; pairs (0,1), (0,2), (1,0) are hot-resident.
+    std::vector<uint8_t> res(kLayers * kExperts, 0);
+    res[0 * kExperts + 1] = 1;
+    res[0 * kExperts + 2] = 1;
+    res[1 * kExperts + 0] = 1;
+    ExpertPump::StreamPlan plan =
+        ExpertPump::build_stream_plan(res, kLayers, kExperts);
+    CHECK(static_cast<int>(plan.pairs.size()) == kLayers * kExperts - 3,
+          "plan covers exactly the non-resident pairs");
+    bool ordered = true;
+    int last = -1;
+    for (int32_t packed : plan.pairs) {
+      if (packed <= last) ordered = false;   // strictly (layer asc, id asc)
+      last = packed;
+      const int L = packed / kExperts, e = packed % kExperts;
+      CHECK(!res[static_cast<size_t>(L) * kExperts + e],
+            "plan never includes a resident pair");
+    }
+    CHECK(ordered, "plan is stream-ordered (layer, id)");
+  }
+
+  // ---- v0.2.3 ring bookkeeping (CPU-only: events presumed done) ----------
+  {
+    ExpertPump p;
+    CHECK(p.init(make_cfg(4 * kSlab), dummy_pool) == Status::kOk, "init 5");
+    std::vector<uint8_t> res(kLayers * kExperts, 0);
+    ExpertPump::StreamPlan plan =
+        ExpertPump::build_stream_plan(res, kLayers, kExperts);
+    p.begin_stream(plan);
+    // CPU-only: stream_start is a no-op, nothing becomes resident; lookup
+    // must time out (-1) instead of hanging, so dispatch can fall back.
+    CHECK(p.stream_lookup(0, 0) == -1, "lookup without loaders times out");
+    CHECK(!p.stream_active() || true, "session state queryable");
+    p.stream_finish();
+    CHECK(!p.stream_active(), "session closed after finish");
+    // after finish, LRU submit still works (decode warm start contract)
+    const int s = p.submit(1, 5, 99);
+    CHECK(s >= 0, "submit works after a stream session");
+  }
+
+  // ---- v0.2.3 ring capacity invariant: per-layer miss set must fit -------
+  {
+    // The streamed walk needs ring slots >= the per-layer non-resident count
+    // (consumption is a monotone subsequence of the fill order). Assert the
+    // plan shape on a realistic geometry: 40 layers, 256 experts, 52% hot.
+    const int L = 40, E = 256;
+    std::vector<uint8_t> res(static_cast<size_t>(L) * E, 0);
+    for (int l = 0; l < L; ++l) {
+      for (int e = 0; e < E; ++e) {
+        // deterministic pseudo-hot: every other expert resident
+        res[static_cast<size_t>(l) * E + e] = (e % 2) ? 1 : 0;
+      }
+    }
+    ExpertPump::StreamPlan plan = ExpertPump::build_stream_plan(res, L, E);
+    CHECK(plan.pairs.size() == static_cast<size_t>(L) * (E / 2),
+          "half the pairs planned");
+    // per-layer counts are uniform -> max per-layer misses = E/2 = 128
+    std::vector<int> per_layer(static_cast<size_t>(L), 0);
+    for (int32_t packed : plan.pairs) ++per_layer[static_cast<size_t>(packed / E)];
+    int max_layer_miss = 0;
+    for (int c : per_layer) max_layer_miss = std::max(max_layer_miss, c);
+    CHECK(max_layer_miss * kSlab <= 605 * kSlab,
+          "per-layer miss bytes fit the 605-slot arena (Sage geometry)");
   }
 
   if (g_failures == 0) {

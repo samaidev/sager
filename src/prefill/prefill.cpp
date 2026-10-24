@@ -26,25 +26,69 @@ Status Session::prefill(const std::vector<int>& ids,
     return Status::kInvalidArgument;
   }
 
-  const int chunk = cp_.chunk_prefill > 0 ? cp_.chunk_prefill : ids.size();
+  const int eff_chunk = pf_batched_
+      ? std::min(cp_.chunk_prefill > 0 ? cp_.chunk_prefill
+                                       : static_cast<int>(ids.size()),
+                 pf_chunk_cap_)
+      : (cp_.chunk_prefill > 0 ? cp_.chunk_prefill
+                               : static_cast<int>(ids.size()));
+  const int chunk = std::max(1, std::min<int>(eff_chunk,
+                                              static_cast<int>(ids.size())));
   const double t0 = now_ms();
   size_t done = 0;
   int n_chunks = static_cast<int>((ids.size() + chunk - 1) / chunk);
 
+  // Strata-style stream-all session: for a prompt big enough that nearly
+  // every expert is routed, copies do not need the routing - ALL hot-tier
+  // misses stream in fixed (layer, id) order through the pump arena ring
+  // while the compute stream consumes that same order layer by layer. The
+  // loaders pread the pool into pinned slabs and DMA from there, so PCIe
+  // runs at full bandwidth and stays independent of the routing syncs.
+#if defined(SAGER_HAVE_CUDA)
+  const bool streaming = pf_batched_ && pump_ &&
+                         static_cast<int>(ids.size()) >= pf_stream_min_;
+  if (streaming) {
+    std::vector<uint8_t> hot_res(
+        static_cast<size_t>(mc_.dims.n_moe_layer) * mc_.dims.n_expert, 0);
+    for (int L = 0; L < mc_.dims.n_moe_layer; ++L) {
+      for (int e = 0; e < mc_.dims.n_expert; ++e) {
+        hot_res[static_cast<size_t>(L) * mc_.dims.n_expert + e] =
+            cache_.resident(L, e) ? 1 : 0;
+      }
+    }
+    ExpertPump::StreamPlan plan = ExpertPump::build_stream_plan(
+        hot_res, mc_.dims.n_moe_layer, mc_.dims.n_expert);
+    pump_->begin_stream(plan);
+    pump_->stream_start(w_.expert_pool_fd());
+  }
+  auto stream_stop = [this]() {
+    if (pump_ && pump_->stream_active()) pump_->stream_finish();
+  };
+#else
+  auto stream_stop = []() {};
+#endif
+
   for (size_t off = 0; off < ids.size(); off += static_cast<size_t>(chunk)) {
-    if (abort_flag && *abort_flag) return Status::kAborted;
+    if (abort_flag && *abort_flag) {
+      stream_stop();
+      return Status::kAborted;
+    }
     const size_t end = std::min(ids.size(), off + static_cast<size_t>(chunk));
     std::vector<int> part(ids.begin() + static_cast<long>(off),
                           ids.begin() + static_cast<long>(end));
-    // forward_window: eager dense-batched path + per-row MoE dispatch; no
+    // forward_window: batched dense path + per-LAYER MoE dispatch; no
     // logits (nullptr) - the tail row's head runs once after the last chunk.
     Status s = forward_window(part, nullptr, abort_flag);
-    if (s != Status::kOk) return s;
+    if (s != Status::kOk) {
+      stream_stop();
+      return s;
+    }
     done = end;
     if (cb.on_prefill_progress) {
       cb.on_prefill_progress(static_cast<int>(done), n_chunks * chunk);
     }
   }
+  stream_stop();
 
   // Tail logits: distribution for the position right after the prompt.
   const int last_row = static_cast<int>(

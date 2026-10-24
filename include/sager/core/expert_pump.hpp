@@ -15,7 +15,8 @@
 //   tier 0  VRAM  hot experts (rebalance-driven residency table, unchanged)
 //                 + pump arena (LRU slots filled on the decode path)
 //                 + attention/router/norm/shared/embedding/head
-//   tier 1  RAM   every routed expert, pinned (the pump's source)
+//   tier 1  RAM   every routed expert (the pump's source; the prefill
+//                 streamer stages it through its own pinned slabs)
 //   tier 2  SSD   roadmap v0.3 (the pump's slot logic is where n-gram
 //                 prefetch will plug in)
 //
@@ -28,14 +29,63 @@
 //   C7c. Residency is hierarchical: hot tier first, then pump arena. The
 //        dispatch layer owns that OR; the pump only manages its own slots.
 //   C7d. All pump state is touched from the session thread only (single
-//        producer), like the rest of the MoE dispatch.
+//        producer), like the rest of the MoE dispatch - EXCEPT the v0.2.3
+//        prefill streamer, whose loader threads mutate only the fields
+//        guarded by stream_mu_ (see below).
 //
 // The bookkeeping (slot allocation, LRU eviction, reuse detection) is plain
 // host code and is unit-tested on CPU-only builds; the CUDA copy path is a
 // thin memcpyAsync + event layer on top.
+//
+// ---------------------------------------------------------------------------
+// v0.2.3: the prefill stream-all ring (Strata-style streamed walk)
+// ---------------------------------------------------------------------------
+// Prefill was per-row: every (token, layer) dispatched its own top-k, synced
+// the whole device, and submitted its own copies. A 512-token chunk paid
+// 20k device syncs and the copy engine only raced single-row GEMVs. The fix
+// follows Strata's streamed walk: for a chunk big enough that nearly every
+// expert is routed (>= SAGER_PF_STREAM_MIN tokens, top-8 of 256), the exact
+// routing is not needed to schedule copies - ALL hot-tier misses stream in
+// fixed (layer asc, expert asc) order through the arena acting as a ring,
+// while the compute stream consumes that same order layer by layer. Copies
+// then overlap the attention halves; consumption is a monotone subsequence
+// of the fill order, so the ring cannot deadlock (a slot the loader wants is
+// only stolen after its "consumed" event - recorded by the compute stream
+// after the expert's GEMMs - has completed).
+//
+// Session lifecycle (per prompt, from Session::prefill):
+//   begin_stream(plan) : plan = hot-tier misses in stream order. Clears the
+//                        LRU arena mapping (the ring owns the whole arena for
+//                        the prompt; chunks re-stream what no longer fits -
+//                        Strata does the same, "every expert is streamed once
+//                        per chunk").
+//   stream_start(fd)   : starts SAGER_PF_READERS loader threads. Each loader:
+//                        take next pair -> take arena slot (free, or steal a
+//                        slot whose consumed event completed) -> take a pinned
+//                        slab -> pread(pool) -> cudaMemcpyAsync H2D on the
+//                        pump's copy stream -> record ready event -> publish.
+//   stream_lookup(L,e) : slot if the pair is at least enqueued (blocks up to
+//                        SAGER_PF_ARM_TIMEOUT_MS, then -1 -> caller falls back
+//                        to the CPU pool; also the guard against a stalled
+//                        loader hanging prefill).
+//   stream_wait(s,slot): cudaStreamWaitEvent on the slot's ready event.
+//   stream_consume(s,slot): record the slot's consumed event on the compute
+//                        stream (frees the slot for the loader).
+//   stream_finish()    : join loaders; surviving slots stay LRU-resident for
+//                        decode (slot_of_/owner_ remain valid).
+//
+// Zero-row pairs (an expert no token of this prompt routes to) would clog
+// slots forever, so the dispatch layer consumes them early: after a layer's
+// routing is known, stream_consume_drop() releases the layer's untouched
+// pairs. With SAGER_PF_STREAM_MIN >= 384 the expected zero-row count is ~0
+// anyway; the drop call is the belt to that braces.
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #include "sager/common.hpp"
@@ -108,12 +158,67 @@ class ExpertPump {
     uint64_t evictions = 0;
     uint64_t fallbacks = 0;   // no free slot -> CPU pool handled the miss
     size_t   bytes_copied = 0;
+    // v0.2.3 prefill streamer
+    uint64_t stream_pairs = 0;    // pairs completed H2D this prompt
+    uint64_t stream_steals = 0;   // slots taken from consumed experts
+    uint64_t stream_drop = 0;     // zero-row pairs released early
+    uint64_t arm_timeouts = 0;    // stream_lookup gave up -> CPU pool
+    uint64_t read_errors = 0;     // pread() short/failed
   };
   Stats stats() const { return stats_; }
 
   int slot_count() const { return static_cast<int>(slot_count_); }
   size_t per_expert_bytes() const { return per_expert_bytes_; }
   int resident_count() const;
+
+  // ---- v0.2.3 prefill stream-all ring ------------------------------------
+
+  // Pure host planning: the hot-tier misses in (layer asc, expert asc) order.
+  // `resident` is a packed L*E bitmap of the HOT tier only (the arena side is
+  // reset by begin_stream). Unit-testable without CUDA.
+  struct StreamPlan {
+    std::vector<int32_t> pairs;    // packed layer*n_experts+expert, stream order
+    int n_layers = 0;
+    int n_experts = 0;
+  };
+  static StreamPlan build_stream_plan(const std::vector<uint8_t>& resident,
+                                      int n_layers, int n_experts);
+
+  // Hand the arena to the ring: clears the LRU mapping and stages the plan.
+  void begin_stream(const StreamPlan& plan);
+
+  // Start the loaders against a pool FILE (pread source; mmap host_base_ is
+  // pageable and defeats cudaMemcpyAsync - the slabs fix that). No-op on
+  // CPU-only builds and when the fd is invalid.
+  void stream_start(int pool_fd);
+
+  bool stream_active() const {
+#if defined(SAGER_HAVE_CUDA)
+    return stream_active_.load(std::memory_order_relaxed);
+#else
+    return false;
+#endif
+  }
+
+  // Slot of (layer, expert) once its copy is enqueued, else -1 after a
+  // bounded wait. Session thread only.
+  int stream_lookup(int layer, int expert);
+
+#if defined(SAGER_HAVE_CUDA)
+  // Order the compute stream behind the slot's ready copy (after lookup).
+  void stream_wait(cudaStream_t compute, int slot);
+  // Freed-for-refill marker, recorded ON the compute stream after the
+  // expert's last GEMM (stream-ordered, so the GEMMs really finished).
+  void stream_consume(cudaStream_t compute, int slot);
+#endif
+
+  // Release a pair the router never picked (zero-row) WITHOUT touching the
+  // compute stream: the slot becomes stealable, the pair unresidable.
+  void stream_consume_drop(int layer, int expert);
+
+  // Join the loaders. Slots still holding pairs stay LRU-resident (decode
+  // warm start); ring bookkeeping resets to plain pump state.
+  void stream_finish();
 
  private:
   size_t sidx(int layer, int expert) const {
@@ -136,10 +241,43 @@ class ExpertPump {
   std::vector<int> pending_;           // slots copied since last arm_wait
   size_t cursor_ = 0;                  // clock hand for eviction scans
 
+  // SAGER_PF_* knobs (plain ints: init() reads them on every build)
+  int arm_timeout_ms_ = 2000;          // SAGER_PF_ARM_TIMEOUT_MS
+  int n_readers_ = 2;                  // SAGER_PF_READERS
+  int slabs_per_reader_ = 16;          // SAGER_PF_SLABS
+
 #if defined(SAGER_HAVE_CUDA)
   void* arena_ = nullptr;
   cudaStream_t copy_stream_ = nullptr;
   std::vector<cudaEvent_t> events_;    // per-slot completion events
+
+  // ---- stream-all ring state ---------------------------------------------
+  // Loader threads mutate slot_of_/owner_/ring_* under stream_mu_; the
+  // session thread reads them there too (stream_lookup). Everything else
+  // stays session-thread only (C7d).
+  enum RingState : uint8_t { kRingFree = 0, kRingLoading = 1, kRingLoaded = 2 };
+  std::vector<uint8_t> ring_state_;    // per slot
+  std::vector<uint8_t> ring_owned_;    // slot belongs to the live session
+  std::vector<uint8_t> consumed_rec_;  // consume event recorded (host flag)
+  std::vector<cudaEvent_t> consumed_ev_;
+  StreamPlan plan_;
+  int pool_fd_ = -1;
+  std::atomic<bool> stream_active_{false};
+  std::vector<std::thread> loaders_;
+
+  void loader_loop(int tid);
+
+  struct Slab {
+    void* ptr = nullptr;
+    cudaEvent_t ev = nullptr;
+    bool used = false;                 // ev ever recorded (query safety)
+  };
+  std::vector<std::vector<Slab>> loader_slabs_;   // per loader thread
+  size_t stream_next_ = 0;             // next plan index (atomic via mu)
+
+  std::mutex stream_mu_;               // guards ring_* + slot_of_ + owner_ +
+                                       // stream_next_ while a session lives
+  std::condition_variable stream_cv_;  // publish signal for stream_lookup
 #endif
 };
 

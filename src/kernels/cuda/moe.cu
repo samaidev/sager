@@ -127,7 +127,180 @@ __global__ void scatter_rows_kernel(uint16_t* dst, const uint16_t* src,
 void scatter_rows_f16(uint16_t* dst, const uint16_t* src, const int* dst_rows,
                       int n_rows, int hidden, cudaStream_t stream) {
   dim3 block(256), grid((hidden + 255) / 256, n_rows);
-  scatter_rows_kernel<<<grid, block, 0, stream>>>(dst, src, dst_rows, hidden);
+  scatter_rows_kernel<<<grid, block, 0, stream>>>(dst, src, dst_rows, n_rows,
+                                                  hidden);
+}
+
+// ---------------------------------------------------------------------------
+// v0.2.3 batched prefill (Strata-style streamed walk) kernels
+// ---------------------------------------------------------------------------
+
+// Router top-k for every row of the chunk; one block per row.
+__global__ void router_topk_batched_kernel(const float* logits, int* idx,
+                                           float* weight, int n_expert, int k,
+                                           int stride, int n_rows) {
+  extern __shared__ float smem[];
+  float* prob = smem;
+  const int row = blockIdx.x;
+  if (row >= n_rows) return;
+  const float* lg = logits + static_cast<size_t>(row) * n_expert;
+  const int tid = threadIdx.x;
+
+  __shared__ float m_sh, z_sh;
+  if (tid == 0) {
+    float mx = -1e30f;
+    for (int i = 0; i < n_expert; ++i) mx = fmaxf(mx, lg[i]);
+    m_sh = mx;
+    float z = 0.f;
+    for (int i = 0; i < n_expert; ++i) z += expf(lg[i] - mx);
+    z_sh = z;
+  }
+  __syncthreads();
+  for (int i = tid; i < n_expert; i += blockDim.x) {
+    prob[i] = expf(lg[i] - m_sh) / z_sh;
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    float wsum = 0.f;
+    int* out_idx = idx + static_cast<size_t>(row) * stride;
+    float* out_w = weight + static_cast<size_t>(row) * stride;
+    for (int kk = 0; kk < k; ++kk) {
+      int best = -1;
+      float bp = -1.f;
+      for (int i = 0; i < n_expert; ++i) {
+        const float p = prob[i];
+        if (p == p && p > bp) { bp = p; best = i; }
+      }
+      if (best < 0) best = kk % n_expert;
+      prob[best] = -1.f;
+      out_idx[kk] = best;
+      out_w[kk] = bp;
+      wsum += bp;
+    }
+    if (wsum > 0.f) {
+      for (int kk = 0; kk < k; ++kk) out_w[kk] /= wsum;
+    }
+  }
+}
+
+// dst[r] = src[src_rows[r]] for whole BlockQ8K rows (routed-row compaction).
+__global__ void gather_rows_q8_kernel(q4k::BlockQ8K* dst,
+                                      const q4k::BlockQ8K* src,
+                                      const int* src_rows, int row_blocks) {
+  const int r = blockIdx.y;
+  const int b = blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= row_blocks) return;
+  const int src_r = src_rows[r];
+  dst[static_cast<size_t>(r) * row_blocks + b] =
+      src[static_cast<size_t>(src_r) * row_blocks + b];
+}
+
+// Compact per-expert outputs into the batched combine slab (see header).
+__global__ void scatter_routed_kernel(uint16_t* expert_y,
+                                      const uint16_t* grouped_out,
+                                      const int* gslot, int n_used,
+                                      int hidden) {
+  const int row = blockIdx.y;
+  const int kk = blockIdx.z;
+  const int gs = gslot[static_cast<size_t>(row) * n_used + kk];
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= hidden || gs < 0) return;
+  uint16_t* dst = expert_y +
+      (static_cast<size_t>(row) * (n_used + 1) + kk) * hidden + i;
+  *dst = grouped_out[static_cast<size_t>(gs) * hidden + i];
+}
+
+// Batched combine: out[row] = residual + sum_kk weight[row,kk] * expert_y
+// [row,kk]; slots are positional, n_used includes the shared slot.
+__global__ void moe_combine_batched_kernel(uint16_t* out,
+                                           const uint16_t* expert_y,
+                                           const float* weight, int n_used,
+                                           int hidden) {
+  const int row = blockIdx.y;
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= hidden) return;
+  float acc = ldh(out + static_cast<size_t>(row) * hidden + i);
+  const uint16_t* yrow = expert_y +
+      static_cast<size_t>(row) * (n_used + 1) * hidden;
+  const float* wrow = weight + static_cast<size_t>(row) * (n_used + 1);
+  for (int kk = 0; kk < n_used + 1; ++kk) {
+    acc += wrow[kk] * ldh(yrow + static_cast<size_t>(kk) * hidden + i);
+  }
+  sth(out + static_cast<size_t>(row) * hidden + i, acc);
+}
+
+// Batched shared-expert scalar gate.
+__global__ void sigmoid_gate_scalar_batched_kernel(uint16_t* out,
+                                                   const float* g,
+                                                   int hidden) {
+  const int row = blockIdx.y;
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= hidden) return;
+  const float gate = 1.f / (1.f + expf(-g[row]));
+  uint16_t* p = out + static_cast<size_t>(row) * hidden + i;
+  sth(p, __half2float(*reinterpret_cast<const __half*>(p)) * gate);
+}
+
+// CPU-pool fallback rows: dst[dst_flat[i]] = fp16(src[i]) rows.
+__global__ void scatter_rows_generic_kernel(uint16_t* dst,
+                                            const uint16_t* src,
+                                            const int* dst_flat, int hidden) {
+  const int i = blockIdx.y;
+  const int j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j < hidden) {
+    dst[static_cast<size_t>(dst_flat[i]) + j] =
+        src[static_cast<size_t>(i) * hidden + j];
+  }
+}
+
+}  // namespace
+
+void router_topk_batched(const float* logits, int* idx, float* weight,
+                         int n_expert, int n_expert_used, int idx_stride,
+                         int n_rows, cudaStream_t stream) {
+  router_topk_batched_kernel<<<n_rows, 128, n_expert * sizeof(float), stream>>>(
+      logits, idx, weight, n_expert, n_expert_used, idx_stride, n_rows);
+}
+
+void gather_rows_q8(q4k::BlockQ8K* dst, const q4k::BlockQ8K* src,
+                    const int* src_rows, int n_rows, int row_blocks,
+                    cudaStream_t stream) {
+  dim3 block(8), grid((row_blocks + 7) / 8, n_rows);
+  gather_rows_q8_kernel<<<grid, block, 0, stream>>>(dst, src, src_rows,
+                                                    row_blocks);
+}
+
+void scatter_routed_f16(uint16_t* expert_y, const uint16_t* grouped_out,
+                        const int* gslot, int n_rows, int n_used, int hidden,
+                        cudaStream_t stream) {
+  dim3 block(256), grid((hidden + 255) / 256, n_rows, n_used);
+  scatter_routed_kernel<<<grid, block, 0, stream>>>(expert_y, grouped_out,
+                                                    gslot, n_used, hidden);
+}
+
+void moe_combine_batched_f16(uint16_t* out, const uint16_t* expert_y,
+                             const float* weight, int n_used, int hidden,
+                             int n_rows, cudaStream_t stream) {
+  dim3 block(256), grid((hidden + 255) / 256, n_rows);
+  moe_combine_batched_kernel<<<grid, block, 0, stream>>>(
+      out, expert_y, weight, n_used, hidden);
+}
+
+void sigmoid_gate_scalar_batched_f16(uint16_t* out, const float* g,
+                                     int n_rows, int hidden,
+                                     cudaStream_t stream) {
+  dim3 block(256), grid((hidden + 255) / 256, n_rows);
+  sigmoid_gate_scalar_batched_kernel<<<grid, block, 0, stream>>>(
+      out, g, hidden);
+}
+
+void scatter_rows_generic_f16(uint16_t* dst, const uint16_t* src,
+                              const int* dst_flat, int n_list, int hidden,
+                              cudaStream_t stream) {
+  dim3 block(256), grid((hidden + 255) / 256, n_list);
+  scatter_rows_generic_kernel<<<grid, block, 0, stream>>>(dst, src, dst_flat,
+                                                          hidden);
 }
 
 }  // namespace sager::cuda

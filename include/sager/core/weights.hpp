@@ -94,6 +94,9 @@ class Weights {
   // experts live at host_pinned_experts + (layer*n_expert + e)*expert_bytes
   uint8_t* host_expert_base() const { return expert_pool_host_; }
   size_t   expert_pool_bytes() const { return expert_pool_bytes_; }
+  // File descriptor of the file-backed expert pool (pread source for the
+  // prefill streamer); -1 when the pool is pinned/anonymous RAM.
+  int      expert_pool_fd() const { return pool_map_fd_; }
 
   const std::vector<LayerWeights>& layers() const { return layers_; }
 
