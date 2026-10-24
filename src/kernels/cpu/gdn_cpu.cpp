@@ -27,16 +27,16 @@ inline float softplusf(float x) {
 
 }  // namespace
 
-void gate(const uint16_t* ba, const float* A_log, const float* dt_bias,
-          float* ab, int nk) {
-  for (int h = 0; h < nk; ++h) {
-    const float b = h2f(ba[h]);
-    const float a = h2f(ba[nk + h]);
+void gate(const uint16_t* ba, const float* A, const float* dt_bias,
+          float* ab, int nv) {
+  for (int h = 0; h < nv; ++h) {
+    const float b = h2f(ba[h]);              // b part: rows [0, nv)
+    const float a = h2f(ba[nv + h]);         // a part: rows [nv, 2*nv)
     const float beta = sigmoidf(b);                       // C-GDN-2
     const float dt = softplusf(a + dt_bias[h]);
-    const float g = -std::exp(A_log[h]) * dt;             // C-GDN-3
-    ab[2 * h + 0] = std::exp(g);                          // alpha
-    ab[2 * h + 1] = beta;
+    const float g = A[h] * dt;   // A = -exp(A_log) pre-negated (C-GDN-3)
+    ab[h] = std::exp(g);                                  // alpha
+    ab[nv + h] = beta;
   }
 }
 
@@ -57,31 +57,23 @@ void conv_step(uint16_t* conv_out, uint16_t* conv_state, const uint16_t* proj,
   }
 }
 
-void qk_norm(uint16_t* qn, uint16_t* kn, const uint16_t* conv_out,
-             const uint16_t* wq, const uint16_t* wk, int nk, int K,
-             float eps) {
+void l2_norm(uint16_t* qn, uint16_t* kn, const uint16_t* conv_out,
+             int nk, int K, float eps) {
   const int off_k = nk * K;  // k part starts after the q part in conv_out
   for (int h = 0; h < nk; ++h) {
-    // RMSNorm with learned weight, then L2-normalize (C-GDN-1)
-    auto norm_head = [&](const uint16_t* src, const uint16_t* w,
-                         uint16_t* dst) {
+    // per-head L2: y = x / sqrt(sum(x^2) + eps)  (C-GDN-1, no weight)
+    auto norm_head = [&](const uint16_t* src, uint16_t* dst) {
       float ss = 0.f;
       for (int i = 0; i < K; ++i) {
         const float v = h2f(src[h * K + i]);
         ss += v * v;
       }
-      const float inv = 1.f / std::sqrt(ss / static_cast<float>(K) + eps);
-      float l2 = 0.f;
-      for (int i = 0; i < K; ++i) {
-        const float v = h2f(src[h * K + i]) * inv * h2f(w[i]);
-        l2 += v * v;
-      }
-      const float invl = 1.f / std::sqrt(l2 + 1e-12f);
+      const float inv = 1.f / std::sqrt(ss + eps);
       for (int i = 0; i < K; ++i)
-        dst[h * K + i] = f2h(h2f(src[h * K + i]) * inv * h2f(w[i]) * invl);
+        dst[h * K + i] = f2h(h2f(src[h * K + i]) * inv);
     };
-    norm_head(conv_out, wq, qn);
-    norm_head(conv_out + off_k, wk, kn);
+    norm_head(conv_out, qn);
+    norm_head(conv_out + off_k, kn);
   }
 }
 
@@ -89,9 +81,8 @@ void delta_step(float* state, uint16_t* y, const uint16_t* qn,
                 const uint16_t* kn, const uint16_t* v, const float* ab,
                 int nk, int K, int ratio, int V) {
   const int rows = ratio * V;
+  const int nv = nk * ratio;
   for (int h = 0; h < nk; ++h) {
-    const float alpha = ab[2 * h + 0];
-    const float beta = ab[2 * h + 1];
     float* S = state + static_cast<size_t>(h) * rows * K;
     // per-head normalized q/k (fp16 in, fp32 math)
     std::vector<float> q(K), k(K);
@@ -109,7 +100,12 @@ void delta_step(float* state, uint16_t* y, const uint16_t* qn,
       u[j] = acc;
     }
     // S <- alpha*S - alpha*beta*u k^T + beta*v k^T ; y_j = S_new[j,:] . q
+    // alpha/beta are PER V-HEAD: value row j of k-head h belongs to
+    // v-head h*ratio + j/V (ab layout: {alpha[nv] | beta[nv]}).
     for (int j = 0; j < rows; ++j) {
+      const int vh = h * ratio + j / V;
+      const float alpha = ab[vh];
+      const float beta = ab[nv + vh];
       const float vj = h2f(v_h[j]);
       float yj = 0.f;
       for (int i = 0; i < K; ++i) {

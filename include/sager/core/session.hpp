@@ -179,6 +179,9 @@ class Session {
   DeviceBuffer<SeqParams> d_params_;
   DeviceBuffer<int> d_ids_, d_pos_ids_;
   DeviceBuffer<uint16_t> x_, x2_, xn_, xn2_, q_, k_, v_, attn_out_, o_proj_;
+  DeviceBuffer<uint16_t> d_gate_;        // attn sigmoid-gate activations
+  DeviceBuffer<float>    d_shared_gate_; // shared-expert scalar logit
+  DeviceBuffer<uint16_t> d_logits16_;    // F16 head output (Q6_K->F16 files)
   DeviceBuffer<uint16_t> expert_g_, expert_u_, expert_y_, shared_y_;
   DeviceBuffer<uint16_t> xf_, d_cat_, d_m1_;
   DeviceBuffer<float>    route_logits_, d_miss_y_;

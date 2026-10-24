@@ -63,19 +63,20 @@ inline int pow2_block(int n) {
 }
 
 // ---------------------------------------------------------------------------
-// gate: ab[2h] = {alpha, beta} from ba (fp16), A_log / dt_bias (fp32).
+// gate: ab = {alpha[nv] | beta[nv]} from ba (fp16, [b|a] per v-head),
+// A (fp32, pre-negated -exp) and dt_bias (fp32), all per v-head.
 // ---------------------------------------------------------------------------
-__global__ void gdn_gate_kernel(const uint16_t* ba, const float* A_log,
-                                const float* dt_bias, float* ab, int nk) {
+__global__ void gdn_gate_kernel(const uint16_t* ba, const float* A,
+                                const float* dt_bias, float* ab, int nv) {
   const int h = blockIdx.x * blockDim.x + threadIdx.x;
-  if (h >= nk) return;
+  if (h >= nv) return;
   const float b = ldh(ba + h);
-  const float a = ldh(ba + nk + h);
+  const float a = ldh(ba + nv + h);
   const float beta = 1.f / (1.f + expf(-b));
   const float dt = softplusf(a + dt_bias[h]);
-  const float g = -expf(A_log[h]) * dt;
-  ab[2 * h + 0] = expf(g);
-  ab[2 * h + 1] = beta;
+  const float g = A[h] * dt;   // A = -exp(A_log) pre-negated
+  ab[h] = expf(g);             // alpha
+  ab[nv + h] = beta;
 }
 
 // ---------------------------------------------------------------------------
@@ -102,12 +103,12 @@ __global__ void gdn_conv_step_kernel(uint16_t* conv_out, uint16_t* conv_state,
 }
 
 // ---------------------------------------------------------------------------
-// qk norm: per k-head RMSNorm(w) then L2-normalize, for both q and k parts.
-// One block per head; two sequential in-block passes (q, then k).
+// l2 norm: per-head L2 normalization of the q and k parts (y = x /
+// sqrt(sum(x^2) + eps), no learnable weight). One block per head; two
+// sequential in-block passes (q, then k).
 // ---------------------------------------------------------------------------
-__global__ void gdn_qk_norm_kernel(uint16_t* qn, uint16_t* kn,
+__global__ void gdn_l2_norm_kernel(uint16_t* qn, uint16_t* kn,
                                    const uint16_t* conv_out,
-                                   const uint16_t* wq, const uint16_t* wk,
                                    int K, float eps) {
   extern __shared__ float sm[];            // K (values) + 1 (reduction)
   float* vals = sm;
@@ -117,8 +118,7 @@ __global__ void gdn_qk_norm_kernel(uint16_t* qn, uint16_t* kn,
   const int tid = threadIdx.x;
   const int off_k = gridDim.x * K;         // k part starts after all q heads
 
-  // head-normalize one part: src -> rmsnorm(w) -> L2 normalize -> dst
-  // (lambda kept out; two explicit passes keep the smem reuse obvious)
+  // q part
   const uint16_t* src_q = conv_out + static_cast<size_t>(h) * K;
   float ss = 0.f;
   for (int i = tid; i < K; i += blockDim.x) {
@@ -126,20 +126,13 @@ __global__ void gdn_qk_norm_kernel(uint16_t* qn, uint16_t* kn,
     vals[i] = v;
     ss += v * v;
   }
-  const float inv_rms =
-      rsqrtf(block_sum_reduce(red, ss) / static_cast<float>(K) + eps);
-  float l2 = 0.f;
+  const float inv_q = rsqrtf(block_sum_reduce(red, ss) + eps);
   for (int i = tid; i < K; i += blockDim.x) {
-    const float t = vals[i] * inv_rms * ldh(wq + i);
-    vals[i] = t;
-    l2 += t * t;
-  }
-  const float inv_l2 = rsqrtf(block_sum_reduce(red, l2) + 1e-12f);
-  for (int i = tid; i < K; i += blockDim.x) {
-    sth(qn + static_cast<size_t>(h) * K + i, vals[i] * inv_l2);
+    sth(qn + static_cast<size_t>(h) * K + i, vals[i] * inv_q);
   }
   __syncthreads();
 
+  // k part
   const uint16_t* src_k = conv_out + off_k + static_cast<size_t>(h) * K;
   ss = 0.f;
   for (int i = tid; i < K; i += blockDim.x) {
@@ -147,38 +140,31 @@ __global__ void gdn_qk_norm_kernel(uint16_t* qn, uint16_t* kn,
     vals[i] = v;
     ss += v * v;
   }
-  const float inv_rms_k =
-      rsqrtf(block_sum_reduce(red, ss) / static_cast<float>(K) + eps);
-  l2 = 0.f;
+  const float inv_k = rsqrtf(block_sum_reduce(red, ss) + eps);
   for (int i = tid; i < K; i += blockDim.x) {
-    const float t = vals[i] * inv_rms_k * ldh(wk + i);
-    vals[i] = t;
-    l2 += t * t;
-  }
-  const float inv_l2_k = rsqrtf(block_sum_reduce(red, l2) + 1e-12f);
-  for (int i = tid; i < K; i += blockDim.x) {
-    sth(kn + static_cast<size_t>(h) * K + i, vals[i] * inv_l2_k);
+    sth(kn + static_cast<size_t>(h) * K + i, vals[i] * inv_k);
   }
 }
 
 // ---------------------------------------------------------------------------
 // delta step: one block per k-head, one thread per state row j.
+//   vh  = h*ratio + j/V   (the v-head owning state row j)
 //   u   = S[j,:] . k
 //   S[j,:] <- alpha*S[j,:] - alpha*beta*u*k + beta*v_j*k
 //   y_j = S_new[j,:] . q
+// ab layout: {alpha[nv] | beta[nv]}
 // ---------------------------------------------------------------------------
 __global__ void gdn_delta_step_kernel(float* state, uint16_t* y,
                                       const uint16_t* qn, const uint16_t* kn,
                                       const uint16_t* v, const float* ab,
-                                      int K, int rows) {
+                                      int K, int rows, int ratio, int V) {
   extern __shared__ float sm[];            // k[K] + q[K] (+1 pad)
   float* ks = sm;
   float* qs = sm + K;
 
   const int h = blockIdx.x;
   const int tid = threadIdx.x;
-  const float alpha = ab[2 * h + 0];
-  const float beta = ab[2 * h + 1];
+  const int nv = gridDim.x * ratio;
 
   for (int i = tid; i < K; i += blockDim.x) {
     ks[i] = ldh(kn + static_cast<size_t>(h) * K + i);
@@ -189,6 +175,9 @@ __global__ void gdn_delta_step_kernel(float* state, uint16_t* y,
   float* S = state + static_cast<size_t>(h) * rows * K;
   const uint16_t* v_h = v + static_cast<size_t>(h) * rows;
   for (int j = tid; j < rows; j += blockDim.x) {
+    const int vh = h * ratio + j / V;
+    const float alpha = ab[vh];
+    const float beta = ab[nv + vh];
     float u = 0.f;
     for (int i = 0; i < K; ++i) u += S[static_cast<size_t>(j) * K + i] * ks[i];
     const float vj = ldh(v_h + j);
@@ -234,11 +223,11 @@ __global__ void gdn_out_norm_kernel(uint16_t* out, const uint16_t* y,
 }  // namespace
 
 // ---- launchers -------------------------------------------------------------
-void gdn_gate_f32(const uint16_t* ba, const float* A_log, const float* dt_bias,
-                  float* ab, int nk, cudaStream_t stream) {
+void gdn_gate_f32(const uint16_t* ba, const float* A, const float* dt_bias,
+                  float* ab, int nv, cudaStream_t stream) {
   const int block = 128;
-  gdn_gate_kernel<<<(nk + block - 1) / block, block, 0, stream>>>(
-      ba, A_log, dt_bias, ab, nk);
+  gdn_gate_kernel<<<(nv + block - 1) / block, block, 0, stream>>>(
+      ba, A, dt_bias, ab, nv);
 }
 
 void gdn_conv_step_f16(uint16_t* conv_out, uint16_t* conv_state,
@@ -250,13 +239,11 @@ void gdn_conv_step_f16(uint16_t* conv_out, uint16_t* conv_state,
       conv_out, conv_state, proj, w, b, conv_dim, ck);
 }
 
-void gdn_qk_norm_f16(uint16_t* qn, uint16_t* kn, const uint16_t* conv_out,
-                     const uint16_t* wq, const uint16_t* wk, int nk, int K,
-                     float eps, cudaStream_t stream) {
+void gdn_l2_norm_f16(uint16_t* qn, uint16_t* kn, const uint16_t* conv_out,
+                     int nk, int K, float eps, cudaStream_t stream) {
   const int block = 128;
   const size_t smem = (static_cast<size_t>(K) + 1) * sizeof(float);
-  gdn_qk_norm_kernel<<<nk, block, smem, stream>>>(qn, kn, conv_out, wq, wk,
-                                                  K, eps);
+  gdn_l2_norm_kernel<<<nk, block, smem, stream>>>(qn, kn, conv_out, K, eps);
 }
 
 void gdn_delta_step_f16(float* state, uint16_t* y, const uint16_t* qn,
@@ -267,7 +254,7 @@ void gdn_delta_step_f16(float* state, uint16_t* y, const uint16_t* qn,
   const int block = pow2_block(rows);
   const size_t smem = (2 * static_cast<size_t>(K) + 1) * sizeof(float);
   gdn_delta_step_kernel<<<nk, block, smem, stream>>>(state, y, qn, kn, v, ab,
-                                                     K, rows);
+                                                     K, rows, ratio, V);
 }
 
 void gdn_out_norm_f16(uint16_t* out, const uint16_t* y, const uint16_t* z,

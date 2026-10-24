@@ -32,37 +32,49 @@ namespace sager {
 struct LayerWeights {
   // All device pointers (nullptr on CPU-only builds / not-present tensors).
   uint16_t* attn_norm   = nullptr;   // [hidden] fp16
-  uint16_t* wq          = nullptr;   // Q4_K attention projections (nullptr on
-  uint16_t* wk          = nullptr;   // gated-delta layers)
+  // Q4_K attention projections. On qwen3.5-style gated attention the q
+  // projection carries [q | gate] (2*n_head*head_dim rows); wq points at the
+  // q half and attn_gate at the sigmoid-gate half. Legacy (v0.1) files have
+  // attn_gate == nullptr and wq covers n_head*head_dim rows only.
+  uint16_t* wq          = nullptr;
+  uint16_t* attn_gate   = nullptr;
+  uint16_t* wk          = nullptr;   // nullptr on gated-delta layers
   uint16_t* wv          = nullptr;
   uint16_t* wo          = nullptr;
+  // Per-head q/k RMSNorm weights of the FULL-attention layers (fp16,
+  // [head_dim]); GDN layers have none (nullptr).
+  uint16_t* attn_q_norm = nullptr;
+  uint16_t* attn_k_norm = nullptr;
+  // True when the q projection carries [q | gate] (qwen3.5 gated attention);
+  // legacy v0.1 files have plain q and the engine skips the gate multiply.
+  bool attn_gated = false;
   // MoE block
   uint16_t* ffn_norm    = nullptr;   // [hidden]
   float*    router      = nullptr;   // [n_expert * hidden] fp32 (tiny, exact)
+  float*    shared_gate_w = nullptr; // [hidden] fp32 router of the shared expert
   uint16_t* shared_gate = nullptr;
   uint16_t* shared_up   = nullptr;
   uint16_t* shared_out  = nullptr;
 
   // ---- v0.2: gated delta net (linear attention) layers --------------------
   // Carved from ONE cudaMalloc per layer (freed via lin_in_qkvz in unload).
-  //   in_qkvz  Q4_K [proj_rows x hidden]  fused q|k|v|z projection
-  //   in_ba    Q4_K [2*nk x hidden]       beta/a projections
+  //   in_qkvz  Q4_K [proj_rows x hidden]  fused q|k|v|z projection (the
+  //            checkpoint's attn_qkv + attn_gate tensors row-concatenated)
+  //   in_ba    Q4_K [2*nv x hidden]       beta|a projections (per V-head)
   //   out_proj Q4_K [hidden x nv*V]       output projection
   //   conv_w   fp16 [conv_dim x ck]       depthwise causal conv taps
   //   conv_b   fp16 [conv_dim]            conv bias (optional, may be null)
-  //   A_log    fp32 [nk]                  gate decay parameter
-  //   dt_bias  fp32 [nk]                  softplus offset
-  //   q_norm / k_norm  fp16 [K]           per-head pre-normalization
+  //   A        fp32 [nv]                  gate decay (checkpoint ssm_a:
+  //                                     pre-negated -exp(A_log))
+  //   dt_bias  fp32 [nv]                  softplus offset
   //   o_norm   fp16 [V]                   output-gate normalization
   uint16_t* lin_in_qkvz = nullptr;
   uint16_t* lin_in_ba   = nullptr;
   uint16_t* lin_out     = nullptr;
   uint16_t* lin_conv_w  = nullptr;
   uint16_t* lin_conv_b  = nullptr;
-  float*    lin_A_log   = nullptr;
+  float*    lin_A_log   = nullptr;   // holds ssm_a (already -exp(A_log))
   float*    lin_dt_bias = nullptr;
-  uint16_t* lin_q_norm  = nullptr;
-  uint16_t* lin_k_norm  = nullptr;
   uint16_t* lin_o_norm  = nullptr;
 };
 
@@ -87,7 +99,7 @@ class Weights {
 
   // Embedding / head
   uint16_t* tok_embd    = nullptr;   // [n_vocab x hidden] fp16
-  uint16_t* output      = nullptr;   // [hidden x n_vocab] fp16 (tied if absent)
+  uint16_t* output      = nullptr;   // head: Q4_K blocks or fp16 (head_type_)
   uint16_t* output_norm = nullptr;   // [hidden]
 
   // MTP head (optional; used by the drafter)
@@ -96,7 +108,11 @@ class Weights {
   bool mtp_present = false;
 
   EngineDims dims{};
-  uint32_t head_type_ = 12;   // GGUF dtype of output head (12=Q4_K, 14=Q6_K)
+
+  // head_type_: GGUF dtype of the resident head matrix.
+  //   12 = Q4_K (native quant, Q4 GEMV path)
+  //    1 = fp16 (Q6_K head dequantized at load; F16 GEMV path)
+  uint32_t head_type_ = 12;
   int      head_rows_ = 0;    // n_vocab (rows of the head matrix)
 
  private:

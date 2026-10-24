@@ -3,9 +3,11 @@
 # (gated delta net) CPU reference, straight from the spec conventions
 # documented in docs/gdn-kernel.md:
 #
-#   C-GDN-1  q,k: per-head RMSNorm(w) then L2-normalize
-#   C-GDN-2  beta = sigmoid(b)
-#   C-GDN-3  g = -exp(A_log) * softplus(a + dt_bias); alpha = exp(g)
+#   C-GDN-1  q,k: per-head L2-normalize (y = x / sqrt(sum(x^2) + eps)),
+#            NO learnable weight (real Sage-A1.5 GDN layers)
+#   C-GDN-2  beta = sigmoid(b), per v-head
+#   C-GDN-3  g = A[h] * softplus(a + dt_bias[h]) per v-head, where the
+#            checkpoint stores A = -exp(A_log) pre-negated; alpha = exp(g)
 #   C-GDN-4  state S [ratio*V x K]; step:
 #              u     = S @ k
 #              S_new = alpha*S - alpha*beta*u*k^T + beta*v*k^T   (rank-1 delta)
@@ -37,13 +39,16 @@ def silu(x):
 def softplus(x):
     return np.log1p(np.exp(-np.abs(x))) + np.maximum(x, 0.0)
 
-def delta_step(S, qh, kh, vh, alpha, beta):
-    """S [ratio*V x K]; returns (S_new, y). Spec C-GDN-4."""
-    u = S @ kh                                  # [ratio*V]
-    S_new = alpha * S - alpha * beta * np.outer(u, kh) \
-            + beta * np.outer(vh, kh)
-    y = S_new @ qh
-    return S_new, y
+def delta_step_row(S, j, qh, kh, vj, alpha_j, beta_j, K):
+    """One state-row delta update (spec C-GDN-4, per-row alpha/beta).
+    Returns (S_new, y_j). Other rows are untouched this call - the caller
+    walks rows in order; u is recomputed against the CURRENT S row."""
+    u = S[j] @ kh
+    S_new = S.copy()
+    S_new[j] = alpha_j * S[j] - alpha_j * beta_j * u * kh \
+               + beta_j * vj * kh
+    y_j = S_new[j] @ qh
+    return S_new, y_j
 
 # ---------------- case 1: conv step ----------------
 conv_state = rng.standard_normal((CONV_DIM, CK - 1)).astype(np.float64)
@@ -54,33 +59,40 @@ win = np.concatenate([conv_state, xrow[:, None]], axis=1)   # [D, CK]
 conv_out = silu((win * conv_w).sum(axis=1) + conv_b)
 conv_state_new = np.concatenate([conv_state[:, 1:], xrow[:, None]], axis=1)
 
-# ---------------- case 2: gate ----------------
-b_raw = rng.standard_normal(NK).astype(np.float64)
-a_raw = rng.standard_normal(NK).astype(np.float64)
-A_log = rng.standard_normal(NK).astype(np.float64) * 0.3
-dt_bias = rng.standard_normal(NK).astype(np.float64) * 0.3
+# ---------------- case 2: gate (per V-head) ----------------
+b_raw = rng.standard_normal(NV).astype(np.float64)
+a_raw = rng.standard_normal(NV).astype(np.float64)
+A = -np.exp(rng.standard_normal(NV).astype(np.float64) * 0.3)  # pre-negated
+dt_bias = rng.standard_normal(NV).astype(np.float64) * 0.3
 beta = 1.0 / (1.0 + np.exp(-b_raw))
 dt = softplus(a_raw + dt_bias)
-g = -np.exp(A_log) * dt
+g = A * dt
 alpha = np.exp(g)
 
 # ---------------- case 3: delta step ----------------
 S0 = rng.standard_normal((NK, RATIO * V, K)).astype(np.float64)
-# C-GDN-1 weights are SHARED across heads ([head_dim] each), matching
-# Qwen3-Next's q_norm/k_norm and the engine's lin_q_norm/lin_k_norm layout.
-qn_w = np.abs(rng.standard_normal(K)) + 0.5
-kn_w = np.abs(rng.standard_normal(K)) + 0.5
+# C-GDN-1: plain L2, no weights. eps matches the engine (norm_eps).
+GEPS = 1e-6
 q_raw = rng.standard_normal((NK, K)).astype(np.float64)
 k_raw = rng.standard_normal((NK, K)).astype(np.float64)
 v_all = rng.standard_normal((NV, V)).astype(np.float64)   # [nv, V] heads
 
-qh = np.stack([l2n(rmsnorm(q_raw[h], qn_w)) for h in range(NK)])
-kh = np.stack([l2n(rmsnorm(k_raw[h], kn_w)) for h in range(NK)])
+qh = np.stack([q_raw[h] / np.sqrt((q_raw[h] ** 2).sum() + GEPS)
+               for h in range(NK)])
+kh = np.stack([k_raw[h] / np.sqrt((k_raw[h] ** 2).sum() + GEPS)
+               for h in range(NK)])
 S1 = np.empty_like(S0)
 y_all = np.empty((NK, RATIO * V))
 for h in range(NK):
-    vh = v_all[h * RATIO:(h + 1) * RATIO].reshape(RATIO * V)  # concat v-heads
-    S1[h], y_all[h] = delta_step(S0[h], qh[h], kh[h], vh, alpha[h], beta[h])
+    # alpha/beta are per V-head: row j of k-head h is v-head h*ratio + j/V.
+    vh_vec = v_all[h * RATIO:(h + 1) * RATIO].reshape(RATIO * V)
+    S_h = S0[h].copy()
+    y_h = np.empty(RATIO * V)
+    for j in range(RATIO * V):
+        vhead = h * RATIO + j // V
+        S_h, y_h[j] = delta_step_row(S_h, j, qh[h], kh[h], vh_vec[j],
+                                     alpha[vhead], beta[vhead], K)
+    S1[h], y_all[h] = S_h, y_h
 
 # ---------------- case 4: out norm ----------------
 won = np.abs(rng.standard_normal(V)) + 0.5
@@ -115,15 +127,13 @@ emit("g_conv_out", conv_out)
 emit("g_conv_state_new", conv_state_new)
 emit("g_b_raw", b_raw)
 emit("g_a_raw", a_raw)
-emit("g_A_log", A_log)
+emit("g_A", A)
 emit("g_dt_bias", dt_bias)
 emit("g_alpha", alpha)
 emit("g_beta", beta)
 emit("g_S0", S0)
 emit("g_q_raw", q_raw)
 emit("g_k_raw", k_raw)
-emit("g_qn_w", qn_w)
-emit("g_kn_w", kn_w)
 emit("g_v_all", v_all)
 emit("g_qh", qh)
 emit("g_kh", kh)

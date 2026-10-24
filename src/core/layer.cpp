@@ -74,8 +74,9 @@ Status HotTier::rebuild(const ExpertCache& cache, const Weights& w,
 
 #if defined(SAGER_HAVE_CUDA)
 void shared_expert_forward(const Weights& w, int layer,
-                           const q4k::BlockQ8K* xq, uint16_t* y,
-                           int hidden, int n_ff_exp, cudaStream_t s) {
+                           const q4k::BlockQ8K* xq, const uint16_t* x_f16,
+                           uint16_t* y, int hidden, int n_ff_exp,
+                           cudaStream_t s) {
   const LayerWeights& lw = w.layers()[static_cast<size_t>(layer)];
   if (!lw.shared_gate) return;
   // y_ffn = W_out @ (silu(W_g x) * (W_u x))  - three small GEMVs.
@@ -88,6 +89,13 @@ void shared_expert_forward(const Weights& w, int layer,
   cuda::silu_mul_f16(g, g, u, 1, n_ff_exp, s);
   cuda::gemv_q4_k_q8_f16out(reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_out), reinterpret_cast<q4k::BlockQ8K*>(g),
                             y, hidden, n_ff_exp, s);
+  // qwen3.5: the shared expert is scaled by sigmoid(router_shexp . x)
+  // (a learned scalar gate per token; absent in legacy v0.1 files).
+  if (lw.shared_gate_w) {
+    float* gate = reinterpret_cast<float*>(u);  // reuse scratch (4 B >= 2 B)
+    cuda::gemv_f32_out_f16x(lw.shared_gate_w, x_f16, gate, 1, hidden, s);
+    cuda::sigmoid_gate_scalar_f16(y, gate, hidden, s);
+  }
 }
 #endif
 

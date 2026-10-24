@@ -129,6 +129,8 @@ Status Session::alloc_scratch() {
   if (!ok(k_.alloc(static_cast<size_t>(T) * KVd))) return Status::kOomVram;
   if (!ok(v_.alloc(static_cast<size_t>(T) * KVd))) return Status::kOomVram;
   if (!ok(attn_out_.alloc(static_cast<size_t>(T) * Q))) return Status::kOomVram;
+  if (!ok(d_gate_.alloc(static_cast<size_t>(T) * Q))) return Status::kOomVram;
+  if (!ok(d_shared_gate_.alloc(1))) return Status::kOomVram;
   if (!ok(o_proj_.alloc(static_cast<size_t>(T) * H))) return Status::kOomVram;
   if (!ok(xf_.alloc(H))) return Status::kOomVram;        // MTP hidden stash
   if (!ok(d_cat_.alloc(2 * H))) return Status::kOomVram;
@@ -158,6 +160,7 @@ Status Session::alloc_scratch() {
 
   // Head + io
   if (!ok(logits_.alloc(V))) return Status::kOomVram;
+  if (!ok(d_logits16_.alloc(V))) return Status::kOomVram;
   mtp_logits_.alloc(0);
   if (!ok(d_params_.alloc(1))) return Status::kOomVram;
   if (!ok(d_ids_.alloc(T))) return Status::kOomVram;
@@ -186,7 +189,7 @@ Status Session::alloc_scratch() {
     return Status::kOomVram;
   if (!ok(lin_on_.alloc(static_cast<size_t>(g.y_rows()))))
     return Status::kOomVram;
-  if (!ok(lin_ab_.alloc(static_cast<size_t>(2 * g.n_k_heads))))
+  if (!ok(lin_ab_.alloc(static_cast<size_t>(2 * g.n_v_heads))))
     return Status::kOomVram;
   if (!ok(lin_conv_state_.alloc(static_cast<size_t>(n_gdn) *
                                 g.conv_state_elems())))
@@ -213,7 +216,7 @@ Status Session::prepare() {
     SLOG_E("session", "prepare called before weights load");
     return Status::kInvalidArgument;
   }
-  if (w_.head_type_ != 12) {
+  if (w_.head_type_ != 12 && w_.head_type_ != 1) {
     SLOG_E("session", "unsupported output head dtype %u (need Q4_K=12); "
                       "re-convert with tools/convert_hf_to_sager.py",
            w_.head_type_);
@@ -365,6 +368,24 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
     cuda::gemv_q4_k_q8_f16out_batched(Q4W(lw.wv), d_xq_.get(), v_.get(), KVd, H,
                                       n_tokens, s);
   }
+  // qwen3.5 gated attention: separate GEMV for the sigmoid-gate half of the
+  // q projection (legacy files: attn_gated == false, gate stays zero).
+  if (lw.attn_gated) {
+    if (n_tokens == 1) {
+      cuda::gemv_q4_k_q8_f16out(Q4W(lw.attn_gate), d_xq_.get(), d_gate_.get(),
+                                Q, H, s);
+    } else {
+      cuda::gemv_q4_k_q8_f16out_batched(Q4W(lw.attn_gate), d_xq_.get(),
+                                        d_gate_.get(), Q, H, n_tokens, s);
+    }
+  }
+  // per-head q/k RMSNorm (full-attention layers only; no-op when absent)
+  if (lw.attn_q_norm) {
+    cuda::rmsnorm_batched_f16(q_.get(), q_.get(), lw.attn_q_norm, d.head_dim,
+                              mc_.norm_eps, n_tokens * d.n_head, s);
+    cuda::rmsnorm_batched_f16(k_.get(), k_.get(), lw.attn_k_norm, d.head_dim,
+                              mc_.norm_eps, n_tokens * d.n_head_kv, s);
+  }
   cuda::rope_f16(q_.get(), k_.get(), d_pos_ids_.get(), d.n_head, d.n_head_kv,
                  d.head_dim, rope_dims, mc_.rope_theta, mc_.rope_style,
                  n_tokens, s);
@@ -396,6 +417,10 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
                                 1.0f / std::sqrt(static_cast<float>(d.head_dim)),
                                 n_tokens, s);
   }
+  if (lw.attn_gated) {
+    cuda::sigmoid_mul_rows_f16(attn_out_.get(), d_gate_.get(),
+                               n_tokens * Q, Q, Q, 0, s);
+  }
   if (n_tokens == 1) {
     cuda::quantize_q8_k(attn_out_.get(), d_hq_.get(), Q, s);
     cuda::gemv_q4_k_q8_f16out(Q4W(lw.wo), d_hq_.get(), o_proj_.get(), H, Q, s);
@@ -423,6 +448,7 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
 void Session::linear_layer_launch(int layer, int n_tokens) {
   const EngineDims& d = mc_.dims;
   const GdnParams g = mc_.gdn();
+  const int nv = g.n_v_heads;
   const LayerWeights& lw = w_.layers()[static_cast<size_t>(layer)];
   const int H = d.hidden;
   const int nk = g.n_k_heads;
@@ -452,11 +478,10 @@ void Session::linear_layer_launch(int layer, int n_tokens) {
                             g.conv_kernel, s);
     // data-dependent gates: alpha/beta per k-head
     cuda::gdn_gate_f32(lin_ba_.get(), lw.lin_A_log, lw.lin_dt_bias,
-                       lin_ab_.get(), nk, s);
-    // per-head RMSNorm + L2 normalization of q/k (C-GDN-1)
-    cuda::gdn_qk_norm_f16(lin_qn_.get(), lin_kn_.get(), lin_conv_.get(),
-                          lw.lin_q_norm, lw.lin_k_norm, nk, K, mc_.norm_eps,
-                          s);
+                       lin_ab_.get(), nv, s);
+    // per-head L2 normalization of q/k (C-GDN-1; no learnable weight)
+    cuda::gdn_l2_norm_f16(lin_qn_.get(), lin_kn_.get(), lin_conv_.get(),
+                          nk, K, mc_.norm_eps, s);
     // rank-1 gated delta update of the persistent state (C-GDN-4)
     cuda::gdn_delta_step_f16(delta_st, lin_y_.get(), lin_qn_.get(),
                              lin_kn_.get(),
@@ -579,8 +604,8 @@ void Session::moe_dispatch_row(int layer, int row) {
                     K, s);
 
   // Shared expert into combine row K (weight 1, see prepare()).
-  detail::shared_expert_forward(w_, layer, d_hq_.get(), shared_y_.get(), H,
-                                FFX, s);
+  detail::shared_expert_forward(w_, layer, d_hq_.get(), xn_row, shared_y_.get(),
+                                H, FFX, s);
 
   // Router decision to the host + the miss-path activation row (C1).
   cudaMemcpyAsync(h_route_idx_.get(), route_idx_.get(), K * sizeof(int),
@@ -736,9 +761,16 @@ void Session::head_launch() {
   cudaStream_t s = stream_.get();
   cuda::rmsnorm_f16(xn_.get(), x_.get(), w_.output_norm, d.hidden,
                     mc_.norm_eps, s);
-  cuda::quantize_q8_k(xn_.get(), d_xq_.get(), d.hidden, s);
-  cuda::gemv_q4_k_q8(Q4W(w_.output), d_xq_.get(), logits_.get(), d.n_vocab,
-                     d.hidden, s);
+  if (w_.head_type_ == 1) {
+    // fp16 head (Q6_K dequantized at load)
+    cuda::gemv_f16_f16out(w_.output, xn_.get(), d_logits16_.get(), d.n_vocab,
+                          d.hidden, s);
+    cuda::convert_f16_to_f32(d_logits16_.get(), logits_.get(), d.n_vocab, s);
+  } else {
+    cuda::quantize_q8_k(xn_.get(), d_xq_.get(), d.hidden, s);
+    cuda::gemv_q4_k_q8(Q4W(w_.output), d_xq_.get(), logits_.get(), d.n_vocab,
+                       d.hidden, s);
+  }
 }
 
 void Session::head_launch_row(int row) {
@@ -749,9 +781,15 @@ void Session::head_launch_row(int row) {
   // MTP stash: prefill's tail row is the hidden the first draft conditions on.
   cudaMemcpyAsync(xf_.get(), xn_.get(), d.hidden * sizeof(uint16_t),
                   cudaMemcpyDeviceToDevice, s);
-  cuda::quantize_q8_k(xn_.get(), d_xq_.get(), d.hidden, s);
-  cuda::gemv_q4_k_q8(Q4W(w_.output), d_xq_.get(), logits_.get(), d.n_vocab,
-                     d.hidden, s);
+  if (w_.head_type_ == 1) {
+    cuda::gemv_f16_f16out(w_.output, xn_.get(), d_logits16_.get(), d.n_vocab,
+                          d.hidden, s);
+    cuda::convert_f16_to_f32(d_logits16_.get(), logits_.get(), d.n_vocab, s);
+  } else {
+    cuda::quantize_q8_k(xn_.get(), d_xq_.get(), d.hidden, s);
+    cuda::gemv_q4_k_q8(Q4W(w_.output), d_xq_.get(), logits_.get(), d.n_vocab,
+                       d.hidden, s);
+  }
   cudaMemcpyAsync(logits_host_.get(), logits_.get(),
                   d.n_vocab * sizeof(float), cudaMemcpyDeviceToHost, s);
   stream_.sync();

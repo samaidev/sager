@@ -6,12 +6,16 @@
 // model at all (v0.1 assumed every layer is GQA and the converter hit
 // KeyError on linear_attn.* tensors).
 //
-// Spec conventions (docs/gdn-kernel.md is the normative text; the numpy
-// generator scripts/gen_gdn_vectors.py is the executable form):
-//   C-GDN-1  q,k: per-head RMSNorm(w) then L2-normalize
-//   C-GDN-2  beta = sigmoid(b)
-//   C-GDN-3  g = -exp(A_log) * softplus(a + dt_bias);  alpha = exp(g)
-//   C-GDN-4  per k-head state S [ratio*V x K] (row-major, rows = value slots):
+// Spec conventions (docs/gdn-kernel.md is the normative text):
+//   C-GDN-1  q,k: per-head L2-normalize (y = x / sqrt(sum(x^2) + eps));
+//            NO learnable weight (real Sage-A1.5 GDN layers have none -
+//            the q/k RMSNorm weights belong to the full-attention layers)
+//   C-GDN-2  beta = sigmoid(b)                  per v-head (nv)
+//   C-GDN-3  g = A[h] * softplus(a + dt_bias[h]) per v-head (nv), where the
+//            checkpoint stores A = -exp(A_log) pre-negated (A_NOSCAN);
+//            alpha = exp(g)
+//   C-GDN-4  per k-head state S [ratio*V x K] (row-major, rows = value slots;
+//            value row j of k-head h belongs to v-head h*ratio + j/V):
 //              u     = S @ k
 //              S     <- alpha*S - alpha*beta*u k^T + beta*v k^T
 //              y     = S @ q        (INCLUSIVE: retrieve from the post-write
@@ -24,11 +28,12 @@
 // Layouts (one token, fp16 unless noted):
 //   fused proj out  proj[2*nk*K + 2*nv*V] = [q | k | v | z]   (q,k: nk heads;
 //                     v,z: nv heads) - q/k/v parts are conv_dim wide.
-//   ba              ba[2*nk] = [b | a]
+//   ba              ba[2*nv] = [b | a]      (per V-head; the checkpoint's
+//                     ssm_beta/ssm_alpha projections concatenated row-wise)
 //   conv weight     w[conv_dim * ck] row-major (row d: ck taps)
 //   conv state      st[conv_dim * (ck-1)]  (previous raw conv inputs)
 //   delta state     S[nk * (ratio*V) * K] fp32 (per k-head [rows x K])
-//   gate out        ab[nk * 2] = {alpha, beta} fp32
+//   gate out        ab[2*nv] = {alpha[nv] | beta[nv]} fp32
 //   y               y[nv * V] fp16 (nk blocks of ratio*V rows)
 //   v slice         proj + 2*nk*K ... conv applies to the first conv_dim rows,
 //                   so v = conv_out + 2*nk*K, z = proj + conv_dim.
@@ -51,7 +56,7 @@ struct GdnParams {
   int conv_dim()     const { return 2 * n_k_heads * key_dim +
                                     n_v_heads * value_dim; }
   int proj_rows()    const { return conv_dim() + n_v_heads * value_dim; }
-  int ba_rows()      const { return 2 * n_k_heads; }
+  int ba_rows()      const { return 2 * n_v_heads; }   // [b(nv) | a(nv)]
   int y_rows()       const { return n_v_heads * value_dim; }
   // fp32 delta-state floats per layer: nk * (ratio*V) * K
   size_t state_elems() const {
@@ -67,9 +72,10 @@ struct GdnParams {
 // All functions operate on ONE token. fp16 inputs are converted internally.
 namespace gdn_cpu {
 
-// C-GDN-2/3: ba[2nk] (fp16) + A_log/dt_bias (fp32) -> ab[2nk] = {alpha,beta}.
-void gate(const uint16_t* ba, const float* A_log, const float* dt_bias,
-          float* ab, int nk);
+// C-GDN-2/3: ba[2nv] (fp16: [b | a]) + A (fp32, pre-negated -exp) /
+// dt_bias (fp32) -> ab[2nv] = {alpha[nv] | beta[nv]}.
+void gate(const uint16_t* ba, const float* A, const float* dt_bias,
+          float* ab, int nv);
 
 // C-GDN-5: one causal conv step. proj = fused qkvz projection output
 // [proj_rows]; the FIRST conv_dim rows are convolved; z bypasses. Updates
@@ -77,16 +83,16 @@ void gate(const uint16_t* ba, const float* A_log, const float* dt_bias,
 void conv_step(uint16_t* conv_out, uint16_t* conv_state, const uint16_t* proj,
                const uint16_t* w, const uint16_t* b, int conv_dim, int ck);
 
-// C-GDN-1: per-head RMSNorm(w) then L2-normalize for q and k parts of the
-// conv output. qn/kn get [nk*K] each; conv_out stays untouched.
-void qk_norm(uint16_t* qn, uint16_t* kn, const uint16_t* conv_out,
-             const uint16_t* wq, const uint16_t* wk, int nk, int K,
-             float eps);
+// C-GDN-1: per-head L2 normalization of the q and k parts of the conv
+// output (y = x / sqrt(sum(x^2) + eps), no learnable weight). qn/kn get
+// [nk*K] each; conv_out stays untouched.
+void l2_norm(uint16_t* qn, uint16_t* kn, const uint16_t* conv_out,
+             int nk, int K, float eps);
 
 // C-GDN-4: one recurrent delta step for ALL k-heads.
 //   state  [nk * (ratio*V) * K] fp32, updated in place
 //   v      [nv * V] fp16 (the conv output v slice)
-//   ab     [nk * 2] fp32 from gate()
+//   ab     [2*nv] fp32 from gate() ({alpha | beta}, per v-head)
 //   y      [nv * V] fp16 out
 void delta_step(float* state, uint16_t* y, const uint16_t* qn,
                 const uint16_t* kn, const uint16_t* v, const float* ab,
@@ -113,17 +119,16 @@ void out_norm(uint16_t* out, const uint16_t* y, const uint16_t* z,
 namespace sager {
 namespace cuda {
 
-void gdn_gate_f32(const uint16_t* ba, const float* A_log, const float* dt_bias,
-                  float* ab, int nk, cudaStream_t stream);
+void gdn_gate_f32(const uint16_t* ba, const float* A, const float* dt_bias,
+                  float* ab, int nv, cudaStream_t stream);
 
 void gdn_conv_step_f16(uint16_t* conv_out, uint16_t* conv_state,
                        const uint16_t* proj, const uint16_t* w,
                        const uint16_t* b, int conv_dim, int ck,
                        cudaStream_t stream);
 
-void gdn_qk_norm_f16(uint16_t* qn, uint16_t* kn, const uint16_t* conv_out,
-                     const uint16_t* wq, const uint16_t* wk, int nk, int K,
-                     float eps, cudaStream_t stream);
+void gdn_l2_norm_f16(uint16_t* qn, uint16_t* kn, const uint16_t* conv_out,
+                     int nk, int K, float eps, cudaStream_t stream);
 
 void gdn_delta_step_f16(float* state, uint16_t* y, const uint16_t* qn,
                         const uint16_t* kn, const uint16_t* v,

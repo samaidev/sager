@@ -27,8 +27,9 @@ struct HotTier {
 // Shared-expert forward for one token/row (device): y = W_out(silu(W_g x) * W_u x)
 #if defined(SAGER_HAVE_CUDA)
 void shared_expert_forward(const Weights& w, int layer,
-                           const q4k::BlockQ8K* xq, uint16_t* y,
-                           int hidden, int n_ff_exp, cudaStream_t s);
+                           const q4k::BlockQ8K* xq, const uint16_t* x_f16,
+                           uint16_t* y, int hidden, int n_ff_exp,
+                           cudaStream_t s);
 #endif
 
 }  // namespace sager::detail

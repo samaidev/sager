@@ -140,6 +140,39 @@ __global__ void silu_mul_kernel(uint16_t* out, const uint16_t* g,
   }
 }
 
+
+// ---------------------------------------------------------------------------
+// v0.2.1: qwen3.5 gated attention - out[i] *= sigmoid(gate_row[i]); the gate
+// lives in a [rows x 2*row_len] buffer at column offset gate_off per row.
+// ---------------------------------------------------------------------------
+__global__ void sigmoid_mul_rows_kernel(uint16_t* out, const uint16_t* gate,
+                                        int total, int row_len,
+                                        int gate_stride, int gate_off) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= total) return;
+  const int row = i / row_len;
+  const int col = i - row * row_len;
+  const float g = ldh(gate + static_cast<size_t>(row) * gate_stride +
+                      gate_off + col);
+  const float sig = 1.f / (1.f + expf(-g));
+  sth(out + i, ldh(out + i) * sig);
+}
+
+// Shared-expert scalar gate: out[i] *= sigmoid(g[0]) (g: 1-element fp32).
+__global__ void sigmoid_gate_scalar_kernel(uint16_t* out, const float* g,
+                                           int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float sig = 1.f / (1.f + expf(-g[0]));
+  sth(out + i, ldh(out + i) * sig);
+}
+
+// fp16 -> fp32 elementwise (logits path after the F16 head GEMV).
+__global__ void f16_to_f32_kernel(const uint16_t* src, float* dst, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dst[i] = ldh(src + i);
+}
+
 }  // namespace
 
 void set_mrope_section(const int sec[3]) {
@@ -225,6 +258,24 @@ void silu_mul_f16(uint16_t* out, const uint16_t* g, const uint16_t* u,
                   int rows, int n_ff, cudaStream_t stream) {
   const int total = rows * n_ff;
   silu_mul_kernel<<<(total + 255) / 256, 256, 0, stream>>>(out, g, u, total);
+}
+
+
+void sigmoid_mul_rows_f16(uint16_t* out, const uint16_t* gate, int total,
+                          int row_len, int gate_stride, int gate_off,
+                          cudaStream_t stream) {
+  sigmoid_mul_rows_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
+      out, gate, total, row_len, gate_stride, gate_off);
+}
+
+void sigmoid_gate_scalar_f16(uint16_t* out, const float* g, int n,
+                             cudaStream_t stream) {
+  sigmoid_gate_scalar_kernel<<<(n + 255) / 256, 256, 0, stream>>>(out, g, n);
+}
+
+void convert_f16_to_f32(const uint16_t* src, float* dst, int n,
+                        cudaStream_t stream) {
+  f16_to_f32_kernel<<<(n + 255) / 256, 256, 0, stream>>>(src, dst, n);
 }
 
 }  // namespace sager::cuda

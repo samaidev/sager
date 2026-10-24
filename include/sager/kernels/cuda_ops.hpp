@@ -112,6 +112,19 @@ void rope_f16(uint16_t* q, uint16_t* k, const int* pos_ids, int n_head,
 void silu_mul_f16(uint16_t* out, const uint16_t* g, const uint16_t* u,
                   int rows, int n_ff, cudaStream_t stream);
 
+// v0.2.1: qwen3.5 gated attention + F16 head support.
+// out (rows x row_len, contiguous) *= sigmoid(gate row), where gate is
+// [rows x gate_stride] and each row's gates start at column gate_off.
+void sigmoid_mul_rows_f16(uint16_t* out, const uint16_t* gate, int total,
+                          int row_len, int gate_stride, int gate_off,
+                          cudaStream_t stream);
+// out[i] *= sigmoid(g[0]) - shared-expert scalar router (fp32 logit).
+void sigmoid_gate_scalar_f16(uint16_t* out, const float* g, int n,
+                             cudaStream_t stream);
+// fp16 -> fp32 (logits after the F16 head GEMV).
+void convert_f16_to_f32(const uint16_t* src, float* dst, int n,
+                        cudaStream_t stream);
+
 // ---- KV cache ----------------------------------------------------------------
 // Append K/V rows (per layer) into the cache slabs at the device-position.
 // q8 KV writes 34-byte Q8_0 rows; fp16 KV writes 2B rows. n_tokens_host

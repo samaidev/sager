@@ -94,24 +94,26 @@ void test_delta_properties() {
 }
 
 void test_gate_formulas() {
-  // hand-computed sigmoid/softplus/exp chain
-  const int nk = 2;
-  uint16_t ba_h[2 * nk];
-  float A_log[nk] = {0.2f, -0.4f}, dt_bias[nk] = {0.1f, 0.3f};
-  // pick b,a so results are stable to hand-verify
-  // gate() layout: ba[h] = b_h, ba[nk + h] = a_h
+  // hand-computed sigmoid/softplus/exp chain (per V-head; ab = {a | b})
+  const int nv = 2;
+  uint16_t ba_h[2 * nv];
+  // checkpoint stores A pre-negated: A = -exp(A_log)
+  float A[nv] = {-std::exp(0.2f), -std::exp(-0.4f)};
+  float dt_bias[nv] = {0.1f, 0.3f};
+  // gate() layout: ba[h] = b_h, ba[nv + h] = a_h
   ba_h[0] = f2h(0.0f);   // b0 -> beta0 = 0.5
   ba_h[1] = f2h(2.0f);   // b1 -> beta1 = sigmoid(2)
   ba_h[2] = f2h(1.0f);   // a0 = 1 -> dt = softplus(1.1)
   ba_h[3] = f2h(-1.0f);  // a1 = -1 -> dt = softplus(-0.7)
-  float ab[2 * nk];
-  gdn_cpu::gate(ba_h, A_log, dt_bias, ab, nk);
-  CHECK_NEAR(ab[1], 0.5f, 1e-6f, "gate: sigmoid(0)");
+  float ab[2 * nv];
+  gdn_cpu::gate(ba_h, A, dt_bias, ab, nv);
+  // ab layout: {alpha[nv] | beta[nv]}
+  CHECK_NEAR(ab[2], 0.5f, 1e-6f, "gate: sigmoid(0)");
   CHECK_NEAR(ab[3], 1.f / (1.f + std::exp(-2.f)), 1e-6f, "gate: sigmoid(2)");
   const float dt0 = std::log1p(std::exp(1.1f));
   CHECK_NEAR(ab[0], std::exp(-std::exp(0.2f) * dt0), 1e-6f, "gate: alpha0");
   const float dt1 = std::log1p(std::exp(-0.7f));
-  CHECK_NEAR(ab[2], std::exp(std::exp(-0.4f) * -dt1), 1e-6f, "gate: alpha1");
+  CHECK_NEAR(ab[1], std::exp(std::exp(-0.4f) * -dt1), 1e-6f, "gate: alpha1");
 }
 
 void test_conv_and_outnorm_golden() {
@@ -148,43 +150,43 @@ void test_delta_golden() {
   const int nk = gv.nk, K = gv.K, RATIO = gv.nv / gv.nk, V = gv.V;
   const int rows = RATIO * V;
 
+  const int nv = gv.nv;
   std::vector<float> S(test::g_S0, test::g_S0 + test::g_S0_n);
   std::vector<uint16_t> qh = to_f16(test::g_q_raw, test::g_q_raw_n);
   std::vector<uint16_t> kh = to_f16(test::g_k_raw, test::g_k_raw_n);
-  std::vector<uint16_t> qnw = to_f16(test::g_qn_w, test::g_qn_w_n);
-  std::vector<uint16_t> knw = to_f16(test::g_kn_w, test::g_kn_w_n);
   std::vector<uint16_t> v = to_f16(test::g_v_all, test::g_v_all_n);
-  std::vector<uint16_t> ba(2 * nk);
+  std::vector<uint16_t> ba(2 * nv);
   std::vector<uint16_t> qn(nk * K), kn(nk * K), y(nk * rows);
-  std::vector<float> ab(2 * nk);
+  std::vector<float> ab(2 * nv);
 
-  // qk_norm reads its source from a conv_out layout [q | k]; build the fake
+  // l2_norm reads its source from a conv_out layout [q | k]; build the fake
   // input from the raw q|k vectors (the golden generator ran the SAME
-  // C-GDN-1 chain, so qk_norm must reproduce g_qh/g_kh).
+  // C-GDN-1 chain, so l2_norm must reproduce g_qh/g_kh).
   {
     std::vector<uint16_t> conv_fake(2 * nk * K);
     for (size_t i = 0; i < test::g_q_raw_n; ++i) conv_fake[i] = qh[i];
     for (size_t i = 0; i < test::g_k_raw_n; ++i)
       conv_fake[test::g_q_raw_n + i] = kh[i];
-    gdn_cpu::qk_norm(qn.data(), kn.data(), conv_fake.data(), qnw.data(),
-                     knw.data(), nk, K, 1e-6f);
+    gdn_cpu::l2_norm(qn.data(), kn.data(), conv_fake.data(), nk, K, 1e-6f);
   }
   for (int h = 0; h < nk; ++h)
     for (int i = 0; i < K; ++i) {
       CHECK_NEAR(h2f(qn[h * K + i]), test::g_qh[h * K + i], 2e-3f,
-                 "qk_norm: golden q");
+                 "l2_norm: golden q");
       CHECK_NEAR(h2f(kn[h * K + i]), test::g_kh[h * K + i], 2e-3f,
-                 "qk_norm: golden k");
+                 "l2_norm: golden k");
     }
 
-  // gate from b/a raw
-  ba[0] = f2h(test::g_b_raw[0]); ba[1] = f2h(test::g_b_raw[1]);
-  ba[2] = f2h(test::g_a_raw[0]); ba[3] = f2h(test::g_a_raw[1]);
-  gdn_cpu::gate(ba.data(), test::g_A_log, test::g_dt_bias, ab.data(), nk);
-  CHECK_NEAR(ab[0], test::g_alpha[0], 2e-3f, "gate: golden alpha0");
-  CHECK_NEAR(ab[2], test::g_alpha[1], 2e-3f, "gate: golden alpha1");
-  CHECK_NEAR(ab[1], test::g_beta[0], 2e-3f, "gate: golden beta0");
-  CHECK_NEAR(ab[3], test::g_beta[1], 2e-3f, "gate: golden beta1");
+  // gate from b/a raw (per V-head; ba = [b(nv) | a(nv)])
+  for (int h = 0; h < nv; ++h) {
+    ba[h] = f2h(test::g_b_raw[h]);
+    ba[nv + h] = f2h(test::g_a_raw[h]);
+  }
+  gdn_cpu::gate(ba.data(), test::g_A, test::g_dt_bias, ab.data(), nv);
+  for (int h = 0; h < nv; ++h) {
+    CHECK_NEAR(ab[h], test::g_alpha[h], 2e-3f, "gate: golden alpha");
+    CHECK_NEAR(ab[nv + h], test::g_beta[h], 2e-3f, "gate: golden beta");
+  }
 
   // delta step
   gdn_cpu::delta_step(S.data(), y.data(), qn.data(), kn.data(), v.data(),
