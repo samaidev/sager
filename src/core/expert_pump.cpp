@@ -71,7 +71,13 @@ Status ExpertPump::init(const Config& cfg, const uint8_t* host_pool_base) {
   n_experts_ = cfg.n_experts;
   per_expert_bytes_ = cfg.per_expert_bytes;
   slot_count_ = cfg.arena_bytes / cfg.per_expert_bytes;
-  arm_timeout_ms_ = env_int("SAGER_PF_ARM_TIMEOUT_MS", 2000, 100, 60000);
+  // v0.2.5b: the walk WAITS for the loader instead of CPU-fallbacking on a
+  // 2 s timeout. The loader is strictly ahead-bound (plan order == walk
+  // order), so the current layer's pairs arrive within seconds; the cv
+  // wakes the lookup the moment a copy publishes, so a long timeout costs
+  // nothing on the fast path. It only bounds a dead-loader scenario, and
+  // even then the live_loaders_ check below fails fast.
+  arm_timeout_ms_ = env_int("SAGER_PF_ARM_TIMEOUT_MS", 30000, 100, 120000);
   n_readers_ = env_int("SAGER_PF_READERS", 2, 1, 4);
   slabs_per_reader_ = env_int("SAGER_PF_SLABS", 16, 2, 64);
 
@@ -384,10 +390,18 @@ void ExpertPump::stream_start(int pool_fd) {
 
 int ExpertPump::stream_lookup(int layer, int expert) {
   if (!stream_active_) return -1;
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(arm_timeout_ms_);
+  auto deadline = std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(arm_timeout_ms_);
   std::unique_lock<std::mutex> lk(stream_mu_);
   const size_t p = sidx(layer, expert);
+  // v0.2.5b: a pair that is not in the plan is never copied by any loader
+  // (parked survivors are consumed via stream_slot_of). Waiting for it
+  // used to burn the whole retry budget.
+  if (std::lower_bound(plan_.pairs.begin(), plan_.pairs.end(),
+                       static_cast<int32_t>(p)) == plan_.pairs.end()) {
+    return -1;
+  }
+  bool extended = false;
   while (slot_of_[p] < 0) {
     if (slot_of_[p] != -2) {
       // v0.2.4c: -1 with the walk already past this pair (take/publish-time
@@ -407,8 +421,16 @@ int ExpertPump::stream_lookup(int layer, int expert) {
       }
     }
     if (std::chrono::steady_clock::now() >= deadline) {
-      ++stats_.arm_timeouts;
-      return -1;   // loader stalled: CPU-pool fallback
+      // v0.2.5b: the deadline bounds a wedged walk, not the loader's lead -
+      // with live readers the pair is bound to arrive (plan order == walk
+      // order), so extend the wait ONCE (2 x arm_timeout) before giving up.
+      // Readers gone: give up immediately.
+      if (live_loaders_.load(std::memory_order_relaxed) == 0 || extended) {
+        ++stats_.arm_timeouts;
+        return -1;   // loader stalled or gone: CPU-pool fallback
+      }
+      deadline += std::chrono::milliseconds(arm_timeout_ms_);
+      extended = true;
     }
     stream_cv_.wait_for(lk, std::chrono::milliseconds(2));
   }

@@ -237,6 +237,18 @@ class ExpertPump {
   // bounded wait. Session thread only.
   int stream_lookup(int layer, int expert);
 
+  // v0.2.5b: current slot of a parked/resident pair (no copy pending).
+  // Session dispatch uses this to consume survivors of an earlier chunk
+  // directly - they are NOT in the stream plan and lookup would wait on a
+  // copy that never comes.
+  int stream_slot_of(int layer, int expert) const {
+#if defined(SAGER_HAVE_CUDA)
+    return slot_of_[sidx(layer, expert)];
+#else
+    (void)layer; (void)expert; return -1;
+#endif
+  }
+
 #if defined(SAGER_HAVE_CUDA)
   // Order the compute stream behind the slot's ready copy (after lookup).
   void stream_wait(cudaStream_t compute, int slot);

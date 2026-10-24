@@ -948,22 +948,30 @@ void Session::moe_dispatch_batched(int layer, int n) {
           hot_->tables_host[base + 2 * static_cast<size_t>(E)]);
     } else if (streaming) {
       // tier 0b: stream-all ring (the pair was planned at chunk start)
+      // v0.2.5b: parked survivors of an earlier chunk are pump-resident but
+      // NOT in the plan - consume their existing slot directly instead of
+      // waiting on a copy that never comes (16 s per pair on the Colab T4).
+      if (pump_->resident(layer, e)) {
+        const int pslot = pump_->stream_slot_of(layer, e);
+        if (pslot >= 0) {
+          pump_->stream_wait(s, pslot);
+          j.ring_slot = pslot;
+          auto* base = const_cast<q4k::BlockQ4K*>(pump_->dev_base(pslot));
+          j.wg = base;
+          j.wu = base + (hot_->per_expert_bytes / 3) / q4k::kBlockBytes;
+          j.wo = base + 2 * (hot_->per_expert_bytes / 3) / q4k::kBlockBytes;
+        }
+      }
+      if (j.ring_slot < 0) {
       // v0.2.4b: a lookup timeout on the CURRENT layer's pair means the
       // loader is merely BEHIND (the walk is sequential and the pair is
       // still ahead of it - the loader only skips pairs of layers that
-      // already passed, and we ARE the current layer). Waiting for the
-      // copy is strictly better than the CPU pool on a weak host:
-      // measured on a 2-vCPU Colab T4, one cold chunk stalled 152 pairs
-      // x 2 s and then paid ~1.5 s per expert on the CPU pool (316 s for
-      // a 5.8 GB chunk); the disk itself only needed 22 s. Retry the
-      // lookup - each attempt is cv-driven and returns as soon as the
-      // slot publishes - with a ~120 s budget before truly giving up.
-      // v0.2.5: the retry budget drops from 60 x arm_timeout (120 s/pair on
-      // the Colab T4) to 8: loaders now self-reclaim wedged slots, so a
-      // genuinely stalled pair recovers on its own and a dead one frees the
-      // walk fast enough to keep the GPU busy.
+      // already passed, and we ARE the current layer). v0.2.5b: the lookup
+      // itself now waits up to 2 x arm_timeout (30 s default) for the
+      // copy while the readers are live; retries exist only to re-arm the
+      // clock after a self-reclaim pass, so 2 is plenty.
       int slot = pump_->stream_lookup(layer, e);
-      for (int retry = 0; slot < 0 && retry < 8; ++retry) {
+      for (int retry = 0; slot < 0 && retry < 2; ++retry) {
         slot = pump_->stream_lookup(layer, e);
       }
       if (slot >= 0) {
@@ -979,6 +987,7 @@ void Session::moe_dispatch_batched(int layer, int n) {
         // did land it meanwhile (no GEMM will read it).
         pump_->stream_consume_drop(layer, e);
       }
+      }  // v0.2.5b: if (j.ring_slot < 0)
     } else if (pump_) {
       // tier 0c: per-expert pump submit (verify windows / small chunks)
       const int slot = pump_->submit(layer, e, step);
