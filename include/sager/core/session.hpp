@@ -154,6 +154,7 @@ class Session {
   void   moe_dispatch(int layer);                       // eager MoE half (row 0)
   void   moe_dispatch_row(int layer, int row);          // eager MoE for row r
   void   moe_dispatch_batched(int layer, int n);        // v0.2.3 whole-chunk MoE
+  void   linear_layer_chunk(int layer, int n);          // v0.3 batched GDN walk
   void   head_launch();                                 // final norm+head
   void   head_launch_row(int row);                      // per-row head (prefill tail)
   void   zero_gdn_states();                             // conv + delta state reset
@@ -230,6 +231,16 @@ class Session {
   DeviceBuffer<float>    lin_ab_;
   DeviceBuffer<uint16_t> lin_conv_state_;   // n_gdn * conv_dim * (ck-1)
   DeviceBuffer<float>    lin_delta_state_;  // n_gdn * nk * (ratio*V) * K
+  // v0.3 chunk (batched) GDN slabs, sized [RT x rows]
+  DeviceBuffer<uint16_t> lin_proj_b_, lin_conv_b_, lin_qn_b_, lin_kn_b_;
+  DeviceBuffer<uint16_t> lin_y_b_, lin_on_b_, lin_ba_b_;
+  DeviceBuffer<float>    lin_ab_b_;
+  // v0.3 grouped MoE job tables (one GEMM launch per layer phase)
+  DeviceBuffer<q4k::BlockQ4K*> d_job_wg_, d_job_wu_, d_job_wo_;
+  DeviceBuffer<int>      d_job_off_, d_job_m_, d_job_tbase_, d_job_jot_;
+  PinnedBuffer<q4k::BlockQ4K*> h_job_wg_, h_job_wu_, h_job_wo_;
+  PinnedBuffer<int>      h_job_off_, h_job_m_, h_job_tbase_, h_job_jot_;
+  bool pf_mtok_ = true;      // SAGER_MTOK=0 -> v0.2.3 batched kernels
 #endif
 
   int pos_ = 0;

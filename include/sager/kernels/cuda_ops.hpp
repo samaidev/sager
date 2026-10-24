@@ -71,6 +71,50 @@ void gemv_f32_out_f16x_batched(const float* w_f32, const uint16_t* x_f16,
                                float* y, int n_rows, int k, int n_tokens,
                                cudaStream_t stream);
 
+// ---- v0.3 mtok tiled kernels (prefill / verify; weight-traffic fix) ---------
+// Same math and per-(row, token) accumulation order as the batched kernels
+// above (bit-identical outputs), but tokens are TILED through shared memory
+// so weight rows are read from DRAM once per tile instead of once per token.
+// y layout is unchanged: y[tok * n_rows + row].
+
+// Single matrix, fp16 out.
+void gemv_q4_k_q8_f16out_mtok(const q4k::BlockQ4K* w, const q4k::BlockQ8K* xq,
+                              uint16_t* y, int n_rows, int k, int n_tokens,
+                              cudaStream_t stream);
+
+// Fused gate+up: two matrices share the staged X rows (one launch, x read
+// once). yg/yu are [n_tokens x n_rows] each.
+void gemv2_q4_k_q8_f16out_mtok(const q4k::BlockQ4K* wg, const q4k::BlockQ4K* wu,
+                               const q4k::BlockQ8K* xq, uint16_t* yg,
+                               uint16_t* yu, int n_rows, int k, int n_tokens,
+                               cudaStream_t stream);
+
+// Grouped fused gate+up: ALL routed experts of a layer in ONE launch.
+// Job j serves activations xq + off[j] rows (m[j] rows) with weights
+// wg[j]/wu[j]; tile_base[j] is the prefix of ceil(m[j]/TILE) over jobs and
+// job_of_tile[t] maps flattened tile t back to its job (n_tiles = total).
+void gemv_grouped2_q4_k_q8_f16out_mtok(
+    const q4k::BlockQ4K* const* wg, const q4k::BlockQ4K* const* wu,
+    const int* off, const int* m, const int* tile_base,
+    const int* job_of_tile, int n_tiles, const q4k::BlockQ8K* xq,
+    uint16_t* yg, uint16_t* yu, int n_rows, int k, int tok_per,
+    cudaStream_t stream);
+
+// Grouped single matrix (down projection).
+void gemv_grouped_q4_k_q8_f16out_mtok(
+    const q4k::BlockQ4K* const* w, const int* off, const int* m,
+    const int* tile_base, const int* job_of_tile, int n_tiles,
+    const q4k::BlockQ8K* xq, uint16_t* y, int n_rows, int k, int tok_per,
+    cudaStream_t stream);
+
+// Router logits, tiled multi-token (fp32 W, fp16 x, fp32 out; accumulation
+// order per (row, token) preserved -> logits bit-identical to the batched
+// router).
+void gemv_f32_out_f16x_mtok(const float* w_f32, const uint16_t* x_f16,
+                            float* y, int n_rows, int k, int n_tokens,
+                            cudaStream_t stream);
+
+
 // Plain fp16 GEMV, fp16 out (MTP head projections; attention stays Q4_K).
 void gemv_f16_f16out(const uint16_t* w_f16, const uint16_t* x_f16, uint16_t* y,
                      int n_rows, int k, cudaStream_t stream);

@@ -248,15 +248,21 @@ void ExpertPump::clear() {
 // v0.2.3 prefill stream-all ring (Strata-style streamed walk)
 // ---------------------------------------------------------------------------
 ExpertPump::StreamPlan ExpertPump::build_stream_plan(
-    const std::vector<uint8_t>& resident, int n_layers, int n_experts) {
+    const std::vector<uint8_t>& miss, int n_layers, int n_experts) {
+  // v0.3 FIX: the caller (Session::prefill) passes the MISS bitmap
+  // (1 = needs streaming). The old `!resident[p]` condition streamed the
+  // HOT pairs instead - the plan held exactly the resident set (5309 pairs,
+  // never the ~4931 misses), so the streamed prefill never streamed a miss:
+  // with the old layer-major residency the walk's lookups fast-failed past
+  // the plan (masked), and with uniform residency they stalled 60 s each.
   StreamPlan plan;
   plan.n_layers = n_layers;
   plan.n_experts = n_experts;
-  plan.pairs.reserve(resident.size());
+  plan.pairs.reserve(miss.size());
   for (int l = 0; l < n_layers; ++l) {
     for (int e = 0; e < n_experts; ++e) {
       const size_t p = static_cast<size_t>(l) * n_experts + e;
-      if (p < resident.size() && !resident[p]) {
+      if (p < miss.size() && miss[p]) {
         plan.pairs.push_back(static_cast<int32_t>(p));
       }
     }
@@ -333,6 +339,21 @@ void ExpertPump::stream_start(int pool_fd) {
   SLOG_I("pump", "stream_start: active=%d pool_fd=%d pairs=%zu slots=%zu",
          stream_active_.load(std::memory_order_relaxed), pool_fd,
          plan_.pairs.size(), slot_count_);
+  {
+    // v0.3 diag: plan composition - first pairs + per-layer counts
+    std::string head;
+    for (size_t i = 0; i < plan_.pairs.size() && i < 10; ++i) {
+      const int32_t pp = plan_.pairs[i];
+      head += " " + std::to_string(pp / n_experts_) + ":" +
+              std::to_string(pp % n_experts_);
+    }
+    int l0 = 0;
+    for (int32_t pp : plan_.pairs) if (pp / n_experts_ == 0) ++l0;
+    SLOG_I("pump", "plan head:%s  layer0_pairs=%d first=%d last=%d",
+           head.c_str(), l0,
+           plan_.pairs.empty() ? -1 : (int)plan_.pairs.front(),
+           plan_.pairs.empty() ? -1 : (int)plan_.pairs.back());
+  }
   if (pool_fd < 0 || plan_.pairs.empty() || slot_count_ == 0) {
     SLOG_W("pump", "stream-all prefill: nothing to stream (fd=%d pairs=%zu slots=%zu)",
            pool_fd, plan_.pairs.size(), slot_count_);
@@ -397,8 +418,11 @@ int ExpertPump::stream_lookup(int layer, int expert) {
   // v0.2.5b: a pair that is not in the plan is never copied by any loader
   // (parked survivors are consumed via stream_slot_of). Waiting for it
   // used to burn the whole retry budget.
-  if (std::lower_bound(plan_.pairs.begin(), plan_.pairs.end(),
-                       static_cast<int32_t>(p)) == plan_.pairs.end()) {
+  // v0.3 FIX: `lower_bound(...) == end()` only rejected pairs ABOVE the
+  // plan's max - a pair missing from the MIDDLE of the plan (a hot expert
+  // the walk still routed to) fell into the full 60 s wait. Membership test.
+  if (!std::binary_search(plan_.pairs.begin(), plan_.pairs.end(),
+                          static_cast<int32_t>(p))) {
     return -1;
   }
   bool extended = false;
@@ -412,8 +436,13 @@ int ExpertPump::stream_lookup(int layer, int expert) {
       const auto it = std::lower_bound(plan_.pairs.begin(),
                                        plan_.pairs.end(),
                                        static_cast<int32_t>(p));
+      if (it == plan_.pairs.end()) {
+        // not in plan at all: never coming (mirrors the head check above)
+        ++stats_.arm_timeouts;
+        return -1;
+      }
       const bool taken =
-          it != plan_.pairs.end() && *it == static_cast<int32_t>(p) &&
+          *it == static_cast<int32_t>(p) &&
           stream_next_ > static_cast<size_t>(it - plan_.pairs.begin());
       if (taken || layer < done_layer_.load(std::memory_order_relaxed)) {
         ++stats_.arm_timeouts;
@@ -427,6 +456,23 @@ int ExpertPump::stream_lookup(int layer, int expert) {
       // Readers gone: give up immediately.
       if (live_loaders_.load(std::memory_order_relaxed) == 0 || extended) {
         ++stats_.arm_timeouts;
+        int loaded = 0, loading = 0, free_s = 0;
+        for (size_t s2 = 0; s2 < slot_count_; ++s2) {
+          if (ring_state_[s2] == kRingLoaded) ++loaded;
+          else if (ring_state_[s2] == kRingLoading) ++loading;
+          else ++free_s;
+        }
+        size_t plan_pos = plan_.pairs.size();
+        for (size_t pi = 0; pi < plan_.pairs.size(); ++pi) {
+          if (static_cast<size_t>(plan_.pairs[pi]) == p) { plan_pos = pi; break; }
+        }
+        SLOG_W("pump", "lookup FAIL: L=%d e=%d slot_of=%d plan_pos=%zu done_layer=%d live=%d ring loaded=%d loading=%d free=%d next=%zu plan=%zu reads=%llu drops=%llu",
+               layer, expert, slot_of_[p], plan_pos,
+               done_layer_.load(std::memory_order_relaxed),
+               live_loaders_.load(std::memory_order_relaxed),
+               loaded, loading, free_s, stream_next_, plan_.pairs.size(),
+               (unsigned long long)stats_.read_errors,
+               (unsigned long long)stats_.stream_drop);
         return -1;   // loader stalled or gone: CPU-pool fallback
       }
       deadline += std::chrono::milliseconds(arm_timeout_ms_);
@@ -615,9 +661,28 @@ void ExpertPump::loader_loop(int tid) {
 
     // 1. arena slot: a FREE one (never owned, or a dropped pair parked),
     //    else steal a LOADED slot whose consumer event has completed.
+    //    v0.3: BOUNDED hunt. The walk's tier loop blocks on lookups for the
+    //    CURRENT layer BEFORE its GEMVs run, so slots only free after the
+    //    whole tier loop completes; if the ring fills while this loader
+    //    hunts, waiting forever deadlocks the walk on this very pair
+    //    (measured: ring 606/606 full, both readers hunting, walk in
+    //    stream_lookup). Give the pair up instead: slot_of_ -> -1, the
+    //    walk's lookup fast-fails on `taken` and routes the rows to the CPU
+    //    pool - a handful of rows per stall, and the walk's stream_progress
+    //    frees this layer's slots so the loaders resume.
     int slot = -1;
+    int hunts = 0;
     for (;;) {
       if (!stream_active_.load(std::memory_order_relaxed)) return;
+      if (++hunts > 20000) {
+        std::lock_guard<std::mutex> lk(stream_mu_);
+        slot_of_[p] = -1;
+        ++stats_.stream_drop;
+        SLOG_W("pump", "loader hunt gave up pair L=%d e=%d after %d spins "
+                       "(ring full; walk will CPU-fallback this pair)",
+               L, e, hunts);
+        break;
+      }
       {
         std::lock_guard<std::mutex> lk(stream_mu_);
         // v0.2.5: self-recovery. A reader wedged on a full ring used to wait
@@ -661,8 +726,22 @@ void ExpertPump::loader_loop(int tid) {
           break;
         }
       }
+      ++hunt_spins_;
+      if ((hunt_spins_ % 20000) == 0) {
+        int loaded = 0, loading = 0, free_s = 0;
+        for (size_t s2 = 0; s2 < slot_count_; ++s2) {
+          if (ring_state_[s2] == kRingLoaded) ++loaded;
+          else if (ring_state_[s2] == kRingLoading) ++loading;
+          else ++free_s;
+        }
+        SLOG_W("pump", "loader hunt stall: spins=%llu loaded=%d loading=%d free=%d done_layer=%d live=%d",
+               (unsigned long long)hunt_spins_, loaded, loading, free_s,
+               done_layer_.load(std::memory_order_relaxed),
+               live_loaders_.load(std::memory_order_relaxed));
+      }
       std::this_thread::sleep_for(std::chrono::microseconds(150));
     }
+    if (slot < 0) continue;   // hunt gave up: pair dropped to CPU fallback
 
     // 2. pinned slab of this reader (its DMA must have completed). Bounded
     //    wait: slabs free up as the copy engine drains; a pathological stall

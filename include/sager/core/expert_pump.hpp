@@ -307,7 +307,8 @@ class ExpertPump {
   std::vector<uint8_t> parked_;        // resident at chunk start (no copy)
   std::vector<cudaEvent_t> consumed_ev_;
   cudaEvent_t fence_ev_ = nullptr;     // chunk-boundary compute -> copy fence
-  std::atomic<int> done_layer_{-1};    // session progress (layers < this die)
+  std::atomic<int> done_layer_{-1};
+  uint64_t hunt_spins_ = 0;   // v0.3 diag: loader hunt spin counter    // session progress (layers < this die)
   StreamPlan plan_;
   int pool_fd_ = -1;
   std::atomic<bool> stream_active_{false};

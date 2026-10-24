@@ -217,6 +217,31 @@ Status Session::alloc_scratch() {
                                 g.conv_state_elems()), "lin_conv_state_")) return Status::kOomVram;
   if (!ok(lin_delta_state_.alloc(static_cast<size_t>(n_gdn) *
                                  g.state_elems()), "lin_delta_state_")) return Status::kOomVram;
+  // v0.3 chunk (batched) GDN slabs: [RT x rows] so prefill/verify windows
+  // run the whole layer in ~10 launches instead of ~12 per token.
+  if (!ok(lin_proj_b_.alloc(static_cast<size_t>(RT) * g.proj_rows()), "lin_proj_b_")) return Status::kOomVram;
+  if (!ok(lin_conv_b_.alloc(static_cast<size_t>(RT) * g.conv_dim()), "lin_conv_b_")) return Status::kOomVram;
+  if (!ok(lin_qn_b_.alloc(static_cast<size_t>(RT) * g.n_k_heads * g.key_dim), "lin_qn_b_")) return Status::kOomVram;
+  if (!ok(lin_kn_b_.alloc(static_cast<size_t>(RT) * g.n_k_heads * g.key_dim), "lin_kn_b_")) return Status::kOomVram;
+  if (!ok(lin_y_b_.alloc(static_cast<size_t>(RT) * g.y_rows()), "lin_y_b_")) return Status::kOomVram;
+  if (!ok(lin_on_b_.alloc(static_cast<size_t>(RT) * g.y_rows()), "lin_on_b_")) return Status::kOomVram;
+  if (!ok(lin_ba_b_.alloc(static_cast<size_t>(RT) * g.ba_rows()), "lin_ba_b_")) return Status::kOomVram;
+  if (!ok(lin_ab_b_.alloc(static_cast<size_t>(RT) * 2 * g.n_v_heads), "lin_ab_b_")) return Status::kOomVram;
+  // v0.3 grouped MoE job tables (upper bound: one job per expert; tiles are
+  // bounded by Rmax/tile + n_expert)
+  const int job_cap = E + 1;
+  const int tile_cap = Rmax / 4 + E + 16;
+  if (!ok(d_job_wg_.alloc(job_cap), "d_job_wg_") ||
+      !ok(d_job_wu_.alloc(job_cap), "d_job_wu_") ||
+      !ok(d_job_wo_.alloc(job_cap), "d_job_wo_") ||
+      !ok(d_job_off_.alloc(job_cap), "d_job_off_") ||
+      !ok(d_job_m_.alloc(job_cap), "d_job_m_") ||
+      !ok(d_job_tbase_.alloc(job_cap + 1), "d_job_tbase_") ||
+      !ok(d_job_jot_.alloc(tile_cap), "d_job_jot_")) return Status::kOomVram;
+  if (!h_job_wg_.alloc(job_cap) || !h_job_wu_.alloc(job_cap) ||
+      !h_job_wo_.alloc(job_cap) || !h_job_off_.alloc(job_cap) ||
+      !h_job_m_.alloc(job_cap) || !h_job_tbase_.alloc(job_cap + 1) ||
+      !h_job_jot_.alloc(tile_cap)) return Status::kOomRam;
 
   // Host staging (pinned, C1: the SAME regions every call)
   if (!h_route_idx_.alloc(static_cast<size_t>(RT) * (K + 1)) ||
@@ -245,6 +270,8 @@ Status Session::prepare() {
   {
     const auto b = env_get("SAGER_PF_BATCHED");
     if (b) pf_batched_ = (*b != "0");
+    const auto mt = env_get("SAGER_MTOK");
+    if (mt) pf_mtok_ = (*mt != "0");
     const auto sm = env_get("SAGER_PF_STREAM_MIN");
     if (sm) pf_stream_min_ = std::max(1, std::atoi(sm->c_str()));
     const auto cc = env_get("SAGER_PF_CHUNK");
@@ -258,8 +285,8 @@ Status Session::prepare() {
              "(%d/%d) - per-row walk stays", dd0.hidden, dd0.n_ff_exp);
       pf_batched_ = false;
     }
-    SLOG_I("session", "prefill v0.2.3: batched=%d stream_min=%d chunk_cap=%d "
-           "cpu_rows=%d", (int)pf_batched_, pf_stream_min_, pf_chunk_cap_,
+    SLOG_I("session", "prefill v0.2.3: batched=%d mtok=%d stream_min=%d chunk_cap=%d "
+           "cpu_rows=%d", (int)pf_batched_, (int)pf_mtok_, pf_stream_min_, pf_chunk_cap_,
            pf_cpu_cap_);
   }
 
@@ -407,6 +434,15 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
     cuda::gemv_q4_k_q8_f16out(Q4W(lw.wq), d_xq_.get(), q_.get(), Q, H, s);
     cuda::gemv_q4_k_q8_f16out(Q4W(lw.wk), d_xq_.get(), k_.get(), KVd, H, s);
     cuda::gemv_q4_k_q8_f16out(Q4W(lw.wv), d_xq_.get(), v_.get(), KVd, H, s);
+  } else if (pf_mtok_ && pf_batched_) {
+    // v0.3: tiled multi-token GEMMs - weights are staged in shared memory
+    // per token-tile instead of re-read per token (bit-identical outputs).
+    cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.wq), d_xq_.get(), q_.get(), Q, H,
+                                   n_tokens, s);
+    cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.wk), d_xq_.get(), k_.get(), KVd, H,
+                                   n_tokens, s);
+    cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.wv), d_xq_.get(), v_.get(), KVd, H,
+                                   n_tokens, s);
   } else {
     cuda::gemv_q4_k_q8_f16out_batched(Q4W(lw.wq), d_xq_.get(), q_.get(), Q, H,
                                       n_tokens, s);
@@ -421,6 +457,9 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
     if (n_tokens == 1) {
       cuda::gemv_q4_k_q8_f16out(Q4W(lw.attn_gate), d_xq_.get(), d_gate_.get(),
                                 Q, H, s);
+    } else if (pf_mtok_ && pf_batched_) {
+      cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.attn_gate), d_xq_.get(),
+                                     d_gate_.get(), Q, H, n_tokens, s);
     } else {
       cuda::gemv_q4_k_q8_f16out_batched(Q4W(lw.attn_gate), d_xq_.get(),
                                         d_gate_.get(), Q, H, n_tokens, s);
@@ -471,6 +510,10 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
   if (n_tokens == 1) {
     cuda::quantize_q8_k(attn_out_.get(), d_hq_.get(), Q, s);
     cuda::gemv_q4_k_q8_f16out(Q4W(lw.wo), d_hq_.get(), o_proj_.get(), H, Q, s);
+  } else if (pf_mtok_ && pf_batched_) {
+    cuda::quantize_q8_k(attn_out_.get(), d_hq_.get(), n_tokens * Q, s);
+    cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.wo), d_hq_.get(), o_proj_.get(), H, Q,
+                                   n_tokens, s);
   } else {
     cuda::quantize_q8_k(attn_out_.get(), d_hq_.get(), n_tokens * Q, s);
     cuda::gemv_q4_k_q8_f16out_batched(Q4W(lw.wo), d_hq_.get(), o_proj_.get(), H, Q,
@@ -493,6 +536,13 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
 // dense layer's (Sage-A1.5: every block is MoE).
 // ---------------------------------------------------------------------------
 void Session::linear_layer_launch(int layer, int n_tokens) {
+  // v0.3: whole-chunk batched walk (projections batched, recurrence fused
+  // into one kernel) - bit-identical to the per-token loop below. Gated on
+  // pf_batched_ so SAGER_PF_BATCHED=0 (arm B) stays the exact v0.2.2 walk.
+  if (n_tokens > 1 && pf_mtok_ && pf_batched_) {
+    linear_layer_chunk(layer, n_tokens);
+    return;
+  }
   const EngineDims& d = mc_.dims;
   const GdnParams g = mc_.gdn();
   const int nv = g.n_v_heads;
@@ -557,6 +607,60 @@ void Session::zero_gdn_states() {
     cudaMemset(lin_delta_state_.get(), 0,
                lin_delta_state_.bytes());
   }
+}
+
+// ---------------------------------------------------------------------------
+// v0.3 batched GDN walk (n tokens at once; bit-identical to the per-token
+// loop). Projections + conv + gates + norms run batched over the window;
+// the sequential rank-1 recurrence fuses into ONE kernel whose blocks keep
+// their state slice in shared memory for the whole chunk.
+// ---------------------------------------------------------------------------
+void Session::linear_layer_chunk(int layer, int n) {
+  const EngineDims& d = mc_.dims;
+  const GdnParams g = mc_.gdn();
+  const LayerWeights& lw = w_.layers()[static_cast<size_t>(layer)];
+  const int H = d.hidden;
+  cudaStream_t s = stream_.get();
+  const int slab = gdn_idx_of_layer_[static_cast<size_t>(layer)];
+  uint16_t* conv_st = lin_conv_state_.get() +
+      static_cast<size_t>(slab) * g.conv_state_elems();
+  float* delta_st = lin_delta_state_.get() +
+      static_cast<size_t>(slab) * g.state_elems();
+
+  cuda::rmsnorm_batched_f16(xn_.get(), x_.get(), lw.attn_norm, H,
+                            mc_.norm_eps, n, s);
+  cuda::quantize_q8_k(xn_.get(), d_xq_.get(), n * H, s);
+  // fused projections for the whole window
+  cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.lin_in_qkvz), d_xq_.get(),
+                                 lin_proj_b_.get(), g.proj_rows(), H, n, s);
+  cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.lin_in_ba), d_xq_.get(),
+                                 lin_ba_b_.get(), g.ba_rows(), H, n, s);
+  // causal conv over the chunk, then commit the state tail
+  cuda::gdn_conv_chunk_f16(lin_conv_b_.get(), lin_proj_b_.get(), conv_st,
+                           lw.lin_conv_w, lw.lin_conv_b, g.conv_dim(),
+                           g.conv_kernel, n, s);
+  cuda::gdn_conv_state_commit_f16(conv_st, lin_proj_b_.get(), g.conv_dim(),
+                                  g.conv_kernel, n, s);
+  // data-dependent gates + per-head L2 norm, batched
+  cuda::gdn_gate_chunk_f32(lin_ba_b_.get(), lw.lin_A_log, lw.lin_dt_bias,
+                           lin_ab_b_.get(), g.n_v_heads, n, s);
+  cuda::gdn_l2_norm_chunk_f16(lin_qn_b_.get(), lin_kn_b_.get(),
+                              lin_conv_b_.get(), g.conv_dim(), g.n_k_heads,
+                              g.key_dim, mc_.norm_eps, n, s);
+  // fused recurrence scan (state stays in shared memory across the chunk)
+  cuda::gdn_scan_chunk_f16(delta_st, lin_y_b_.get(), lin_qn_b_.get(),
+                           lin_kn_b_.get(), lin_conv_b_.get(), g.conv_dim(),
+                           lin_ab_b_.get(), g.n_k_heads, g.key_dim, g.ratio(),
+                           g.value_dim, n, s);
+  // output gating + out projection + residual
+  cuda::gdn_out_norm_chunk_f16(lin_on_b_.get(), lin_y_b_.get(),
+                               lin_proj_b_.get(), g.proj_rows(), g.conv_dim(),
+                               lw.lin_o_norm, g.n_v_heads, g.value_dim,
+                               mc_.norm_eps, n, s);
+  cuda::quantize_q8_k(lin_on_b_.get(), d_hq_.get(), n * g.y_rows(), s);
+  cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.lin_out), d_hq_.get(), o_proj_.get(),
+                                 H, g.y_rows(), n, s);
+  cuda::add_f16(x_.get(), o_proj_.get(), n * H, s);
 }
 
 // ---------------------------------------------------------------------------
@@ -654,12 +758,12 @@ void Session::moe_dispatch_row(int layer, int row) {
   detail::shared_expert_forward(w_, layer, d_hq_.get(), xn_row, shared_y_.get(),
                                 H, FFX, s);
 
-  // Router decision to the host + the miss-path activation row (C1).
+  // Router decision to the host (C1). The miss-path activation row is only
+  // pulled when a CPU-pool miss actually happens (saves a D2H + host wake
+  // per layer per step at high pump residency).
   cudaMemcpyAsync(h_route_idx_.get(), route_idx_.get(), K * sizeof(int),
                   cudaMemcpyDeviceToHost, s);
   cudaMemcpyAsync(h_route_w_.get(), route_w_.get(), K * sizeof(float),
-                  cudaMemcpyDeviceToHost, s);
-  cudaMemcpyAsync(h_x16_.get(), xn_row, H * sizeof(uint16_t),
                   cudaMemcpyDeviceToHost, s);
   stream_.sync();
 
@@ -759,6 +863,8 @@ void Session::moe_dispatch_row(int layer, int row) {
   // submitted before the GPU finishes hits+shared so both run in parallel).
   // Expert layout in the pinned pool: [gate | up | out], each gu bytes.
   if (n_miss > 0) {
+    cudaMemcpy(h_x16_.get(), xn_row, H * sizeof(uint16_t),
+               cudaMemcpyDeviceToHost);
     for (int i = 0; i < H; ++i) {
       miss_x_[i] = q4k::half_to_float(h_x16_[i]);
     }
@@ -831,8 +937,13 @@ void Session::moe_dispatch_batched(int layer, int n) {
 
   // 2) batched router: logits + top-k for every row (stride K+1 so the
   //    shared-expert combine slot stays host-managed).
-  cuda::gemv_f32_out_f16x_batched(lw.router, xn_.get(), route_logits_.get(),
-                                  E, H, n, s);
+  if (pf_mtok_) {
+    cuda::gemv_f32_out_f16x_mtok(lw.router, xn_.get(), route_logits_.get(),
+                                 E, H, n, s);
+  } else {
+    cuda::gemv_f32_out_f16x_batched(lw.router, xn_.get(), route_logits_.get(),
+                                    E, H, n, s);
+  }
   cuda::router_topk_batched(route_logits_.get(), route_idx_.get(),
                             route_w_.get(), E, K, K + 1, n, s);
 
@@ -1041,15 +1152,60 @@ void Session::moe_dispatch_batched(int layer, int n) {
                          R_gpu, h_blocks, s);
   }
 
+  // 6b) v0.3 grouped job tables: ALL experts of the layer fuse into ONE
+  //     gate+up launch and ONE down launch (tiles flattened over jobs).
+  const int n_jobs = static_cast<int>(jobs.size());
+  int n_tiles = 0;
+  int tile_gu = 8;
+  if (pf_mtok_ && n_jobs > 0) {
+    int t = (49152 - 16 * h_blocks * static_cast<int>(sizeof(q4k::BlockQ4K)) -
+             512) / (h_blocks * static_cast<int>(sizeof(q4k::BlockQ8K)));
+    tile_gu = t < 4 ? 4 : (t > 16 ? 16 : t);
+    for (int j = 0; j < n_jobs; ++j) {
+      h_job_wg_[j] = const_cast<q4k::BlockQ4K*>(jobs[j].wg);
+      h_job_wu_[j] = const_cast<q4k::BlockQ4K*>(jobs[j].wu);
+      h_job_wo_[j] = const_cast<q4k::BlockQ4K*>(jobs[j].wo);
+      h_job_off_[j] = jobs[j].off;
+      h_job_m_[j] = jobs[j].m;
+      h_job_tbase_[j] = n_tiles;
+      const int tiles = (jobs[j].m + tile_gu - 1) / tile_gu;
+      for (int q = 0; q < tiles; ++q) h_job_jot_[n_tiles + q] = j;
+      n_tiles += tiles;
+    }
+    cudaMemcpyAsync(d_job_wg_.get(), h_job_wg_.get(),
+                    n_jobs * sizeof(q4k::BlockQ4K*), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(d_job_wu_.get(), h_job_wu_.get(),
+                    n_jobs * sizeof(q4k::BlockQ4K*), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(d_job_wo_.get(), h_job_wo_.get(),
+                    n_jobs * sizeof(q4k::BlockQ4K*), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(d_job_off_.get(), h_job_off_.get(),
+                    n_jobs * sizeof(int), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(d_job_m_.get(), h_job_m_.get(),
+                    n_jobs * sizeof(int), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(d_job_tbase_.get(), h_job_tbase_.get(),
+                    n_jobs * sizeof(int), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(d_job_jot_.get(), h_job_jot_.get(),
+                    n_tiles * sizeof(int), cudaMemcpyHostToDevice, s);
+  }
+
   // 7) gate + up for every GPU expert (id order = stream order: the waits
   //    were armed above, so copies stream ahead of these launches).
-  for (const Job& j : jobs) {
-    cuda::gemv_q4_k_q8_f16out_batched(
-        j.wg, d_xqg_.get() + static_cast<size_t>(j.off) * h_blocks,
-        expert_g2_.get() + static_cast<size_t>(j.off) * FFX, FFX, H, j.m, s);
-    cuda::gemv_q4_k_q8_f16out_batched(
-        j.wu, d_xqg_.get() + static_cast<size_t>(j.off) * h_blocks,
-        expert_u2_.get() + static_cast<size_t>(j.off) * FFX, FFX, H, j.m, s);
+  if (pf_mtok_) {
+    if (n_tiles > 0) {
+      cuda::gemv_grouped2_q4_k_q8_f16out_mtok(
+          d_job_wg_.get(), d_job_wu_.get(), d_job_off_.get(), d_job_m_.get(),
+          d_job_tbase_.get(), d_job_jot_.get(), n_tiles, d_xqg_.get(),
+          expert_g2_.get(), expert_u2_.get(), FFX, H, tile_gu, s);
+    }
+  } else {
+    for (const Job& j : jobs) {
+      cuda::gemv_q4_k_q8_f16out_batched(
+          j.wg, d_xqg_.get() + static_cast<size_t>(j.off) * h_blocks,
+          expert_g2_.get() + static_cast<size_t>(j.off) * FFX, FFX, H, j.m, s);
+      cuda::gemv_q4_k_q8_f16out_batched(
+          j.wu, d_xqg_.get() + static_cast<size_t>(j.off) * h_blocks,
+          expert_u2_.get() + static_cast<size_t>(j.off) * FFX, FFX, H, j.m, s);
+    }
   }
 
   // 8) fused activation + requant over the whole compacted slab.
@@ -1061,10 +1217,21 @@ void Session::moe_dispatch_batched(int layer, int n) {
   }
 
   // 9) down projection per expert; ring slots are consumed right after.
+  if (pf_mtok_) {
+    if (n_tiles > 0) {
+      cuda::gemv_grouped_q4_k_q8_f16out_mtok(
+          d_job_wo_.get(), d_job_off_.get(), d_job_m_.get(),
+          d_job_tbase_.get(), d_job_jot_.get(), n_tiles, d_hqg_.get(),
+          y_grouped_.get(), H, FFX, tile_gu, s);
+    }
+  } else {
+    for (const Job& j : jobs) {
+      cuda::gemv_q4_k_q8_f16out_batched(
+          j.wo, d_hqg_.get() + static_cast<size_t>(j.off) * gu_blocks,
+          y_grouped_.get() + static_cast<size_t>(j.off) * H, H, FFX, j.m, s);
+    }
+  }
   for (const Job& j : jobs) {
-    cuda::gemv_q4_k_q8_f16out_batched(
-        j.wo, d_hqg_.get() + static_cast<size_t>(j.off) * gu_blocks,
-        y_grouped_.get() + static_cast<size_t>(j.off) * H, H, FFX, j.m, s);
     if (j.ring_slot >= 0) pump_->stream_consume(s, j.ring_slot);
   }
 
@@ -1076,18 +1243,31 @@ void Session::moe_dispatch_batched(int layer, int n) {
 
   // 11) shared expert, batched (dense MLP over all chunk rows).
   if (lw.shared_gate) {
-    cuda::gemv_q4_k_q8_f16out_batched(
-        reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_gate),
-        d_xq_moe_.get(), sh_g_.get(), FFX, H, n, s);
-    cuda::gemv_q4_k_q8_f16out_batched(
-        reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_up),
-        d_xq_moe_.get(), sh_u_.get(), FFX, H, n, s);
+    if (pf_mtok_) {
+      cuda::gemv2_q4_k_q8_f16out_mtok(
+          reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_gate),
+          reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_up),
+          d_xq_moe_.get(), sh_g_.get(), sh_u_.get(), FFX, H, n, s);
+    } else {
+      cuda::gemv_q4_k_q8_f16out_batched(
+          reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_gate),
+          d_xq_moe_.get(), sh_g_.get(), FFX, H, n, s);
+      cuda::gemv_q4_k_q8_f16out_batched(
+          reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_up),
+          d_xq_moe_.get(), sh_u_.get(), FFX, H, n, s);
+    }
     cuda::silu_mul_f16(sh_g_.get(), sh_g_.get(), sh_u_.get(), 1, n * FFX, s);
     cuda::quantize_q8_k(sh_g_.get(), d_hqg_.get(),
                         static_cast<size_t>(n) * FFX, s);
-    cuda::gemv_q4_k_q8_f16out_batched(
-        reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_out), d_hqg_.get(),
-        shared_yb_.get(), H, FFX, n, s);
+    if (pf_mtok_) {
+      cuda::gemv_q4_k_q8_f16out_mtok(
+          reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_out), d_hqg_.get(),
+          shared_yb_.get(), H, FFX, n, s);
+    } else {
+      cuda::gemv_q4_k_q8_f16out_batched(
+          reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_out), d_hqg_.get(),
+          shared_yb_.get(), H, FFX, n, s);
+    }
     if (lw.shared_gate_w) {
       cuda::gemv_f32_out_f16x_batched(lw.shared_gate_w, xn_.get(),
                                       d_sgate_.get(), 1, H, n, s);
@@ -1383,6 +1563,7 @@ Status Session::forward_window(const std::vector<int>&, float*,
 void Session::reset() {}
 void Session::push_recent(int) {}
 void Session::moe_dispatch_batched(int, int) {}
+void Session::linear_layer_chunk(int, int) {}
 const float* Session::last_logits() const { return nullptr; }
 
 #endif  // SAGER_HAVE_CUDA

@@ -139,6 +139,47 @@ void gdn_out_norm_f16(uint16_t* out, const uint16_t* y, const uint16_t* z,
                       const uint16_t* w_on, int nv, int V, float eps,
                       cudaStream_t stream);
 
+// ---- v0.3 chunk kernels (prefill / verify windows) -------------------------
+// Batched over n tokens; math is bit-identical to the per-token walk above
+// (same serial fp32 order per element / per state row).
+
+// Causal depthwise conv over the chunk: conv_out [n x conv_dim], raw conv
+// inputs are the first conv_dim rows of proj [n x proj_rows]; state_old is
+// read-only here (commit below).
+void gdn_conv_chunk_f16(uint16_t* conv_out, const uint16_t* proj,
+                        const uint16_t* state_old, const uint16_t* w,
+                        const uint16_t* b, int conv_dim, int ck, int n,
+                        cudaStream_t stream);
+
+// conv_state <- the last (ck-1) raw conv inputs of the chunk.
+void gdn_conv_state_commit_f16(uint16_t* conv_state, const uint16_t* proj,
+                               int conv_dim, int ck, int n,
+                               cudaStream_t stream);
+
+// ab [n x 2nv] = {alpha | beta} per token from ba [n x 2nv].
+void gdn_gate_chunk_f32(const uint16_t* ba, const float* A,
+                        const float* dt_bias, float* ab, int nv, int n,
+                        cudaStream_t stream);
+
+// Per-head L2 norm of q/k for every token: qn/kn [n x nk*K].
+void gdn_l2_norm_chunk_f16(uint16_t* qn, uint16_t* kn,
+                           const uint16_t* conv_out, int conv_dim, int nk,
+                           int K, float eps, int n, cudaStream_t stream);
+
+// Fused chunk recurrence: one kernel walks all n tokens; each block keeps
+// its (k-head, row-chunk) state slice in shared memory. y [n x nv*V].
+void gdn_scan_chunk_f16(float* state, uint16_t* y, const uint16_t* qn,
+                        const uint16_t* kn, const uint16_t* conv_out,
+                        int conv_dim, const float* ab, int nk, int K,
+                        int ratio, int V, int n, cudaStream_t stream);
+
+// Output gating for every token: out [n x nv*V] = rmsnorm(y) * silu(z),
+// where z is the [nv*V] tail of each proj row.
+void gdn_out_norm_chunk_f16(uint16_t* out, const uint16_t* y,
+                            const uint16_t* proj, int proj_rows, int conv_dim,
+                            const uint16_t* w_on, int nv, int V, float eps,
+                            int n, cudaStream_t stream);
+
 }  // namespace cuda
 
 }  // namespace sager

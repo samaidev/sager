@@ -142,9 +142,19 @@ def main():
     a = os.path.join(OUT, "A_stream_pp512_tg128")
     b = os.path.join(OUT, "B_perrow_pp512_tg128")
     if os.path.exists(a) and os.path.exists(b):
-        ta = open(a).read().count('"type":"token"')
-        tb = open(b).read().count('"type":"token"')
-        same = open(a).read() == open(b).read()
+        def toks(path):
+            out = []
+            for line in open(path):
+                s2 = line.strip()
+                if s2.startswith('{"') and '"type":"token"' in s2:
+                    try:
+                        out.append(json.loads(s2).get("id"))
+                    except Exception:
+                        pass
+            return out
+        ta_list, tb_list = toks(a), toks(b)
+        ta, tb = len(ta_list), len(tb_list)
+        same = ta_list == tb_list
         print(f"TOKEN_STREAMS: A={ta} B={tb} "
               + ("IDENTICAL" if same else "DIFFER"), flush=True)
 

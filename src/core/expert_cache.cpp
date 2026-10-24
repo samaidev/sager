@@ -54,7 +54,45 @@ int ExpertCache::rebalance() {
   const size_t n = freq_.size();
   std::vector<Ent> ents;
   ents.reserve(n);
-  for (size_t i = 0; i < n; ++i) ents.push_back({freq_[i] + persisted_[i], i});
+  double mass = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    const float f = freq_[i] + persisted_[i];
+    mass += f;
+    ents.push_back({f, i});
+  }
+  if (mass <= 0.0) {
+    // v0.3: COLD-START UNIFORM RESIDENCY. With no usage profile every score
+    // is 0 and a plain partial_sort keeps the FIRST capacity_ pairs - which
+    // are layer-major, i.e. the first ~21 layers fully resident and the rest
+    // empty. The streamed prefill then races through the all-hot layers
+    // (stream_progress advances done_layer_ for free) while the loaders are
+    // still on their first cold preads, and every remaining plan pair dies
+    // to the take-time "past layer" skip (measured: 5307/5309 skipped, whole
+    // layers dropped to the CPU pool). Seeding EXPERT-MAJOR round-robin
+    // instead gives every layer the same hit rate, so the walk paces against
+    // the loaders layer by layer - and decode sees a uniform miss pattern.
+    int kept = 0;
+    std::vector<uint64_t> new_bits(resident_bits_.size(), 0);
+    for (int e = 0; e < n_experts_ && kept < capacity_; ++e) {
+      for (int L = 0; L < n_layers_ && kept < capacity_; ++L) {
+        const size_t i = idx(L, e);
+        new_bits[i >> 6] |= (1ull << (i & 63));
+        ++kept;
+      }
+    }
+    int evicted = 0;
+    for (size_t i = 0; i < n; ++i) {
+      const bool was = resident_bits_[i >> 6] & (1ull << (i & 63));
+      const bool now = new_bits[i >> 6] & (1ull << (i & 63));
+      if (was && !now) ++evicted;
+    }
+    resident_bits_ = std::move(new_bits);
+    ++rebalances_;
+    SLOG_I("cache", "rebalance #%llu (cold-start uniform): resident=%d/%d, evicted=%d",
+           static_cast<unsigned long long>(rebalances_.load()), kept,
+           static_cast<int>(n), evicted);
+    return 0;
+  }
   std::partial_sort(ents.begin(), ents.begin() + std::min<size_t>(capacity_, n),
                     ents.end(), [](const Ent& a, const Ent& b) { return a.f > b.f; });
 

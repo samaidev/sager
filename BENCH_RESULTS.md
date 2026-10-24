@@ -1,188 +1,89 @@
-# SAGER v0.2.2 vs llama.cpp — Sage-A1.5-Q4_K_M on Tesla T4
+# SAGER v0.3.0 — mtok tiled kernels + real streamed prefill (Tesla T4)
 
-## Result (same GPU, same model, 2026-10-24)
+## Result (same GPU, same model, Sage-A1.5-Q4_K_M, commit db6f2bf base)
 
-| Metric | sager v0.2.2 (expert streaming, all-GPU) | llama.cpp ngl30 (10 CPU layers) | speedup |
-|---|---|---|---|
-| prefill pp512  | **48.96 tok/s** | 20.51 tok/s | **2.4x** |
-| decode  tg128  | **18.59 tok/s** | 3.45 tok/s  | **5.4x** |
-| VRAM model fit | 20.2 GB weights on 15.4 GB card (52% hot experts resident, rest streamed per-token over PCIe) | needs 19.9 GB -> OOM at ngl99, must offload 10 layers to 2 weak CPU cores | - |
+| Metric | v0.2.2 (per-row) | v0.2.5b (streamed, broken) | **v0.3.0** | vs v0.2.2 |
+|---|---|---|---|---|
+| prefill pp512  | 48.96 tok/s | 36.0 tok/s | **103–109 tok/s** | **2.1–2.2x** |
+| prefill pp2048 | -           | 65.0 tok/s | **108–120 tok/s** | **1.7–1.8x** |
+| decode tg128   | 18.59 tok/s | (unmeasured) | **21.0–21.7 tok/s** | **+13–17%** |
 
-sager config: vram_mb=8960 hot pool, pump_arena 1024 MB, ctx 8192, chunk 2048,
-kv q8, 40 per-layer decode CUDA graphs captured, suffix drafter on (drafted=125
-over 128 tokens, acceptance 0 at temperature 1.0 on random prompts - expected),
-mtp off. Load 2min07s with SAGER_EXPERT_POOL_REUSE=1 (30 min cold build).
+Correctness gates: ctest 3/3; token-stream equality VERIFIED at the token
+level — A (mtok kernels) == A (SAGER_MTOK=0) == B (per-row walk), 128/128
+ids identical on the shared random-512 prompt; 0 "exceed cap" row drops.
 
-Decode cost model at 52% residency: ~152 hot misses/step x 1.69 MB PCIe H2D
-~= 257 MB/step ~= 43 ms -> matches the measured 54 ms/step. Higher residency
-(bigger card) or workload expert locality (agentic/code) pushes decode up.
+## What was fixed / changed
 
-## Correctness gates passed before this benchmark
+### 1. The streamed prefill never streamed (upstream bug, found + fixed)
+`build_stream_plan` received the MISS bitmap (1 = needs streaming) but
+filtered with `!resident[p]` - the plan held exactly the HOT set (5309
+pairs, never the ~4931 misses). Masked under the old layer-major residency
+(lookups fast-failed past the plan), fatal under uniform residency
+(60 s stalls per lookup). Fixed the condition and the not-in-plan check
+(`lower_bound()==end()` only rejected pairs above the plan max - now
+`binary_search`). Also bounded the loader slot-hunt (was unbounded: ring
+full + walk blocked in lookup = deadlock).
 
-- ctest 3/3 (q4 roundtrip, GDN golden vectors, expert pump policy)
-- compute-sanitizer memcheck: ERROR SUMMARY: 0 errors over full
-  load -> warmup -> 40-layer graph capture -> generation pipeline
-  (after fixing the GDN shared-memory reduction scratch overflow,
-  commit 7b070c7)
-- greedy MTP/suffix bit-exactness covered by tests/smoke_engine.py phases
+### 2. Cold-start residency was layer-major (fixed)
+`ExpertCache::rebalance` with an empty profile ranked all-zero scores and
+`partial_sort` kept the FIRST 5309 pairs = layers 0-20 fully resident,
+layers 21-39 empty. Seeded EXPERT-MAJOR round-robin instead: every layer
+gets the same hit rate, the walk paces against the loaders, and decode
+sees a uniform miss pattern.
 
-## What was fixed to get here (v0.2.2)
+### 3. mtok tiled kernels (the prefill speed)
+The v0.2.3 "batched" kernels put n_tokens in grid.y: every token's warp
+re-read the whole weight row - a 512-token chunk routed 4096 rows/layer
+over 256 experts (~16 rows/expert) and paid ~16x memory amplification
+(~290 GB of weight traffic per chunk on T4). New mtok kernels tile tokens
+through shared memory (weights staged once per tile, 8-32x less traffic),
+keeping the exact per-(row, token) accumulation order - bit-identical
+outputs:
 
-1. c00fe48 - native qwen35moe GGUFs suffix every tensor with ".weight";
-   expert stacks hard-failed, norms+MoE router silently skipped
-2. 68c4c16 - CpuPool::stop() lost-wakeup deadlock (join forever)
-3. 9448831 - C4 submit check refused every CPU-pool miss job
-4. 7b070c7 - GDN shared-memory reduction scratch overflow (sanitizer-found)
-5. d93002b - SAGER_EXPERT_POOL_REUSE=1: 30 min cold pool build -> 2 min
-6. 94e5378 - alloc_scratch per-buffer OOM reporting (root-caused the
-   vocab-248320 budget drift vs the t4-guide)
+- `gemv_q4_k_q8_f16out_mtok` - single matrix
+- `gemv2_q4_k_q8_f16out_mtok` - fused gate+up (one launch, x read once)
+- `gemv_grouped2_...` / `gemv_grouped_...` - ALL routed experts of a layer
+  in ONE launch (flattened tile map), MoE goes from ~770 launches/layer
+  to 2
+- `gemv_f32_out_f16x_mtok` - fp32 router, k-chunked, order-preserving
+
+Used by the batched MoE walk, the dense attention projections, and the
+shared expert. SAGER_MTOK=0 falls back to the v0.2.3 kernels (A/B).
+
+### 4. GDN chunk kernels (the launch storm)
+The per-token GDN walk issued ~12 tiny launches per token - 30 layers x
+512 tokens = ~184k launches per chunk on a 2-vCPU host. New chunk kernels
+batch conv/gates/l2-norm/out-norm over the window and fuse the sequential
+rank-1 recurrence into ONE kernel whose blocks keep their state slice in
+shared memory (loaded once, stored once per chunk). Bit-identical per-row
+math (thread-per-state-row, serial i order). A GDN layer is now ~11
+launches per CHUNK.
+
+### 5. Decode shaves
+- the per-layer miss-path activation D2H (h_x16_) is only pulled when a
+  CPU-pool miss actually happens (was unconditional every layer/step)
+- grouped MoE + mtok also serve verify windows (MTP path benefits too)
 
 ## Reproduce
 
 ```bash
-# 1. build (any CUDA GPU, sm_75 verified)
 git clone https://github.com/samaidev/sager && cd sager && ./setup.sh
-
-# 2. model
-hf download InternScience/Sage-A1.5-Q4_K_M-GGUF Sage-A1.5-Q4_K_M.gguf --local-dir .
-
-# 3. run (echo JSON lines into the engine)
-export SAGER_EXPERT_POOL_FILE=$PWD/pool.bin SAGER_EXPERT_POOL_REUSE=0
-# first run builds the 16.9 GB pool (~30 min); subsequent runs set REUSE=1
-echo '{"cmd":"load","model":"Sage-A1.5-Q4_K_M.gguf","ctx":8192,"vram_mb":8960,
-"pump_arena_mb":1024,"threads":2,"graphs":true,"mtp":false,"chunk":2048,"kv_q8":true}
-{"cmd":"generate","ids":[72,3820,913],"max_tokens":64,"temperature":1.0,"seed":42}
-{"cmd":"shutdown"}' | ./build/sager_engine
+hf download InternScience/Sage-A1.5-Q4_K_M-GGUF Sage-A1.5-Q4_K_M.gguf
+export SAGER_EXPERT_POOL_FILE=$PWD/pool.bin SAGER_EXPERT_POOL_REUSE=0   # first run builds 16.9 GB pool (~35 min)
+python3 bench/bench_v023.py all      # arm A = mtok streamed, arm B = per-row
+python3 bench/bench_v023.py A        # warm pass - the headline numbers
 ```
 
-Artifacts in the release tarball are sm_75 CUDA binaries built by nvcc 13.0 on
-commit 7b070c7 (see BUILD_INFO.txt).
+Run A twice and report the second pass (first pass pays cold page-cache
+reads of the pool). Measured on Colab T4 (2 vCPU, 12.7 GB RAM), engine
+env: vram_mb=8960, pump_arena_mb=1024, ctx 8192, chunk 2048, kv q8,
+graphs on, mtp off.
 
----
+## Notes
 
-# v0.2.3 - Strata-style streamed prefill (status: code landed, re-bench pending)
-
-## What changed (commits 78b2f88..c754ed2)
-
-v0.2.2's prefill walked the prompt PER ROW: every (token, layer) dispatched
-its own top-k, synced the whole device, and submitted its own pageable
-copies - a 512-token chunk paid 20,480 device syncs (measured 48.96 tok/s).
-v0.2.3 rewrites the prefill MoE half the way Strata streams experts:
-
-- per-LAYER batched MoE: one route sync per layer, routed rows compacted
-  expert-major, batched per-expert GEMVs, batched combine (new kernels:
-  router_topk_batched, gather_rows_q8, scatter_routed, moe_combine_batched,
-  sigmoid_gate_scalar_batched, scatter_rows_generic);
-- stream-all ring in ExpertPump: for chunks >= SAGER_PF_STREAM_MIN (384
-  tokens, top-8 of 256 -> nearly every expert is routed) the routing is not
-  needed to schedule copies - hot-tier AND arena misses stream in fixed
-  (layer, id) order through the arena ring while compute consumes that same
-  order; copies overlap attention compute;
-- pinned-RAM loader threads (SAGER_PF_READERS x SAGER_PF_SLABS): pool file
-  -> pread -> pinned slab -> cudaMemcpyAsync -> arena slot. No more pageable
-  mmap as the copy source;
-- sessions are per CHUNK; resident slots are parked (reused without a copy)
-  and a fence event orders the copy stream behind compute across the chunk
-  boundary;
-- SAGER_PF_BATCHED=0 switches back to the exact v0.2.2 per-row walk (A/B).
-  Both walks share the same kernels per row - outputs are bit-identical.
-
-## Failure mode found and fixed (first streamed run, 2 tok/s)
-
-The first run stalled: zero-count pairs (experts no token routes to, ~15 of
-256 per layer on random-id prompts) that the loaders landed AFTER their
-layer had passed clogged ring slots forever -> 112 x 2s arm timeouts = the
-whole 238 s prefill. Fixed in c754ed2: stream_progress(L) releases every
-slot owned by a pair of an earlier layer (parked: immediately; consumed:
-once its down-projection event completes), loaders skip past-layer pairs at
-take AND publish time, sessions became per-chunk, timeout pairs are dropped.
-
-## Measured so far (pre-fix run + disk physics, Tesla T4 Colab)
-
-- non-hot plan per 512-token chunk: 4,931-5,309 pairs = 8.1-8.7 GB to stream
-  (52% hot residency is profile-driven and uncorrelated with random-id
-  routing);
-- Colab T4 box: 12.7 GB RAM < 16.9 GB pool -> the cold fraction of every
-  first pass reads from disk at ~261 MB/s sequential (dd measured). A fully
-  cold pass is therefore disk-bound: ~33 s/chunk floor, warm page-cache
-  passes are PCIe-bound (~1 s/chunk ceiling);
-- first (buggy) run: 5.74 GB H2D in 316 s - timeout-dominated, not
-  representative; post-fix numbers pending a fresh GPU session.
-
-## Reproduce the A/B
-
-```bash
-python3 bench_v023.py all    # arm A = streamed (default), arm B = per-row
-                             # (SAGER_PF_BATCHED=0); token streams must be
-                             # IDENTICAL - that is the correctness gate
-```
-
-Run A twice and report the second pass: the first pass pays the cold disk
-reads, every later pass is the steady-state number (matching how the v0.2.2
-48.96 tok/s baseline was itself measured on a warm cache).
-
-## v0.2.5b (commits e016542, 67270b2) - stream-all unwedged, measured (2026-10-24)
-
-Two independent wedge modes sat between the streamed prefill and its design
-point. Both were found with a live gdb attach on the wedged engine.
-
-| Metric (Sage-A1.5-Q4_K_M, T4, warm cache) | v0.2.4 (wedged) | v0.2.5b | llama.cpp ngl30 | v0.2.2 per-row |
-|---|---|---|---|---|
-| prefill pp512  | 2.0 tok/s (316 s) | **36.0 tok/s (14.3 s)** | 20.51 tok/s | 48.96 tok/s |
-| prefill pp2048 | - | **65.0 tok/s (31.7 s)** | - | - |
-| arm timeouts   | 152 | **0** | - | - |
-| loader self-reclaim | - | take loop + lookup | - | - |
-
-pp2048 = 65 tok/s is the headline: the bigger the chunk, the more the fixed
-per-chunk costs (pool pread, plan build, graph-relevant warmup) amortize, and
-the more the copy engine overlaps attention/GDN compute - exactly the Strata
-regime this runtime set out to replicate.
-
-### Wedge mode 1 (v0.2.4/4b/4c/4d, pp512 = 2.0): ring deadlock
-
-The readers run ahead of the walk, fill the 606-slot ring with LOADED slots,
-and wedge in the take loop waiting for consumers; the walk, blocked in a
-lookup for a pair behind the wedge, never reaches the next stream_progress -
-the ring can only drain at the next layer boundary, which never comes. gdb:
-main in `stream_lookup` futex, no loader_loop thread alive, GPU util 0%.
-Net effect ~120 s per pair (60 x 2 s retry budget) + CPU-pool fallbacks.
-
-Fixes (e016542):
-- `reclaim_locked()`: shared scan freeing slots of layers behind the session;
-  called from `stream_progress` (session thread) AND from the loader take
-  loop - readers dig themselves out instead of waiting on a blocked session;
-- `live_loaders_` atomic (spawn-time increment, LiveGuard decrement on every
-  exit path) - v0.2.4d's check counted thread objects, which stay > 0 after
-  the plan drains;
-- session lookup retry 60 -> 8.
-
-### Wedge mode 2 (v0.2.5 first re-run, pp512 = 3.0): phantom lookups
-
-The stream plan covers chunk-start misses only, but dispatch routed parked
-survivors (pump-resident from earlier chunks/decode) into stream_lookup too -
-a pair no loader will ever copy burned the whole retry budget. Walk crawled
-at ~9 layers/min, readers skipped 5123 of 5309 planned pairs.
-
-Fixes (67270b2):
-- tier 0b consumes parked survivors via `stream_slot_of()` directly;
-- `stream_lookup` returns -1 immediately for pairs not in the plan;
-- walk-waits-for-loader semantics: arm timeout 2 s -> 30 s (cv wakes the
-  lookup on publish, so the long timeout costs nothing on the fast path;
-  deadline extends once while readers are live, fails immediately when
-  live_loaders_ == 0).
-
-### Bench harness fixes found during measurement
-
-- bench_v023.py counted `"type": "token"` (spaced) while the engine emits
-  compact JSON (`"type":"token"`) - token-stream counters were always 0;
-- decode_tps lives in the stdout done-line JSON, not stderr - tg was
-  always None; both fixed in the VM copy (repo bench/ pending sync).
-
-### Pending on next GPU session
-
-- re-run arm B (per-row baseline) under v0.2.5b so the TOKEN_STREAMS
-  gate compares same-code A/B output (the 48.96 tok/s v0.2.2 numbers
-  remain the reference until then);
-- decode tg128 number for v0.2.5b (the engine ran the 128 decode steps
-  but the harness parse missed it - fixed above);
-- publish the v0.2.5b engine binary to the GitHub Release.
+- Decode at 52% residency is PCIe-miss bound (~150 misses/step x 1.69 MB
+  over a pageable-mmap pool on a 12.7 GB RAM box): tg128 improves only
+  ~15%. Bigger cards / agentic workloads with expert locality gain more.
+- Strata's own sm_75 experiment (bench/results/2026-09-30-tc-gemv-sm75)
+  measured tensor-core GEMV as a regression for decode; the warp dp4a
+  decode path is unchanged, consistent with that finding.
