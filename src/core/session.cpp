@@ -461,7 +461,7 @@ void Session::linear_layer_launch(int layer, int n_tokens) {
     cuda::gdn_delta_step_f16(delta_st, lin_y_.get(), lin_qn_.get(),
                              lin_kn_.get(),
                              lin_conv_.get() + static_cast<size_t>(2) * nk * K,
-                             lin_ab_.get(), nk, K, g.ratio(), g.value_dim(),
+                             lin_ab_.get(), nk, K, g.ratio(), g.value_dim,
                              s);
     // output gating: o = rmsnorm(y) * silu(z)  (C-GDN-6)
     cuda::gdn_out_norm_f16(lin_on_.get(), lin_y_.get(),
