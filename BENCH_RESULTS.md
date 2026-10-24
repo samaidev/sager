@@ -87,3 +87,23 @@ graphs on, mtp off.
 - Strata's own sm_75 experiment (bench/results/2026-09-30-tc-gemv-sm75)
   measured tensor-core GEMV as a regression for decode; the warp dp4a
   decode path is unchanged, consistent with that finding.
+
+## Tuning note: vram_mb 9984
+
+The Colab T4 has ~1.8 GB of spare VRAM after the 8960 MB pool + 1024 MB
+arena + weights + scratch. vram_mb=9984 fits (capacity 5916/10240 = 58%)
+and measured pp512 = 116 tok/s (vs 103-109 at 8960). 10240 does NOT fit
+(scratch OOM at lin_on_b_, 14 MiB short).
+
+## Decode analysis (v0.4 direction)
+
+At the v0.3 residency the router is heavily skewed on real inputs
+(cache_hit_rate ~0.985-0.99 on the bench prompt): PCIe miss traffic is no
+longer the decode bottleneck. GPU utilization during decode is 91-100%,
+but the roofline math says the same work needs only ~8-9 ms of the
+measured ~47 ms step: decode is bound by small-kernel launch/drain
+overhead (~600 kernels/step; one-row GEMVs at ~12% per-launch occupancy).
+The v0.4 lever is whole-step graph capture with device-side expert
+dispatch (static (layer,expert)->VRAM pointer table + arena query for the
+rare miss), which removes the per-layer host round-trips and the eager
+MoE launches entirely.
