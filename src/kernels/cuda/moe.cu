@@ -127,13 +127,14 @@ __global__ void scatter_rows_kernel(uint16_t* dst, const uint16_t* src,
 void scatter_rows_f16(uint16_t* dst, const uint16_t* src, const int* dst_rows,
                       int n_rows, int hidden, cudaStream_t stream) {
   dim3 block(256), grid((hidden + 255) / 256, n_rows);
-  scatter_rows_kernel<<<grid, block, 0, stream>>>(dst, src, dst_rows, n_rows,
-                                                  hidden);
+  scatter_rows_kernel<<<grid, block, 0, stream>>>(dst, src, dst_rows, hidden);
 }
 
 // ---------------------------------------------------------------------------
 // v0.2.3 batched prefill (Strata-style streamed walk) kernels
 // ---------------------------------------------------------------------------
+
+namespace {
 
 // Router top-k for every row of the chunk; one block per row.
 __global__ void router_topk_batched_kernel(const float* logits, int* idx,
