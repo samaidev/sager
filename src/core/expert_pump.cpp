@@ -365,7 +365,15 @@ void ExpertPump::stream_start(int pool_fd) {
     bool any = false;
     for (const Slab& sb : loader_slabs_[static_cast<size_t>(t)]) any = sb.ptr != nullptr;
     if (!any) continue;
-    loaders_.emplace_back([this, t] { loader_loop(t); });
+    try {
+      loaders_.emplace_back([this, t] { loader_loop(t); });
+      // v0.2.5: count the thread here (not inside loader_loop) so a slow
+      // start cannot race the session's live-loader check; loader_loop
+      // decrements on every exit path.
+      live_loaders_.fetch_add(1, std::memory_order_relaxed);
+    } catch (...) {
+      break;   // thread creation failed; live count stays honest
+    }
   }
   SLOG_I("pump", "stream-all prefill: %zu pairs (%.1f GB), ring %zu slots, "
          "%zu readers, %d slabs/reader",
@@ -411,15 +419,29 @@ void ExpertPump::stream_progress(int layer) {
 #if defined(SAGER_HAVE_CUDA)
   if (!stream_active_) return;
   done_layer_.store(layer, std::memory_order_relaxed);
-  std::lock_guard<std::mutex> lk(stream_mu_);
+  {
+    std::lock_guard<std::mutex> lk(stream_mu_);
+    reclaim_locked();
+  }
+  stream_cv_.notify_all();
+#else
+  (void)layer;
+#endif
+}
+
+// Caller must hold stream_mu_. Frees every ring slot owned by a pair of a
+// layer the session has already completed (owner_l_ < done_layer_):
+//   - LOADED + consumed: released once the GEMM event actually fires
+//   - LOADED + unconsumed (walk CPU-fallbacked the pair): nobody will ever
+//     read the slot again - release immediately
+//   - LOADING: still owned by a live reader; its publish-time staleness
+//     check (session check 2) drops it there.
+void ExpertPump::reclaim_locked() {
+#if defined(SAGER_HAVE_CUDA)
+  const int dl = done_layer_.load(std::memory_order_relaxed);
+  if (dl < 0) return;
   for (size_t s = 0; s < slot_count_; ++s) {
-    if (!ring_owned_[s] || owner_l_[s] < 0 || owner_l_[s] >= layer) continue;
-    // Past-layer slots: parked pairs have no in-flight work (the chunk-bound
-    // fence covers prior-chunk GEMMs); consumed pairs are released once the
-    // compute stream actually finished their down projection; LOADED pairs
-    // whose GEMM was never launched this chunk (drop-at-loading case) have
-    // no in-flight reader either. LOADING slots wait for the publish-time
-    // staleness check.
+    if (!ring_owned_[s] || owner_l_[s] < 0 || owner_l_[s] >= dl) continue;
     if (ring_state_[s] == kRingLoading) continue;
     if (!parked_[s] && consumed_rec_[s]) {
       if (cudaEventQuery(consumed_ev_[s]) != cudaSuccess) continue;
@@ -432,9 +454,6 @@ void ExpertPump::stream_progress(int layer) {
     parked_[s] = 0;
     consumed_rec_[s] = 0;
   }
-  stream_cv_.notify_all();
-#else
-  (void)layer;
 #endif
 }
 
@@ -519,6 +538,12 @@ void ExpertPump::stream_finish() {
 // one), stage pool -> pinned slab -> VRAM on the copy stream, publish.
 // Each reader owns its slabs (no cross-thread slab sharing).
 void ExpertPump::loader_loop(int tid) {
+  // v0.2.5: every exit path (plan drained, session off, wedged hunt) must
+  // decrement the live count - dispatch gates streaming on it.
+  struct LiveGuard {
+    std::atomic<int>& a;
+    ~LiveGuard() { a.fetch_sub(1, std::memory_order_relaxed); }
+  } lg{live_loaders_};
   auto& slabs = loader_slabs_[static_cast<size_t>(tid)];
   size_t slab_i = 0;
   for (;;) {
@@ -573,6 +598,12 @@ void ExpertPump::loader_loop(int tid) {
       if (!stream_active_.load(std::memory_order_relaxed)) return;
       {
         std::lock_guard<std::mutex> lk(stream_mu_);
+        // v0.2.5: self-recovery. A reader wedged on a full ring used to wait
+        // for the session's next layer boundary (stream_progress) - but the
+        // session can BE blocked in a lookup waiting for this very reader,
+        // a deadlock that only drained at ~120 s per pair on a cold Colab
+        // T4. Reclaiming behind-the-session slots here breaks the cycle.
+        reclaim_locked();
         for (size_t k = 0; k < slot_count_; ++k) {
           const size_t s = (cursor_ + k) % slot_count_;
           if (ring_state_[s] != kRingFree) continue;

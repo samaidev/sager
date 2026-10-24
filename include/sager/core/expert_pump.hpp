@@ -220,7 +220,10 @@ class ExpertPump {
   // lookups forever.
   int stream_loader_count() const {
 #if defined(SAGER_HAVE_CUDA)
-    return static_cast<int>(loaders_.size());
+    // v0.2.5: LIVE count - loader_loop decrements on exit, so a session whose
+    // walkers finished (or never spawned) reads 0 and dispatch falls back to
+    // the per-pump submit path instead of waiting on lookups forever.
+    return live_loaders_.load(std::memory_order_relaxed);
 #else
     return 0;
 #endif
@@ -297,6 +300,16 @@ class ExpertPump {
   int pool_fd_ = -1;
   std::atomic<bool> stream_active_{false};
   std::vector<std::thread> loaders_;
+  std::atomic<int> live_loaders_{0};   // v0.2.5: spawned minus exited
+
+  // Requires stream_mu_ held. Releases every slot owned by a pair whose
+  // layer is already behind the session (done_layer_): consumed pairs wait
+  // for their GEMM event, unconsumed ones (walk took the CPU fallback)
+  // can never be read again and free up immediately. Called by the session
+  // thread (stream_progress) AND by loader threads stuck in the take loop -
+  // otherwise a wedged ring can only recover at the next layer boundary,
+  // which never comes while the walk itself is blocked in a lookup.
+  void reclaim_locked();
 
   void loader_loop(int tid);
 

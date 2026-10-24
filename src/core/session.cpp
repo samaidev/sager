@@ -958,8 +958,12 @@ void Session::moe_dispatch_batched(int layer, int n) {
       // a 5.8 GB chunk); the disk itself only needed 22 s. Retry the
       // lookup - each attempt is cv-driven and returns as soon as the
       // slot publishes - with a ~120 s budget before truly giving up.
+      // v0.2.5: the retry budget drops from 60 x arm_timeout (120 s/pair on
+      // the Colab T4) to 8: loaders now self-reclaim wedged slots, so a
+      // genuinely stalled pair recovers on its own and a dead one frees the
+      // walk fast enough to keep the GPU busy.
       int slot = pump_->stream_lookup(layer, e);
-      for (int retry = 0; slot < 0 && retry < 60; ++retry) {
+      for (int retry = 0; slot < 0 && retry < 8; ++retry) {
         slot = pump_->stream_lookup(layer, e);
       }
       if (slot >= 0) {
