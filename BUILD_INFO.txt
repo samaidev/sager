@@ -1,0 +1,28 @@
+SAGER v0.2.2 T4 CUDA build info
+=================================
+repo:        samaidev/sager
+commit:      7b070c7c8ac13ffb976aff17601733a509fc5051 (main)
+built on:    Colab Tesla T4 (sm_75, 15360 MiB), 2 vCPU, 12.7 GB RAM
+toolchain:   Build cuda_13.0.r13.0/compiler.36424714_0
+cmake:       cmake version 3.31.10
+flags:       cmake -B build -DCMAKE_BUILD_TYPE=Release (setup.sh; CUDA autodetected)
+env:         SAGER_EXPERT_POOL_FILE=/content/pool.bin SAGER_EXPERT_POOL_REUSE=1
+model:       Sage-A1.5-Q4_K_M.gguf 21,713,463,520 B sha256 a64fe0bb...ca395
+date:        2026-10-24
+
+Contents of the release tarball (sager_v022_t4_cuda.tar.gz):
+  build/sager_engine        767,864 B  - the resident JSON-lines engine
+  build/sager_test_q4        56,848 B  - ctest: Q4_K roundtrip
+  build/sager_test_gdn       38,904 B  - ctest: GDN golden vectors
+  build/sager_test_pump      26,912 B  - ctest: expert pump policy
+  build/libsager_core.a     633,868 B
+  build/libsager_cuda.a     491,056 B
+  BUILD_INFO.txt            this file
+  BENCH_RESULTS.md          benchmark + fixes + reproduce
+  bench_result.json         raw engine responses (pp512/tg128, pp64/tg128, stats)
+  bench_stderr.log          engine log of the benchmark run
+  bench_sager.py            benchmark driver
+  real_smoke.py             smoke driver (load -> generate -> stats -> shutdown)
+  dl_sage.sh                model download script (HF + curl resume fallback)
+  sager_build.sh            remote build script (setup.sh wrapper)
+  run_san.sh                compute-sanitizer memcheck run wrapper

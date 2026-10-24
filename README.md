@@ -39,6 +39,22 @@ Sage-A1.5 is a HYBRID (config.json: `full_attention_interval=4`, 40 blocks → *
 
 KV is now allocated only for the 10 full-attention layers (GDN layers keep fixed-size recurrence state — ~60 MB total instead of hundreds of MB of KV).
 
+## Measured on one Tesla T4 (v0.2.2, Sage-A1.5-Q4_K_M, commit 7b070c7)
+
+Native llama.cpp `qwen35moe` GGUFs load directly (`.weight`-suffixed tensor names accepted).
+
+| metric | sager v0.2.2 (all-GPU + expert streaming) | llama.cpp ngl30 (10 layers on CPU) |
+|---|---|---|
+| prefill pp512 | **48.96 tok/s** | 20.51 tok/s |
+| decode tg128 | **18.59 tok/s** | 3.45 tok/s |
+| fit | 20.2 GB weights on a 15.4 GB card: 5309/10240 experts hot-resident, misses pumped per-token over PCIe; 40 per-layer decode graphs captured | needs 19.9 GB → ngl99 OOM, 93% of decode time on 2 weak CPU cores |
+
+Gates passed before these numbers: ctest 3/3, and compute-sanitizer memcheck
+`ERROR SUMMARY: 0 errors` over load → warmup → graph capture → generation.
+Full report + reproduction commands: [BENCH_RESULTS.md](BENCH_RESULTS.md);
+prebuilt sm_75 binaries: [release sager-v0.2.2-t4](https://github.com/samaidev/sager/releases/tag/sager-v0.2.2-t4)
+(mirrors: HF `tchbcb/sager-t4-cuda-artifacts`, ModelScope `luoyunlan168/sager-t4-cuda-artifacts`).
+
 ## Format: GGUF-compatible Q4_K, in-house kernels
 
 The on-disk format is **byte-compatible with the standard Q4_K super-block** (256 weights / 144 bytes / 4.5 bpw, K-quant scale packing), so community GGUFs load directly — but the kernels are ours:
