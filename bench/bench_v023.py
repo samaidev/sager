@@ -66,16 +66,26 @@ def run_engine(cmds, env_extra, log_name):
         f.write(proc.stdout)
     with open(os.path.join(OUT, log_name + ".err"), "w") as f:
         f.write(proc.stderr)
-    # parse throughput from the engine's stderr log
+    # v0.2.5b: decode_tps lives in the stdout done-line JSON, not stderr
     pp = tg = None
+    for line in proc.stdout.splitlines():
+        s2 = line.strip()
+        if s2.startswith('{"') and '"type":"done"' in s2:
+            try:
+                dj = json.loads(s2)
+                if dj.get("decode_tps"):
+                    tg = float(dj["decode_tps"])
+            except Exception:
+                pass
     m = re.search(r"prefill\] (\d+) tokens in (\d+) ms \(([\d.]+) tok/s",
                   proc.stderr)
     if m:
         pp = {"tokens": int(m.group(1)), "ms": int(m.group(2)),
               "tps": float(m.group(3))}
-    m = re.search(r"decode_tps[\": ]+([\d.]+)", proc.stderr)
-    if m:
-        tg = float(m.group(1))
+    if tg is None:
+        m = re.search(r"decode_tps[\": ]+([\d.]+)", proc.stderr)
+        if m:
+            tg = float(m.group(1))
     m = re.search(r"decode\] .*?([\d.]+) tok/s", proc.stderr)
     if tg is None and m:
         tg = float(m.group(1))
@@ -132,11 +142,12 @@ def main():
     a = os.path.join(OUT, "A_stream_pp512_tg128")
     b = os.path.join(OUT, "B_perrow_pp512_tg128")
     if os.path.exists(a) and os.path.exists(b):
-        ta = open(a).read().count('"type": "token"')
-        tb = open(b).read().count('"type": "token"')
+        ta = open(a).read().count('"type":"token"')
+        tb = open(b).read().count('"type":"token"')
         same = open(a).read() == open(b).read()
         print(f"TOKEN_STREAMS: A={ta} B={tb} "
               + ("IDENTICAL" if same else "DIFFER"), flush=True)
 
 if __name__ == "__main__":
     main()
+
