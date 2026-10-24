@@ -191,8 +191,9 @@ void sigmoid_gate_scalar_batched_f16(uint16_t* out, const float* g,
                                      cudaStream_t stream);
 
 // CPU-pool fallback results into the batched combine slab:
-// dst[dst_flat[i]] = fp16(src row i); dst_flat holds full element offsets.
-void scatter_rows_generic_f16(uint16_t* dst, const uint16_t* src,
+// dst[dst_flat[i]] = fp16(src row i) (src is fp32, converted in-kernel);
+// dst_flat holds full element offsets.
+void scatter_rows_generic_f16(uint16_t* dst, const float* src,
                               const int* dst_flat, int n_list, int hidden,
                               cudaStream_t stream);
 

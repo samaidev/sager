@@ -245,13 +245,13 @@ __global__ void sigmoid_gate_scalar_batched_kernel(uint16_t* out,
 
 // CPU-pool fallback rows: dst[dst_flat[i]] = fp16(src[i]) rows.
 __global__ void scatter_rows_generic_kernel(uint16_t* dst,
-                                            const uint16_t* src,
+                                            const float* src,
                                             const int* dst_flat, int hidden) {
   const int i = blockIdx.y;
   const int j = blockIdx.x * blockDim.x + threadIdx.x;
   if (j < hidden) {
     dst[static_cast<size_t>(dst_flat[i]) + j] =
-        src[static_cast<size_t>(i) * hidden + j];
+        __float2half(src[static_cast<size_t>(i) * hidden + j]);
   }
 }
 
@@ -296,7 +296,7 @@ void sigmoid_gate_scalar_batched_f16(uint16_t* out, const float* g,
       out, g, hidden);
 }
 
-void scatter_rows_generic_f16(uint16_t* dst, const uint16_t* src,
+void scatter_rows_generic_f16(uint16_t* dst, const float* src,
                               const int* dst_flat, int n_list, int hidden,
                               cudaStream_t stream) {
   dim3 block(256), grid((hidden + 255) / 256, n_list);
