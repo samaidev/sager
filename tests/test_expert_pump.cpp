@@ -44,10 +44,18 @@ ExpertPump::Config make_cfg(size_t arena_bytes) {
 }  // namespace
 
 int main() {
+  // Valid dummy pool backing: on CUDA builds the pump performs real (tiny)
+  // DMAs, so a null host base would fail init() and the submit path would
+  // then run against an uninitialized pump (segfault). 2 layers x 8 experts
+  // x 1 KiB = 16 KiB.
+  static uint8_t dummy_pool[kLayers * kExperts * kSlab];
+  for (size_t i = 0; i < sizeof(dummy_pool); ++i)
+    dummy_pool[i] = static_cast<uint8_t>(i * 7 + 3);
+
   // ---- reuse: same expert submitted twice -> one slot, one copy ----------
   {
     ExpertPump p;
-    CHECK(p.init(make_cfg(4 * kSlab), nullptr) == Status::kOk, "init");
+    CHECK(p.init(make_cfg(4 * kSlab), dummy_pool) == Status::kOk, "init");
     const int s1 = p.submit(0, 3, 1);
     CHECK(s1 >= 0, "first submit gets a slot");
     CHECK(p.resident(0, 3), "resident after submit");
@@ -61,7 +69,7 @@ int main() {
   // ---- LRU eviction: fill the arena, touch oldest, submit new ------------
   {
     ExpertPump p;
-    CHECK(p.init(make_cfg(2 * kSlab), nullptr) == Status::kOk, "init 2 slots");
+    CHECK(p.init(make_cfg(2 * kSlab), dummy_pool) == Status::kOk, "init 2 slots");
     const int a = p.submit(0, 0, 1);
     const int b = p.submit(0, 1, 2);
     CHECK(a >= 0 && b >= 0 && a != b, "two distinct slots");
@@ -84,7 +92,7 @@ int main() {
   // ---- clear(): reset semantics ------------------------------------------
   {
     ExpertPump p;
-    CHECK(p.init(make_cfg(4 * kSlab), nullptr) == Status::kOk, "init");
+    CHECK(p.init(make_cfg(4 * kSlab), dummy_pool) == Status::kOk, "init");
     p.submit(0, 0, 1);
     p.submit(1, 2, 1);
     CHECK(p.resident_count() == 2, "two residents before clear");
@@ -101,7 +109,7 @@ int main() {
   // ---- fallback: arena too small for even one expert ---------------------
   {
     ExpertPump p;
-    CHECK(p.init(make_cfg(kSlab / 2), nullptr) == Status::kOk, "init tiny");
+    CHECK(p.init(make_cfg(kSlab / 2), dummy_pool) == Status::kOk, "init tiny");
     CHECK(p.submit(0, 0, 1) == -1, "no arena -> fallback (-1)");
     CHECK(p.stats().fallbacks == 1, "fallback counted");
     CHECK(!p.resident(0, 0), "nothing resident after fallback");
@@ -110,7 +118,7 @@ int main() {
   // ---- stress: more unique experts than slots, all submits succeed --------
   {
     ExpertPump p;
-    CHECK(p.init(make_cfg(4 * kSlab), nullptr) == Status::kOk, "init 4");
+    CHECK(p.init(make_cfg(4 * kSlab), dummy_pool) == Status::kOk, "init 4");
     std::set<int> slots;
     uint64_t step = 1;
     for (int L = 0; L < kLayers; ++L) {
