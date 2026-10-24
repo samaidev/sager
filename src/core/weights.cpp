@@ -518,9 +518,18 @@ Status Weights::load_expert_pool(gguf::File& f, const ModelConfig& cfg) {
   const EngineDims& d = dims;
   const size_t ebytes = cfg.expert_bytes();
   expert_pool_bytes_ = static_cast<size_t>(d.experts_total()) * ebytes;
+  // SAGER_EXPERT_POOL_SWAP=1: back the pool with swappable (non-pinned)
+  // memory instead of page-locked RAM. For boxes whose RAM is smaller than
+  // the full expert set (e.g. a 12 GB Colab against a 17 GB expert pool):
+  // the kernel pages cold experts out, the pump faults them back on demand.
+  // Slower than pinned RAM, but it keeps every address stable.
+  const bool pinned = !env_flag("SAGER_EXPERT_POOL_SWAP");
   expert_pool_host_ = static_cast<uint8_t*>(
-      host_alloc(expert_pool_bytes_, /*pinned=*/true));
+      host_alloc(expert_pool_bytes_, pinned));
   if (!expert_pool_host_) return Status::kOomRam;
+  SLOG_I("weights", "expert pool backing: %s (%.1f GB)",
+         pinned ? "pinned RAM" : "swappable (SAGER_EXPERT_POOL_SWAP=1)",
+         expert_pool_bytes_ / 1073741824.0);
 
   auto tile = [&](size_t rows, size_t cols) { return rows * (cols / q4k::kQK_K) * q4k::kBlockBytes; };
   const size_t gu = tile(static_cast<size_t>(d.n_ff_exp), static_cast<size_t>(d.hidden));
