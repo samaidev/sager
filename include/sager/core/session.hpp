@@ -26,9 +26,11 @@
 #include "sager/common.hpp"
 #include "sager/core/config.hpp"
 #include "sager/core/expert_cache.hpp"
+#include "sager/core/expert_pump.hpp"
 #include "sager/core/expert_source.hpp"
 #include "sager/core/weights.hpp"
 #include "sager/core/tensor.hpp"
+#include "sager/kernels/gdn.hpp"
 #include "sager/kernels/q4_k.hpp"
 
 #if defined(SAGER_HAVE_CUDA)
@@ -147,11 +149,13 @@ class Session {
   friend class MtpDrafter;   // drafter reuses the stream + hidden stash
   Status alloc_scratch();
   Status capture_graphs();
-  void   dense_layer_launch(int layer, int n_tokens);  // graph body
+  void   dense_layer_launch(int layer, int n_tokens);  // graph body (GQA)
+  void   linear_layer_launch(int layer, int n_tokens); // graph body (GDN, v0.2)
   void   moe_dispatch(int layer);                       // eager MoE half (row 0)
   void   moe_dispatch_row(int layer, int row);          // eager MoE for row r
   void   head_launch();                                 // final norm+head
   void   head_launch_row(int row);                      // per-row head (prefill tail)
+  void   zero_gdn_states();                             // conv + delta state reset
 
   Weights&      w_;
   ExpertCache&  cache_;
@@ -162,6 +166,13 @@ class Session {
   KVCache   kv_;
   GraphSet  graphs_;
   std::unique_ptr<detail::HotTier> hot_;
+  std::unique_ptr<ExpertPump> pump_;      // v0.2 per-token expert streaming
+
+  // v0.2 layer-kind indirection (built in prepare()):
+  //   kv_slot_of_layer_[L]  KV slab for full-attention layers (-1 for GDN)
+  //   gdn_idx_of_layer_[L]  GDN state slab for linear layers (-1 for GQA)
+  std::vector<int> kv_slot_of_layer_;
+  std::vector<int> gdn_idx_of_layer_;
 
 #if defined(SAGER_HAVE_CUDA)
   CudaStream stream_;
@@ -177,6 +188,10 @@ class Session {
   DeviceBuffer<q4k::BlockQ8K> d_xq_, d_hq_, d_mq_;
   DeviceBuffer<float>    logits_, mtp_logits_;
   DeviceBuffer<int>      d_recent_;
+  // v0.2 expert pump staging (C7: fixed addresses, session-thread only)
+  DeviceBuffer<q4k::BlockQ4K*> d_ptrs_pump_;  // compact pump ptr table (3*K)
+  DeviceBuffer<int>      d_pump_rows_;         // pumped row -> routed slot k
+  DeviceBuffer<q4k::BlockQ8K> d_xq_moe_;        // row activation snapshot
   PinnedBuffer<int>      h_route_idx_, h_slot_of_k_;
   PinnedBuffer<float>    h_route_w_;
   PinnedBuffer<uint16_t> h_x16_;                 // xn_ row staging (miss path)
@@ -184,6 +199,14 @@ class Session {
   PinnedBuffer<float>    logits_host_;
   PinnedBuffer<q4k::BlockQ4K*> h_ptrs_;          // compact hit ptr staging
   PinnedBuffer<int>      h_hit_rows_;            // hit slot -> routed slot k
+  PinnedBuffer<q4k::BlockQ4K*> h_pump_ptrs_;     // compact pump ptr staging
+  PinnedBuffer<int>      h_pump_rows_;           // pumped slot -> routed slot k
+  // v0.2 GDN working set (fixed addresses -> graph-capturable)
+  DeviceBuffer<uint16_t> lin_proj_, lin_ba_, lin_conv_, lin_qn_, lin_kn_;
+  DeviceBuffer<uint16_t> lin_y_, lin_on_;
+  DeviceBuffer<float>    lin_ab_;
+  DeviceBuffer<uint16_t> lin_conv_state_;   // n_gdn * conv_dim * (ck-1)
+  DeviceBuffer<float>    lin_delta_state_;  // n_gdn * nk * (ratio*V) * K
 #endif
 
   int pos_ = 0;

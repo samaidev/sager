@@ -283,8 +283,21 @@ def cfg_from_hf(hf_dir: str) -> dict:
     with open(os.path.join(hf_dir, "config.json")) as f:
         c = json.load(f)
     tc = c.get("text_config", c)  # VL wrappers keep text params nested
+    # layer kind: explicit layer_types list, else derive from
+    # full_attention_interval (pattern: interval-1 full-attention layers of
+    # every `interval` blocks; Sage-A1.5 = 3 GDN + 1 GQA repeating).
+    n_layer = tc.get("num_hidden_layers", 48)
+    ltypes = tc.get("layer_types") or []
+    if len(ltypes) == n_layer:
+        is_linear = [1 if t == "linear_attention" else 0 for t in ltypes]
+    else:
+        iv = tc.get("full_attention_interval", 0)
+        if iv and iv > 1:
+            is_linear = [0 if (i % iv == iv - 1) else 1 for i in range(n_layer)]
+        else:
+            is_linear = [0] * n_layer
     return {
-        "n_layer": tc.get("num_hidden_layers", 48),
+        "n_layer": n_layer,
         "n_head": tc.get("num_attention_heads", 32),
         "n_head_kv": tc.get("num_key_value_heads", 4),
         "head_dim": tc.get("head_dim",
@@ -301,22 +314,34 @@ def cfg_from_hf(hf_dir: str) -> dict:
         "mrope": tc.get("rope_scaling", {}).get("type", "") == "mrope",
         "mrope_section": tc.get("rope_scaling", {}).get("mrope_section", [11, 11, 10]),
         "shared_expert": tc.get("shared_expert_intermediate_size", 768) > 0,
+        # v0.2 gated delta net
+        "layer_is_linear": is_linear,
+        "gdn_k_heads": tc.get("linear_num_key_heads", 16),
+        "gdn_v_heads": tc.get("linear_num_value_heads", 32),
+        "gdn_key_dim": tc.get("linear_key_head_dim", 128),
+        "gdn_value_dim": tc.get("linear_value_head_dim", 128),
+        "gdn_conv_kernel": tc.get("linear_conv_kernel_dim", 4),
     }
 
 
 def _convert_expert_layer(args) -> List[Tuple[str, np.ndarray, int]]:
     """Worker: stack + quantize the 3 expert tensors of one layer.
 
-    HF stores per-expert matrices mlp.experts.{e}.{gate,up,down}_proj.weight,
-    possibly spread across shards; SAGER wants stacked [n_expert, rows, cols]
-    tensors sliced expert-major by the loader (weights.cpp load_expert_pool).
+    HF stores per-expert matrices {moe}.{e}.{gate,up,down}_proj.weight
+    (moe = "mlp" or "moe" depending on the modeling code), possibly spread
+    across shards; SAGER wants stacked [n_expert, rows, cols] tensors sliced
+    expert-major by the loader (weights.cpp load_expert_pool).
     """
-    layer, mapping, n_expert = args
-    prefix = f"model.layers.{layer}.mlp.experts."
+    layer, mapping, n_expert, exp_prefix = args
+    # exp_prefix already contains the layer path and ends with "experts."
+    # (e.g. "model.language_model.layers.3.mlp.experts."); the expert loop
+    # below appends the expert index directly.
+    prefix = exp_prefix
     def stack(suffix: str) -> np.ndarray:
         mats = []
-        with safe_open(mapping[f"{prefix}0.{suffix}"], framework="numpy") as probe:
-            rows, cols = probe.get_slice(f"{prefix}0.{suffix}").get_shape()
+        probe_name = f"{prefix}0.{suffix}"
+        with safe_open(mapping[probe_name], framework="numpy") as probe:
+            rows, cols = probe.get_slice(probe_name).get_shape()
         for e in range(n_expert):
             name = f"{prefix}{e}.{suffix}"
             with safe_open(mapping[name], framework="numpy") as f:
@@ -336,6 +361,29 @@ def convert(hf_dir: str, out_path: str, workers: int, fast: bool = False) -> Non
     mapping = find_weights(hf_dir)
     w = GGUFWriter()
 
+    # ---- source layout detection (v0.2) ------------------------------------
+    # Sage-A1.5 ships "model.language_model.layers.*"; plain qwen-family
+    # checkpoints use "model.layers.*". MoE submodule is "mlp" (qwen family)
+    # or "moe" (some finetunes).
+    if "model.language_model.layers.0.input_layernorm.weight" in mapping:
+        base = "model.language_model."
+    else:
+        base = "model."
+    def lp(layer: int) -> str:
+        return f"{base}layers.{layer}."
+    def moe_of(layer: int) -> str:
+        p = lp(layer)
+        for cand in ("mlp", "moe"):
+            if f"{p}{cand}.gate.weight" in mapping:
+                return f"{p}{cand}."
+        raise KeyError(f"no mlp/moe router under {p}")
+    def exp_base(layer: int) -> str:
+        m = moe_of(layer)
+        for cand in ("experts", "moe"):
+            if f"{m}{cand}.0.gate_proj.weight" in mapping:
+                return f"{m}{cand}."
+        raise KeyError(f"no experts dir under {m}")
+
     def src(name: str) -> np.ndarray:
         return safe_open(mapping[name], framework="numpy").get_tensor(name)
 
@@ -343,7 +391,7 @@ def convert(hf_dir: str, out_path: str, workers: int, fast: bool = False) -> Non
     w.add("general.architecture", "sager.sage_a15")
     w.add("general.name", os.path.basename(os.path.normpath(hf_dir)))
     w.add("general.quantization", "Q4_K_M")
-    w.add("sager.version", 1)
+    w.add("sager.version", 2)
     # Canonical "sager.*" namespace - the keys src/core/config.cpp reads first.
     w.add("sager.block_count", cfg["n_layer"])
     w.add("sager.moe_layer_count", cfg["n_layer"])
@@ -363,6 +411,13 @@ def convert(hf_dir: str, out_path: str, workers: int, fast: bool = False) -> Non
     w.add("sager.rope.partial_rotary_factor", float(cfg["rope_partial"]))
     if cfg["mrope"]:
         w.add("sager.rope.mrope_section", cfg["mrope_section"])
+    # v0.2: hybrid layer kinds + gated delta net geometry
+    w.add("sager.layer_is_linear", cfg["layer_is_linear"])
+    w.add("sager.gdn.key_heads", cfg["gdn_k_heads"])
+    w.add("sager.gdn.value_heads", cfg["gdn_v_heads"])
+    w.add("sager.gdn.key_dim", cfg["gdn_key_dim"])
+    w.add("sager.gdn.value_dim", cfg["gdn_value_dim"])
+    w.add("sager.gdn.conv_kernel", cfg["gdn_conv_kernel"])
     # qwen-family aliases (community converters / fallback readers)
     w.add("qwen3_5_moe.block_count", cfg["n_layer"])
     w.add("qwen3_5_moe.moe_layer_count", cfg["n_layer"])
@@ -383,17 +438,14 @@ def convert(hf_dir: str, out_path: str, workers: int, fast: bool = False) -> Non
           "mrope" if cfg["mrope"] else "none")
     w.add("qwen3_5_moe.rope.scaling.section", cfg["mrope_section"])
 
-    def shp(name: str) -> Tuple[int, ...]:
-        with safe_open(mapping[name], framework="numpy") as f:
-            return f.get_slice(name).get_shape()
-
     # ---- embedding / head / norms ----
-    emb = src("model.embed_tokens.weight")
+    emb_name = f"{base}embed_tokens.weight"
+    emb = src(emb_name)
     w.add_tensor("token_embd.weight", emb, T_F16)
     w.add_tensor("output_norm.weight",
-                 src("model.norm.weight").astype(np.float32), T_F16)
+                 src(f"{base}norm.weight").astype(np.float32), T_F16)
     head = src("lm_head.weight") if "lm_head.weight" in mapping \
-        else src("model.embed_tokens.weight")
+        else src(emb_name)
     print(f"[convert] quantizing output head {head.shape} (Q4_K) ...")
     w.add_tensor("output.weight", head, T_Q4_K)
 
@@ -402,30 +454,61 @@ def convert(hf_dir: str, out_path: str, workers: int, fast: bool = False) -> Non
         w.add_tensor("mtp.fc.weight", src("mtp.fc.weight"), T_F16)
     if "mtp.proj_out.weight" in mapping:
         w.add_tensor("mtp.proj_out.weight", src("mtp.proj_out.weight"), T_F16)
+
     L = cfg["n_layer"]
     for layer in range(L):
-        p = f"model.layers.{layer}."
+        p = lp(layer)
+        linear = bool(cfg["layer_is_linear"][layer])
         attn_norm = src(p + "input_layernorm.weight")
         ffn_norm = src(p + "post_attention_layernorm.weight")
         w.add_tensor(f"blk.{layer}.attn_norm", attn_norm.astype(np.float32), T_F16)
         w.add_tensor(f"blk.{layer}.ffn_norm", ffn_norm.astype(np.float32), T_F16)
-        print(f"[convert] layer {layer + 1}/{L}: attention ...")
-        w.add_tensor(f"blk.{layer}.attn_q.weight", src(p + "self_attn.q_proj.weight"), T_Q4_K)
-        w.add_tensor(f"blk.{layer}.attn_k.weight", src(p + "self_attn.k_proj.weight"), T_Q4_K)
-        w.add_tensor(f"blk.{layer}.attn_v.weight", src(p + "self_attn.v_proj.weight"), T_Q4_K)
-        w.add_tensor(f"blk.{layer}.attn_output.weight", src(p + "self_attn.o_proj.weight"), T_Q4_K)
+        if linear:
+            # ---- gated delta net layer (v0.2) ----
+            print(f"[convert] layer {layer + 1}/{L}: gated-delta ...")
+            la = p + "linear_attn."
+            w.add_tensor(f"blk.{layer}.lin_in_qkvz",
+                         src(la + "in_proj_qkvz.weight"), T_Q4_K)
+            w.add_tensor(f"blk.{layer}.lin_in_ba",
+                         src(la + "in_proj_ba.weight"), T_Q4_K)
+            conv_w = src(la + "conv1d.weight")
+            conv_w = np.asarray(conv_w).reshape(conv_w.shape[0], -1)  # [D,1,ck] -> [D,ck]
+            w.add_tensor(f"blk.{layer}.lin_conv_w", conv_w, T_F16)
+            if la + "conv1d.bias" in mapping:
+                w.add_tensor(f"blk.{layer}.lin_conv_b",
+                             src(la + "conv1d.bias").astype(np.float32), T_F16)
+            w.add_tensor(f"blk.{layer}.lin_A_log",
+                         src(la + "A_log").astype(np.float32), T_F32)
+            w.add_tensor(f"blk.{layer}.lin_dt_bias",
+                         src(la + "dt_bias").astype(np.float32), T_F32)
+            w.add_tensor(f"blk.{layer}.lin_q_norm",
+                         src(la + "q_norm.weight").astype(np.float32), T_F16)
+            w.add_tensor(f"blk.{layer}.lin_k_norm",
+                         src(la + "k_norm.weight").astype(np.float32), T_F16)
+            w.add_tensor(f"blk.{layer}.lin_o_norm",
+                         src(la + "o_norm.weight").astype(np.float32), T_F16)
+            w.add_tensor(f"blk.{layer}.lin_out",
+                         src(la + "out_proj.weight"), T_Q4_K)
+        else:
+            # ---- full attention layer (v0.1 path) ----
+            print(f"[convert] layer {layer + 1}/{L}: attention ...")
+            w.add_tensor(f"blk.{layer}.attn_q.weight", src(p + "self_attn.q_proj.weight"), T_Q4_K)
+            w.add_tensor(f"blk.{layer}.attn_k.weight", src(p + "self_attn.k_proj.weight"), T_Q4_K)
+            w.add_tensor(f"blk.{layer}.attn_v.weight", src(p + "self_attn.v_proj.weight"), T_Q4_K)
+            w.add_tensor(f"blk.{layer}.attn_output.weight", src(p + "self_attn.o_proj.weight"), T_Q4_K)
         print(f"[convert] layer {layer + 1}/{L}: router + shared ...")
+        m = moe_of(layer)
         w.add_tensor(f"blk.{layer}.ffn_gate_inp",
-                     src(p + "mlp.gate.weight").astype(np.float32), T_F32)
+                     src(m + "gate.weight").astype(np.float32), T_F32)
         if cfg["shared_expert"]:
-            w.add_tensor(f"blk.{layer}.ffn_gate_shexp", src(p + "mlp.shared_expert.gate_proj.weight"), T_Q4_K)
-            w.add_tensor(f"blk.{layer}.ffn_up_shexp", src(p + "mlp.shared_expert.up_proj.weight"), T_Q4_K)
-            w.add_tensor(f"blk.{layer}.ffn_down_shexp", src(p + "mlp.shared_expert.down_proj.weight"), T_Q4_K)
+            w.add_tensor(f"blk.{layer}.ffn_gate_shexp", src(m + "shared_expert.gate_proj.weight"), T_Q4_K)
+            w.add_tensor(f"blk.{layer}.ffn_up_shexp", src(m + "shared_expert.up_proj.weight"), T_Q4_K)
+            w.add_tensor(f"blk.{layer}.ffn_down_shexp", src(m + "shared_expert.down_proj.weight"), T_Q4_K)
 
     # experts in parallel (the expensive part)
     print(f"[convert] quantizing {L} expert stacks with {workers} workers "
           f"({'fast' if fast else 'searched'}) ...")
-    jobs = [(layer, mapping, cfg["n_expert"]) for layer in range(L)]
+    jobs = [(layer, mapping, cfg["n_expert"], exp_base(layer)) for layer in range(L)]
     qexp = quantize_q4_k_fast if fast else quantize_q4_k
     if workers <= 1:
         for j in jobs:

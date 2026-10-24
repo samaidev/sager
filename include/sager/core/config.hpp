@@ -11,12 +11,33 @@
 
 #include "sager/common.hpp"
 #include "sager/core/gguf.hpp"
+#include "sager/kernels/gdn.hpp"
 #include "sager/kernels/q4_k.hpp"
 
 namespace sager {
 
 struct ModelConfig {
   EngineDims dims;
+
+  // Per-layer attention kind (v0.2): 1 = gated delta net (linear attention),
+  // 0 = full GQA attention. Empty = all full-attention (v0.1 files). Read
+  // from the GGUF key "sager.layer_is_linear" written by the converter.
+  std::vector<uint8_t> layer_is_linear;
+
+  bool is_linear(int layer) const {
+    return !layer_is_linear.empty() &&
+           layer_is_linear[static_cast<size_t>(layer)] != 0;
+  }
+  int n_linear() const {
+    int n = 0;
+    for (uint8_t v : layer_is_linear) n += (v != 0);
+    return n;
+  }
+  GdnParams gdn() const {
+    const EngineDims& d = dims;
+    return GdnParams{d.n_gdn_k_heads, d.n_gdn_v_heads, d.gdn_key_dim,
+                     d.gdn_value_dim, d.gdn_conv_kernel};
+  }
 
   // Norm / rope params from metadata (Sage-A1.5 values per model card).
   float norm_eps            = 1e-6f;
@@ -54,6 +75,9 @@ struct CtxParams {
   bool  kv_q8            = true;   // Q8 KV cache: ~2x more context per GB
   int   batch_threads    = 0;      // CPU pool workers (0 = hw_concurrency/2)
   size_t vram_budget_mb  = 10240;  // hot-expert pool budget inside 16GB T4
+  // v0.2: per-token expert pump (C7 contract in core/expert_pump.hpp).
+  bool   expert_pump     = true;   // DMA misses RAM->VRAM, compute on GPU
+  size_t pump_arena_mb   = 1536;   // streaming arena (~880 slots @1.7MB)
   bool  capture_graphs   = true;   // per-layer decode CUDA graphs
   bool  enable_mtp       = true;   // speculative drafting (needs MTP head)
   int   mtp_max_draft    = 3;      // model card: num_speculative_tokens=3

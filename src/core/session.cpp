@@ -164,12 +164,44 @@ Status Session::alloc_scratch() {
   if (!ok(d_pos_ids_.alloc(3 * T))) return Status::kOomVram;
   if (!ok(d_recent_.alloc(kMaxRecent))) return Status::kOomVram;
 
+  // v0.2 expert pump staging
+  if (!ok(d_ptrs_pump_.alloc(3 * K))) return Status::kOomVram;
+  if (!ok(d_pump_rows_.alloc(K))) return Status::kOomVram;
+  if (!ok(d_xq_moe_.alloc(H / q4k::kQK_K))) return Status::kOomVram;
+
+  // v0.2 GDN working set (fixed addresses; state slabs are per linear layer)
+  const GdnParams g = mc_.gdn();
+  const int n_gdn = mc_.n_linear();
+  if (!ok(lin_proj_.alloc(static_cast<size_t>(g.proj_rows()))))
+    return Status::kOomVram;
+  if (!ok(lin_ba_.alloc(static_cast<size_t>(g.ba_rows()))))
+    return Status::kOomVram;
+  if (!ok(lin_conv_.alloc(static_cast<size_t>(g.conv_dim()))))
+    return Status::kOomVram;
+  if (!ok(lin_qn_.alloc(static_cast<size_t>(g.n_k_heads) * g.key_dim)))
+    return Status::kOomVram;
+  if (!ok(lin_kn_.alloc(static_cast<size_t>(g.n_k_heads) * g.key_dim)))
+    return Status::kOomVram;
+  if (!ok(lin_y_.alloc(static_cast<size_t>(g.y_rows()))))
+    return Status::kOomVram;
+  if (!ok(lin_on_.alloc(static_cast<size_t>(g.y_rows()))))
+    return Status::kOomVram;
+  if (!ok(lin_ab_.alloc(static_cast<size_t>(2 * g.n_k_heads))))
+    return Status::kOomVram;
+  if (!ok(lin_conv_state_.alloc(static_cast<size_t>(n_gdn) *
+                                g.conv_state_elems())))
+    return Status::kOomVram;
+  if (!ok(lin_delta_state_.alloc(static_cast<size_t>(n_gdn) *
+                                 g.state_elems())))
+    return Status::kOomVram;
+
   // Host staging (pinned, C1: the SAME regions every call)
   if (!h_route_idx_.alloc(K + 1) || !h_route_w_.alloc(K + 1) ||
       !h_x16_.alloc(H) || !miss_x_.alloc(H) ||
       !miss_y_.alloc(static_cast<size_t>(K) * H) ||
       !logits_host_.alloc(V) || !h_ptrs_.alloc(3 * K) ||
-      !h_hit_rows_.alloc(K) || !h_slot_of_k_.alloc(K)) {
+      !h_hit_rows_.alloc(K) || !h_slot_of_k_.alloc(K) ||
+      !h_pump_ptrs_.alloc(3 * K) || !h_pump_rows_.alloc(K)) {
     return Status::kOomRam;
   }
   return Status::kOk;
@@ -213,6 +245,33 @@ Status Session::prepare() {
   // mrope section boundaries -> device constant memory (graph-safe: fixed).
   cuda::set_mrope_section(mc_.mrope_section.data());
 
+  // v0.2 layer-kind indirection: GQA layers share the KV slab pool; GDN
+  // layers get a state slab index instead and touch no KV at all.
+  const int n_gdn_layers = mc_.n_linear();
+  kv_slot_of_layer_.assign(static_cast<size_t>(d.n_layer), -1);
+  gdn_idx_of_layer_.assign(static_cast<size_t>(d.n_layer), -1);
+  int kv_i = 0, gdn_i = 0;
+  for (int L = 0; L < d.n_layer; ++L) {
+    if (mc_.is_linear(L)) gdn_idx_of_layer_[static_cast<size_t>(L)] = gdn_i++;
+    else                  kv_slot_of_layer_[static_cast<size_t>(L)] = kv_i++;
+  }
+
+  // v0.2 expert pump (C7 contract; arena next to the hot pool in VRAM).
+  if (cp_.expert_pump) {
+    pump_ = std::make_unique<ExpertPump>();
+    ExpertPump::Config pc;
+    pc.n_layers = d.n_moe_layer;
+    pc.n_experts = E;
+    pc.per_expert_bytes = mc_.expert_bytes();
+    pc.arena_bytes = cp_.pump_arena_mb << 20;
+    s = pump_->init(pc, w_.host_expert_base());
+    if (s != Status::kOk) {
+      SLOG_W("session", "expert pump init failed (%s) - CPU pool only",
+             status_str(s));
+      pump_.reset();
+    }
+  }
+
   // CPU expert pool (C4: geometry validated at bind time).
   const PoolGeometry want{d.hidden, d.n_ff_exp, E, q4k::kBlockBytes};
   s = pool_.start(cp_.batch_threads, want);
@@ -243,7 +302,8 @@ Status Session::prepare() {
   cudaMemcpy(route_w_.get(), h_route_w_.get(),
              (d.n_expert_used + 1) * sizeof(float), cudaMemcpyHostToDevice);
 
-  kv_.init({d.n_layer, d.n_head_kv, d.head_dim, cp_.n_ctx, cp_.kv_q8});
+  kv_.init({d.n_layer - n_gdn_layers, d.n_head_kv, d.head_dim, cp_.n_ctx,
+            cp_.kv_q8});
 
   if (cp_.capture_graphs) {
     s = capture_graphs();
@@ -262,9 +322,12 @@ Status Session::prepare() {
     graphs_.set_valid(false);
   }
 
-  SLOG_I("session", "ready: ctx=%d chunk=%d graphs=%s hot_experts=%d/%d",
+  SLOG_I("session",
+         "ready: ctx=%d chunk=%d graphs=%s hot_experts=%d/%d gdn_layers=%d "
+         "pump=%s(%d slots)",
          cp_.n_ctx, cp_.chunk_prefill, graphs_.valid() ? "on" : "off",
-         hot_->resident_count, d.experts_total());
+         hot_->resident_count, d.experts_total(), n_gdn_layers,
+         pump_ ? "on" : "off", pump_ ? pump_->slot_count() : 0);
   prepared_ = true;
   return Status::kOk;
 }
@@ -305,19 +368,29 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
   cuda::rope_f16(q_.get(), k_.get(), d_pos_ids_.get(), d.n_head, d.n_head_kv,
                  d.head_dim, rope_dims, mc_.rope_theta, mc_.rope_style,
                  n_tokens, s);
-  cuda::kv_append(k_.get(), v_.get(), kv_.k_slab(layer), kv_.v_slab(layer),
+  cuda::kv_append(k_.get(), v_.get(),
+                  kv_.k_slab(kv_slot_of_layer_[static_cast<size_t>(layer)]),
+                  kv_.v_slab(kv_slot_of_layer_[static_cast<size_t>(layer)]),
                   nullptr, nullptr, kv_.q8() ? 1 : 0, d_params_.get(),
                   n_tokens, d.n_head_kv, d.head_dim, s);
   if (n_tokens == 1) {
-    cuda::attention_decode_f16(attn_out_.get(), q_.get(), kv_.k_slab(layer),
-                               kv_.v_slab(layer), nullptr, nullptr,
+    cuda::attention_decode_f16(attn_out_.get(), q_.get(),
+                               kv_.k_slab(kv_slot_of_layer_[
+                                   static_cast<size_t>(layer)]),
+                               kv_.v_slab(kv_slot_of_layer_[
+                                   static_cast<size_t>(layer)]),
+                               nullptr, nullptr,
                                kv_.q8() ? 1 : 0, d_params_.get(), d.n_head,
                                d.n_head_kv, d.head_dim,
                                1.0f / std::sqrt(static_cast<float>(d.head_dim)),
                                s);
   } else {
-    cuda::attention_prefill_f16(attn_out_.get(), q_.get(), kv_.k_slab(layer),
-                                kv_.v_slab(layer), nullptr, nullptr,
+    cuda::attention_prefill_f16(attn_out_.get(), q_.get(),
+                                kv_.k_slab(kv_slot_of_layer_[
+                                    static_cast<size_t>(layer)]),
+                                kv_.v_slab(kv_slot_of_layer_[
+                                    static_cast<size_t>(layer)]),
+                                nullptr, nullptr,
                                 kv_.q8() ? 1 : 0, d_params_.get(), d.n_head,
                                 d.n_head_kv, d.head_dim,
                                 1.0f / std::sqrt(static_cast<float>(d.head_dim)),
@@ -341,14 +414,96 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
 }
 
 // ---------------------------------------------------------------------------
+// Gated-delta layer body (graph-capturable: fixed shapes, fixed addresses).
+// For n_tokens > 1 (prefill / verify) the recurrence is walked token by
+// token - correct first, chunked-parallel scan is the v0.3 upgrade
+// (docs/gdn-kernel.md). The MoE half after this body is IDENTICAL to the
+// dense layer's (Sage-A1.5: every block is MoE).
+// ---------------------------------------------------------------------------
+void Session::linear_layer_launch(int layer, int n_tokens) {
+  const EngineDims& d = mc_.dims;
+  const GdnParams g = mc_.gdn();
+  const LayerWeights& lw = w_.layers()[static_cast<size_t>(layer)];
+  const int H = d.hidden;
+  const int nk = g.n_k_heads;
+  const int K = g.key_dim;
+  const int rows = g.ratio() * g.value_dim;
+  cudaStream_t s = stream_.get();
+  const int slab = gdn_idx_of_layer_[static_cast<size_t>(layer)];
+  uint16_t* conv_st = lin_conv_state_.get() +
+      static_cast<size_t>(slab) * g.conv_state_elems();
+  float* delta_st = lin_delta_state_.get() +
+      static_cast<size_t>(slab) * g.state_elems();
+
+  for (int t = 0; t < n_tokens; ++t) {
+    uint16_t* x_row = x_.get() + static_cast<size_t>(t) * H;
+    uint16_t* xn_row = xn_.get() + static_cast<size_t>(t) * H;
+    uint16_t* op_row = o_proj_.get() + static_cast<size_t>(t) * H;
+    cuda::rmsnorm_f16(xn_row, x_row, lw.attn_norm, H, mc_.norm_eps, s);
+    cuda::quantize_q8_k(xn_row, d_xq_.get(), H, s);
+    // fused projections: qkvz -> [q|k|v|z], ba -> [b|a]
+    cuda::gemv_q4_k_q8_f16out(Q4W(lw.lin_in_qkvz), d_xq_.get(),
+                              lin_proj_.get(), g.proj_rows(), H, s);
+    cuda::gemv_q4_k_q8_f16out(Q4W(lw.lin_in_ba), d_xq_.get(),
+                              lin_ba_.get(), g.ba_rows(), H, s);
+    // conv (first conv_dim rows of proj: q|k|v; z bypasses) + SiLU
+    cuda::gdn_conv_step_f16(lin_conv_.get(), conv_st, lin_proj_.get(),
+                            lw.lin_conv_w, lw.lin_conv_b, g.conv_dim(),
+                            g.conv_kernel, s);
+    // data-dependent gates: alpha/beta per k-head
+    cuda::gdn_gate_f32(lin_ba_.get(), lw.lin_A_log, lw.lin_dt_bias,
+                       lin_ab_.get(), nk, s);
+    // per-head RMSNorm + L2 normalization of q/k (C-GDN-1)
+    cuda::gdn_qk_norm_f16(lin_qn_.get(), lin_kn_.get(), lin_conv_.get(),
+                          lw.lin_q_norm, lw.lin_k_norm, nk, K, mc_.norm_eps,
+                          s);
+    // rank-1 gated delta update of the persistent state (C-GDN-4)
+    cuda::gdn_delta_step_f16(delta_st, lin_y_.get(), lin_qn_.get(),
+                             lin_kn_.get(),
+                             lin_conv_.get() + static_cast<size_t>(2) * nk * K,
+                             lin_ab_.get(), nk, K, g.ratio(), g.value_dim(),
+                             s);
+    // output gating: o = rmsnorm(y) * silu(z)  (C-GDN-6)
+    cuda::gdn_out_norm_f16(lin_on_.get(), lin_y_.get(),
+                           lin_proj_.get() + g.conv_dim(), lw.lin_o_norm,
+                           g.n_v_heads, g.value_dim, mc_.norm_eps, s);
+    // out_proj -> residual
+    cuda::quantize_q8_k(lin_on_.get(), d_hq_.get(), g.y_rows(), s);
+    cuda::gemv_q4_k_q8_f16out(Q4W(lw.lin_out), d_hq_.get(), op_row, H,
+                              g.y_rows(), s);
+    cuda::add_f16(x_row, op_row, H, s);
+  }
+  (void)rows;
+}
+
+void Session::zero_gdn_states() {
+  if (lin_conv_state_.count()) {
+    cudaMemset(lin_conv_state_.get(), 0,
+               lin_conv_state_.bytes());
+  }
+  if (lin_delta_state_.count()) {
+    cudaMemset(lin_delta_state_.get(), 0,
+               lin_delta_state_.bytes());
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Graph capture
 // ---------------------------------------------------------------------------
 Status Session::capture_graphs() {
   const EngineDims& d = mc_.dims;
   graphs_.init(d.n_layer);
 
-  // Warm every kernel once (module load) outside capture.
-  dense_layer_launch(0, 1);
+  // Warm every kernel once (module load) outside capture. Warm ONE layer of
+  // each kind: dense_layer_launch reads lw.wq which is null on GDN layers -
+  // so the warmup layer must be chosen by type.
+  int warm_attn = -1, warm_gdn = -1;
+  for (int L = 0; L < d.n_layer; ++L) {
+    if (mc_.is_linear(L)) { if (warm_gdn < 0) warm_gdn = L; }
+    else                  { if (warm_attn < 0) warm_attn = L; }
+  }
+  if (warm_attn >= 0) dense_layer_launch(warm_attn, 1);
+  if (warm_gdn >= 0)  linear_layer_launch(warm_gdn, 1);
   stream_.sync();
   if (cudaError_t we = cudaGetLastError(); we != cudaSuccess) {
     SLOG_W("session", "capture warmup left error: %s", cudaGetErrorString(we));
@@ -362,7 +517,8 @@ Status Session::capture_graphs() {
              cudaGetErrorString(cudaGetLastError()));
       return Status::kCudaError;
     }
-    dense_layer_launch(L, 1);
+    if (mc_.is_linear(L)) linear_layer_launch(L, 1);
+    else                  dense_layer_launch(L, 1);
     cudaGraph_t graph = nullptr;
     cudaError_t ec = cudaStreamEndCapture(stream_.get(), &graph);
     if (ec != cudaSuccess) {
@@ -383,6 +539,10 @@ Status Session::capture_graphs() {
   }
   stream_.sync();
   graphs_.set_valid(true);
+  // Warmup + capture DON'T execute the recorded kernels, but the warmup DID
+  // mutate GDN state (one token through a linear layer) - reset it so real
+  // inference starts from clean recurrence state.
+  zero_gdn_states();
   SLOG_I("session", "captured %d per-layer decode graphs", d.n_layer);
   return Status::kOk;
 }
@@ -406,6 +566,14 @@ void Session::moe_dispatch_row(int layer, int row) {
 
   // Router: logits -> softmax top-k (renormalized weights).
   cuda::quantize_q8_k(xn_row, d_hq_.get(), H, s);
+  // Snapshot of the quantized activation for the pump path: the hits' out
+  // GEMV overwrites d_hq_ with the silu'd gate activations, but pumped
+  // experts are computed AFTER those launches and still need x.
+  if (pump_) {
+    cudaMemcpyAsync(d_xq_moe_.get(), d_hq_.get(),
+                    (H / q4k::kQK_K) * sizeof(q4k::BlockQ8K),
+                    cudaMemcpyDeviceToDevice, s);
+  }
   cuda::gemv_f32_out_f16x(lw.router, xn_row, route_logits_.get(), E, H, s);
   cuda::router_topk(route_logits_.get(), route_idx_.get(), route_w_.get(), E,
                     K, s);
@@ -434,11 +602,12 @@ void Session::moe_dispatch_row(int layer, int row) {
     }
   }
 
-  int n_hit = 0, n_miss = 0;
+  int n_hit = 0, n_miss = 0, n_pump = 0;
   for (int kk = 0; kk < K; ++kk) {
     const int e = h_route_idx_[kk];
     cache_.touch(layer, e);
     if (cache_.resident(layer, e)) {
+      // tier 0a: rebalance-driven hot slab (pointer tables)
       const size_t base = (static_cast<size_t>(layer) * 3 + 0) * E + e;
       h_ptrs_[0 * K + n_hit] = hot_->tables_host[base];
       h_ptrs_[1 * K + n_hit] = hot_->tables_host[base + static_cast<size_t>(E)];
@@ -447,6 +616,24 @@ void Session::moe_dispatch_row(int layer, int row) {
       h_hit_rows_[n_hit] = kk;
       h_slot_of_k_[kk] = -1;
       ++n_hit;
+    } else if (pump_) {
+      // tier 0b: streaming arena - DMA from the pinned RAM pool, compute on
+      // the GPU after the event fence (C7a). Reuses the slot when the expert
+      // was already pumped (temporal locality across tokens).
+      const int slot = pump_->submit(layer, e, perf.steps + 1);
+      if (slot >= 0) {
+        h_pump_rows_[n_pump] = kk;
+        h_pump_ptrs_[0 * K + n_pump] =
+            const_cast<q4k::BlockQ4K*>(pump_->dev_base(slot));
+        h_pump_ptrs_[1 * K + n_pump] = h_pump_ptrs_[0 * K + n_pump] +
+            (hot_->per_expert_bytes / 3) / q4k::kBlockBytes;
+        h_pump_ptrs_[2 * K + n_pump] = h_pump_ptrs_[0 * K + n_pump] +
+            2 * (hot_->per_expert_bytes / 3) / q4k::kBlockBytes;
+        h_slot_of_k_[kk] = -2;
+        ++n_pump;
+      } else {
+        h_slot_of_k_[kk] = n_miss++;   // C7b fallback: CPU pool
+      }
     } else {
       h_slot_of_k_[kk] = n_miss++;
     }
@@ -472,6 +659,29 @@ void Session::moe_dispatch_row(int layer, int row) {
   }
   cudaMemcpyAsync(d_slot_of_k_.get(), h_slot_of_k_.get(), K * sizeof(int),
                   cudaMemcpyHostToDevice, s);
+
+  // v0.2 pump group: fence the async copies into the compute stream, then
+  // run the SAME fused ptr-GEMV chain as the hits (pointers now aim at the
+  // pump arena). Overlap story: the copies raced ahead on the copy stream
+  // while the hits + shared expert were being computed above.
+  if (n_pump > 0) {
+    pump_->arm_wait(s);
+    cudaMemcpyAsync(d_ptrs_pump_.get(), h_pump_ptrs_.get(),
+                    3 * K * sizeof(q4k::BlockQ4K*), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(d_pump_rows_.get(), h_pump_rows_.get(),
+                    n_pump * sizeof(int), cudaMemcpyHostToDevice, s);
+    cuda::gemv_ptrs_q4_k_q8_f16out(d_ptrs_pump_.get(), d_xq_moe_.get(),
+                                   expert_g_.get(), n_pump, FFX, H, s);
+    cuda::gemv_ptrs_q4_k_q8_f16out(d_ptrs_pump_.get() + K, d_xq_moe_.get(),
+                                   expert_u_.get(), n_pump, FFX, H, s);
+    cuda::silu_mul_f16(expert_g_.get(), expert_g_.get(), expert_u_.get(), 1,
+                       n_pump * FFX, s);
+    cuda::quantize_q8_k(expert_g_.get(), d_hq_.get(), n_pump * FFX, s);
+    cuda::gemv_ptrs_q4_k_q8_f16out(d_ptrs_pump_.get() + 2 * K, d_hq_.get(),
+                                   x2_.get(), n_pump, H, FFX, s);
+    cuda::scatter_rows_f16(expert_y_.get(), x2_.get(), d_pump_rows_.get(),
+                           n_pump, H, s);
+  }
 
   // CPU misses (C2: no router weights here; C3: fixed pinned slots; C6:
   // submitted before the GPU finishes hits+shared so both run in parallel).
@@ -570,9 +780,14 @@ const float* Session::decode_step(int last_id) {
 
   cuda::gather_embed(x_.get(), w_.tok_embd, d_ids_.get(), 1, d.hidden, s);
 
+  pump_ ? pump_->begin_step(static_cast<uint64_t>(perf.steps) + 1)
+        : void(0);
   for (int L = 0; L < d.n_layer; ++L) {
+    const bool linear = mc_.is_linear(L);
     if (graphs_.valid() && graphs_.layer_graph(L)) {
       cudaGraphLaunch(static_cast<cudaGraphExec_t>(graphs_.layer_graph(L)), s);
+    } else if (linear) {
+      linear_layer_launch(L, 1);
     } else {
       dense_layer_launch(L, 1);
     }
@@ -644,9 +859,11 @@ Status Session::forward_window(const std::vector<int>& window,
 
   cuda::gather_embed(x_.get(), w_.tok_embd, d_ids_.get(), n, d.hidden, s);
 
+  pump_ ? pump_->begin_step(static_cast<uint64_t>(pos_) + 1) : void(0);
   for (int L = 0; L < d.n_layer; ++L) {
     if (abort_flag && *abort_flag) return Status::kAborted;
-    dense_layer_launch(L, n);
+    if (mc_.is_linear(L)) linear_layer_launch(L, n);
+    else                  dense_layer_launch(L, n);
     for (int t = 0; t < n; ++t) moe_dispatch_row(L, t);
   }
   pos_ = p + n;
@@ -685,6 +902,12 @@ void Session::reset() {
   kv_.reset();
   pos_ = 0;
   recent_ids_.clear();
+#if defined(SAGER_HAVE_CUDA)
+  // Recurrence state must follow the conversation: a retained-expert reset
+  // with stale GDN states would leak the previous context into the new one.
+  zero_gdn_states();
+#endif
+  if (pump_) pump_->clear();   // residency tied to the previous conversation
 }
 
 void Session::push_recent(int id) {
@@ -703,6 +926,8 @@ Session::~Session() = default;
 Status Session::alloc_scratch() { return Status::kUnsupported; }
 Status Session::prepare() { return Status::kUnsupported; }
 void Session::dense_layer_launch(int, int) {}
+void Session::linear_layer_launch(int, int) {}
+void Session::zero_gdn_states() {}
 void Session::moe_dispatch(int) {}
 void Session::moe_dispatch_row(int, int) {}
 void Session::head_launch() {}

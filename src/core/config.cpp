@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstring>
 
+#include "sager/log.hpp"
+
 namespace sager {
 
 // Accept both the engine's own "sager.*" keys and the qwen-family keys used
@@ -73,6 +75,34 @@ Status ModelConfig::load(const std::string& gguf_path, ModelConfig* out) {
 
   // MTP head presence is signaled by the MTP tensors themselves.
   d.mtp = f.tensor("mtp.fc.weight") != nullptr || f.tensor("mtp.proj_in.weight") != nullptr;
+
+  // ---- v0.2: gated-delta (linear attention) layers ------------------------
+  // The converter writes sager.layer_is_linear as a u32 array (one entry per
+  // block, 1 = GDN). GDN geometry comes from sager.gdn.* keys, defaulting to
+  // the Sage-A1.5 model card values.
+  if (const gguf::Value* la = f.kv_find("sager.layer_is_linear")) {
+    if (la->type == gguf::Type::array && la->elem_type == gguf::Type::u32) {
+      const size_t n = la->raw.size() / 4;
+      out->layer_is_linear.resize(n);
+      for (size_t i = 0; i < n; ++i) {
+        uint32_t x;
+        std::memcpy(&x, la->raw.data() + i * 4, 4);
+        out->layer_is_linear[i] = x != 0;
+      }
+    }
+  }
+  d.n_gdn_k_heads   = static_cast<int>(f.kv_int("sager.gdn.key_heads", d.n_gdn_k_heads));
+  d.n_gdn_v_heads   = static_cast<int>(f.kv_int("sager.gdn.value_heads", d.n_gdn_v_heads));
+  d.gdn_key_dim     = static_cast<int>(f.kv_int("sager.gdn.key_dim", d.gdn_key_dim));
+  d.gdn_value_dim   = static_cast<int>(f.kv_int("sager.gdn.value_dim", d.gdn_value_dim));
+  d.gdn_conv_kernel = static_cast<int>(f.kv_int("sager.gdn.conv_kernel", d.gdn_conv_kernel));
+  if (d.n_gdn_v_heads % d.n_gdn_k_heads != 0 || d.gdn_conv_kernel < 2 ||
+      d.gdn_key_dim <= 0 || d.gdn_value_dim <= 0) {
+    SLOG_E("config", "invalid GDN geometry (k=%d v=%d K=%d V=%d ck=%d)",
+           d.n_gdn_k_heads, d.n_gdn_v_heads, d.gdn_key_dim, d.gdn_value_dim,
+           d.gdn_conv_kernel);
+    return Status::kGeometryMismatch;
+  }
 
   out->dims = d;
   return validate_dims(out->dims);

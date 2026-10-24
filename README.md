@@ -29,6 +29,16 @@ A complete stack, no external inference framework:
 3. **CPU expert pool** — misses stream the expert from pinned RAM through AVX2 Q4_K dot products on worker threads, overlapped with the GPU via the doorbell contract (C1–C6 in `core/expert_source.hpp`). The CPU never applies router weights; the device-side combine is the only weighted sum, so CPU/GPU weight mismatch is structurally impossible.
 4. **KV reuse + chunked prefill** — 8192-token chunks, q8 KV cache (2× context per GB), per-turn KV checkpoints so follow-ups re-prefill only the new suffix.
 
+## v0.2: gated-delta kernels + per-token expert pump (NEW)
+
+Sage-A1.5 is a HYBRID (config.json: `full_attention_interval=4`, 40 blocks → **30 gated-delta linear-attention layers + 10 GQA layers**). v0.1 could not run it at all (converter KeyError + no linear-attention kernel). v0.2 closes both gaps:
+
+5. **GDN kernels** (`kernels/gdn.hpp`, `kernels/cuda/gdn.cu`) — causal depthwise shortconv + per-head norm + **rank-1 gated delta recurrence** (`S ← αS − αβ·(Sk)kᵀ + β·vkᵀ`) with fp32 persistent state, fixed-address/capture-safe for the per-layer decode CUDA graphs. CPU reference + numpy golden vectors cross-validate the math (`tests/test_gdn_host.cpp`, spec in `docs/gdn-kernel.md`).
+6. **Expert pump** (`core/expert_pump.hpp`) — a hot-cache miss no longer has to fall back to the weak host CPU: one `cudaMemcpyAsync` streams the expert from the pinned RAM pool into a VRAM arena slot (~1.7 MB ≈ 0.2 ms on PCIe), the same fused ptr-GEMV computes it on the GPU, and the slot is KEPT (LRU) so the next token routes to it in VRAM. CPU pool remains as fallback. Contract C7a–C7d in `docs/expert-pump.md`; policy unit-tested without a GPU.
+7. **Converter v0.2** — eats the real Sage-A1.5 layout (`model.language_model.layers.*`, `linear_attn.*`, `mlp|moe` MoE aliases) and writes `sager.layer_is_linear` + `sager.gdn.*` metadata. Full chain smoke on a synthetic hybrid checkpoint: `tests/run_hybrid_chain.sh`.
+
+KV is now allocated only for the 10 full-attention layers (GDN layers keep fixed-size recurrence state — ~60 MB total instead of hundreds of MB of KV).
+
 ## Format: GGUF-compatible Q4_K, in-house kernels
 
 The on-disk format is **byte-compatible with the standard Q4_K super-block** (256 weights / 144 bytes / 4.5 bpw, K-quant scale packing), so community GGUFs load directly — but the kernels are ours:

@@ -21,7 +21,11 @@ namespace sager::detail {
 Status HotTier::rebuild(const ExpertCache& cache, const Weights& w,
                         int n_layers, int n_experts, size_t per_expert_bytes) {
 #if defined(SAGER_HAVE_CUDA)
-  per_expert_bytes = per_expert_bytes;
+  // v0.2 FIX: the parameter shadowed the member (self-assign no-op), so
+  // HotTier::per_expert_bytes stayed 0 and the CPU-miss path in
+  // session.cpp derived gu = 0 - all three MissJob pointers pointed at the
+  // gate matrix. Latent since v0.1 (the model never ran end-to-end).
+  this->per_expert_bytes = per_expert_bytes;
   const size_t gu = (static_cast<size_t>(w.dims.n_ff_exp) *
                      static_cast<size_t>(w.dims.hidden) / q4k::kQK_K) *
                     q4k::kBlockBytes;

@@ -51,6 +51,7 @@ add_library(sager_core STATIC
   src/core/gguf.cpp
   src/core/weights.cpp
   src/core/expert_cache.cpp
+  src/core/expert_pump.cpp
   src/core/session.cpp
   src/core/layer.cpp
   src/core/verify.cpp
@@ -62,6 +63,7 @@ add_library(sager_core STATIC
   src/kernels/q4_k.cpp
   src/kernels/cpu/q4_avx2.cpp
   src/kernels/cpu/pool.cpp
+  src/kernels/cpu/gdn_cpu.cpp
 )
 
 target_include_directories(sager_core PUBLIC include)
@@ -97,6 +99,7 @@ if(SAGER_ENABLE_CUDA)
     src/kernels/cuda/attention.cu
     src/kernels/cuda/norm_rotary.cu
     src/kernels/cuda/sampling.cu
+    src/kernels/cuda/gdn.cu
   )
   target_include_directories(sager_cuda PUBLIC include)
   target_compile_definitions(sager_cuda PUBLIC SAGER_HAVE_CUDA=1)
@@ -125,6 +128,20 @@ if(SAGER_BUILD_TESTS)
   )
   target_link_libraries(sager_test_q4 PRIVATE sager_core)
   add_test(NAME q4_host_roundtrip COMMAND sager_test_q4)
+
+  # v0.2: GDN reference math vs numpy golden vectors + delta-rule properties.
+  add_executable(sager_test_gdn
+    tests/test_gdn_host.cpp
+  )
+  target_link_libraries(sager_test_gdn PRIVATE sager_core)
+  add_test(NAME gdn_host_reference COMMAND sager_test_gdn)
+
+  # v0.2: expert pump residency policy (LRU, reuse, in-flight safety).
+  add_executable(sager_test_pump
+    tests/test_expert_pump.cpp
+  )
+  target_link_libraries(sager_test_pump PRIVATE sager_core)
+  add_test(NAME expert_pump_policy COMMAND sager_test_pump)
 endif()
 
 install(TARGETS sager_engine RUNTIME DESTINATION bin)

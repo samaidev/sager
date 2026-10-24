@@ -80,6 +80,17 @@ struct EngineDims {
   bool mtp           = true;   // MTP (multi-token prediction) head present
   bool vision        = false;  // mmproj present (v0.1 is text-only: skipped)
 
+  // Gated Delta Net (linear attention) layers - v0.2. The real Sage-A1.5
+  // (config.json) is a hybrid: full_attention_interval=4 over 40 blocks,
+  // i.e. 30 gated-delta layers + 10 full-attention layers. A layer counts as
+  // full-attention unless ModelConfig.layer_is_linear marks it otherwise;
+  // these defaults match the model card's linear_* fields.
+  int n_gdn_k_heads   = 16;
+  int n_gdn_v_heads   = 32;   // multiple of k-heads (grouped query)
+  int gdn_key_dim     = 128;
+  int gdn_value_dim   = 128;
+  int gdn_conv_kernel = 4;
+
   int n_embd_gqa()  const { return n_head_kv * head_dim; }
   int experts_total() const { return n_moe_layer * n_expert; }
 };

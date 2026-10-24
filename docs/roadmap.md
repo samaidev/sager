@@ -13,8 +13,17 @@ Ordered by impact on the single-T4 mission.
 - q8 KV cache, chunked prefill, conversation retention with KV checkpoints
 - OpenAI-compatible server, web chat, HF converter, quant validator, bench
 
-## v0.2 - prefill & throughput
+## v0.2 - hybrid attention + expert streaming (shipped) & throughput
 
+- **Gated Delta Net kernels** (DONE, v0.2): CPU reference + sm_75 CUDA,
+  fp32 recurrence state, graph-capturable; hybrid layer dispatch; KV only
+  for full-attention layers. See docs/gdn-kernel.md.
+- **Per-token expert pump** (DONE, v0.2): async pinned-RAM -> VRAM arena
+  streaming with LRU slots + event fences; CPU pool demoted to fallback.
+  See docs/expert-pump.md.
+- **Converter v0.2** (DONE, v0.2): real Sage-A1.5 layout (language_model
+  prefix, linear_attn.*, mlp/moe aliases) + hybrid metadata; chain smoke in
+  tests/run_hybrid_chain.sh.
 - **Batched MoE prefill**: chunk-level router GEMV, one D2H for all top-k,
   hit-set grouping, ptr-GEMV per group (closes the prefill gap; see
   performance.md)

@@ -97,6 +97,15 @@ json::Value load_cmd(EngineState& es, const json::Value& req) {
     cp.enable_suffix_draft = v->as_bool(true);
   if (const auto* v = req.find("mtp_max_draft"))
     cp.mtp_max_draft = static_cast<int>(v->as_int(3));
+  // v0.2 expert pump (per-token RAM->VRAM streaming; C7 contract)
+  if (const auto* v = req.find("expert_pump"))
+    cp.expert_pump = v->as_bool(true);
+  if (const auto* v = req.find("pump_arena_mb"))
+    cp.pump_arena_mb = static_cast<size_t>(v->as_int(1536));
+  // env overrides (feature flags without recompiling)
+  if (env_get("SAGER_EXPERT_PUMP")) cp.expert_pump = env_flag("SAGER_EXPERT_PUMP");
+  if (const int mb = env_int("SAGER_PUMP_ARENA_MB", -1); mb > 0)
+    cp.pump_arena_mb = static_cast<size_t>(mb);
 
   es.weights = std::make_unique<Weights>();
   s = es.weights->load(*es.file, es.mc, cp.vram_budget_mb << 20);

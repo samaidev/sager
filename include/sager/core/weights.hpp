@@ -32,8 +32,8 @@ namespace sager {
 struct LayerWeights {
   // All device pointers (nullptr on CPU-only builds / not-present tensors).
   uint16_t* attn_norm   = nullptr;   // [hidden] fp16
-  uint16_t* wq          = nullptr;   // Q4_K? No: attention stays fp16 on T4
-  uint16_t* wk          = nullptr;   // (fp16 packed rows, see load())
+  uint16_t* wq          = nullptr;   // Q4_K attention projections (nullptr on
+  uint16_t* wk          = nullptr;   // gated-delta layers)
   uint16_t* wv          = nullptr;
   uint16_t* wo          = nullptr;
   // MoE block
@@ -42,6 +42,28 @@ struct LayerWeights {
   uint16_t* shared_gate = nullptr;
   uint16_t* shared_up   = nullptr;
   uint16_t* shared_out  = nullptr;
+
+  // ---- v0.2: gated delta net (linear attention) layers --------------------
+  // Carved from ONE cudaMalloc per layer (freed via lin_in_qkvz in unload).
+  //   in_qkvz  Q4_K [proj_rows x hidden]  fused q|k|v|z projection
+  //   in_ba    Q4_K [2*nk x hidden]       beta/a projections
+  //   out_proj Q4_K [hidden x nv*V]       output projection
+  //   conv_w   fp16 [conv_dim x ck]       depthwise causal conv taps
+  //   conv_b   fp16 [conv_dim]            conv bias (optional, may be null)
+  //   A_log    fp32 [nk]                  gate decay parameter
+  //   dt_bias  fp32 [nk]                  softplus offset
+  //   q_norm / k_norm  fp16 [K]           per-head pre-normalization
+  //   o_norm   fp16 [V]                   output-gate normalization
+  uint16_t* lin_in_qkvz = nullptr;
+  uint16_t* lin_in_ba   = nullptr;
+  uint16_t* lin_out     = nullptr;
+  uint16_t* lin_conv_w  = nullptr;
+  uint16_t* lin_conv_b  = nullptr;
+  float*    lin_A_log   = nullptr;
+  float*    lin_dt_bias = nullptr;
+  uint16_t* lin_q_norm  = nullptr;
+  uint16_t* lin_k_norm  = nullptr;
+  uint16_t* lin_o_norm  = nullptr;
 };
 
 class Weights {

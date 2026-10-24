@@ -10,6 +10,7 @@
 #include <string>
 
 #include "sager/core/config.hpp"
+#include "sager/kernels/gdn.hpp"
 #include "sager/kernels/q4_k.hpp"
 #include "sager/log.hpp"
 
@@ -46,21 +47,37 @@ Status Weights::alloc_vram(const ModelConfig& cfg) {
   auto q4bytes = [](size_t rows, size_t cols) {
     return rows * (cols / q4k::kQK_K) * q4k::kBlockBytes;
   };
+  const GdnParams g = cfg.gdn();
 
   for (int L = 0; L < d.n_layer; ++L) {
     LayerWeights& lw = layers_[L];
     size_t b = 0;
-    b += q4bytes(QKV, H);                    // wq
-    b += q4bytes(KV, H) * 2;                 // wk, wv
-    b += q4bytes(H, QKV);                    // wo
+    bool linear = cfg.is_linear(L);
+    if (linear) {
+      // carve: in_qkvz | in_ba | out_proj
+      b += q4bytes(static_cast<size_t>(g.proj_rows()), H);
+      b += q4bytes(static_cast<size_t>(g.ba_rows()), H);
+      b += q4bytes(H, static_cast<size_t>(g.y_rows()));
+    } else {
+      b += q4bytes(QKV, H);                    // wq
+      b += q4bytes(KV, H) * 2;                 // wk, wv
+      b += q4bytes(H, QKV);                    // wo
+    }
     void* base = nullptr;
     if (cudaMalloc(&base, b) != cudaSuccess) return Status::kOomVram;
-    // carve: wq | wk | wv | wo
     uint8_t* p = static_cast<uint8_t*>(base);
-    lw.wq = reinterpret_cast<uint16_t*>(p);  p += q4bytes(QKV, H);
-    lw.wk = reinterpret_cast<uint16_t*>(p);  p += q4bytes(KV, H);
-    lw.wv = reinterpret_cast<uint16_t*>(p);  p += q4bytes(KV, H);
-    lw.wo = reinterpret_cast<uint16_t*>(p);
+    if (linear) {
+      lw.lin_in_qkvz = reinterpret_cast<uint16_t*>(p);
+      p += q4bytes(static_cast<size_t>(g.proj_rows()), H);
+      lw.lin_in_ba = reinterpret_cast<uint16_t*>(p);
+      p += q4bytes(static_cast<size_t>(g.ba_rows()), H);
+      lw.lin_out = reinterpret_cast<uint16_t*>(p);
+    } else {
+      lw.wq = reinterpret_cast<uint16_t*>(p);  p += q4bytes(QKV, H);
+      lw.wk = reinterpret_cast<uint16_t*>(p);  p += q4bytes(KV, H);
+      lw.wv = reinterpret_cast<uint16_t*>(p);  p += q4bytes(KV, H);
+      lw.wo = reinterpret_cast<uint16_t*>(p);
+    }
     // norms: fp16
     void *n1 = nullptr, *n2 = nullptr;
     if (dmalloc(&n1, H * 2) != Status::kOk) return Status::kOomVram;
@@ -83,6 +100,27 @@ Status Weights::alloc_vram(const ModelConfig& cfg) {
       lw.shared_gate = static_cast<uint16_t*>(s1);
       lw.shared_up   = static_cast<uint16_t*>(s2);
       lw.shared_out  = static_cast<uint16_t*>(s3);
+    }
+    // ---- GDN side tensors (linear layers only) ----
+    if (linear) {
+      void* cw = nullptr; void* cb = nullptr; void* al = nullptr;
+      void* db = nullptr; void* qn = nullptr; void* kn = nullptr;
+      void* on = nullptr;
+      if (dmalloc(&cw, static_cast<size_t>(g.conv_dim()) * g.conv_kernel * 2) != Status::kOk ||
+          dmalloc(&cb, static_cast<size_t>(g.conv_dim()) * 2) != Status::kOk ||
+          dmalloc(&al, static_cast<size_t>(g.n_k_heads) * 4) != Status::kOk ||
+          dmalloc(&db, static_cast<size_t>(g.n_k_heads) * 4) != Status::kOk ||
+          dmalloc(&qn, static_cast<size_t>(g.key_dim) * 2) != Status::kOk ||
+          dmalloc(&kn, static_cast<size_t>(g.key_dim) * 2) != Status::kOk ||
+          dmalloc(&on, static_cast<size_t>(g.value_dim) * 2) != Status::kOk)
+        return Status::kOomVram;
+      lw.lin_conv_w  = static_cast<uint16_t*>(cw);
+      lw.lin_conv_b  = static_cast<uint16_t*>(cb);
+      lw.lin_A_log   = static_cast<float*>(al);
+      lw.lin_dt_bias = static_cast<float*>(db);
+      lw.lin_q_norm  = static_cast<uint16_t*>(qn);
+      lw.lin_k_norm  = static_cast<uint16_t*>(kn);
+      lw.lin_o_norm  = static_cast<uint16_t*>(on);
     }
   }
 
@@ -136,10 +174,66 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
       }
     }
     Status s = Status::kOk;
+    if (cfg.is_linear(L)) {
+      // ---- gated delta net layer: fused qkvz + ba + out_proj (Q4_K) ----
+      s = copyq4(lw.lin_in_qkvz, f.tensor(cat("blk.", L, ".lin_in_qkvz")));
+      if (s != Status::kOk) return s;
+      s = copyq4(lw.lin_in_ba, f.tensor(cat("blk.", L, ".lin_in_ba")));
+      if (s != Status::kOk) return s;
+      s = copyq4(lw.lin_out, f.tensor(cat("blk.", L, ".lin_out")));
+      if (s != Status::kOk) return s;
+      // conv taps (fp16) + optional bias
+      if (const auto* t = f.tensor(cat("blk.", L, ".lin_conv_w"))) {
+        if (t->type != 1) return Status::kGgufParseError;
+        SAGER_CUDA_CHECK(cudaMemcpy(lw.lin_conv_w, f.tensor_data(*t),
+                                    t->nbytes, cudaMemcpyHostToDevice));
+      } else {
+        return Status::kGgufParseError;
+      }
+      if (const auto* t = f.tensor(cat("blk.", L, ".lin_conv_b"))) {
+        if (t->type == 1) {
+          SAGER_CUDA_CHECK(cudaMemcpy(lw.lin_conv_b, f.tensor_data(*t),
+                                      t->nbytes, cudaMemcpyHostToDevice));
+        }
+      }  // bias optional: kernels treat null as zeros? no - zero it here
+      else {
+        const GdnParams g = cfg.gdn();
+        cudaMemset(lw.lin_conv_b, 0,
+                   static_cast<size_t>(g.conv_dim()) * sizeof(uint16_t));
+      }
+      // A_log / dt_bias (fp32)
+      if (const auto* t = f.tensor(cat("blk.", L, ".lin_A_log"))) {
+        SAGER_CUDA_CHECK(cudaMemcpy(lw.lin_A_log, f.tensor_data(*t),
+                                    t->nbytes, cudaMemcpyHostToDevice));
+      } else {
+        return Status::kGgufParseError;
+      }
+      if (const auto* t = f.tensor(cat("blk.", L, ".lin_dt_bias"))) {
+        SAGER_CUDA_CHECK(cudaMemcpy(lw.lin_dt_bias, f.tensor_data(*t),
+                                    t->nbytes, cudaMemcpyHostToDevice));
+      } else {
+        return Status::kGgufParseError;
+      }
+      // norms (fp16)
+      auto copyf16 = [&](uint16_t* dst, const char* key) -> Status {
+        const auto* t = f.tensor(key);
+        if (!t || t->type != 1) return Status::kGgufParseError;
+        SAGER_CUDA_CHECK(cudaMemcpy(dst, f.tensor_data(*t), t->nbytes,
+                                    cudaMemcpyHostToDevice));
+        return Status::kOk;
+      };
+      s = copyf16(lw.lin_q_norm, (cat("blk.", L, ".lin_q_norm")).c_str());
+      if (s != Status::kOk) return s;
+      s = copyf16(lw.lin_k_norm, (cat("blk.", L, ".lin_k_norm")).c_str());
+      if (s != Status::kOk) return s;
+      s = copyf16(lw.lin_o_norm, (cat("blk.", L, ".lin_o_norm")).c_str());
+      if (s != Status::kOk) return s;
+    } else {
     s = copyq4(lw.wq, f.tensor(cat("blk.", L, ".attn_q.weight")));   if (s != Status::kOk) return s;
     s = copyq4(lw.wk, f.tensor(cat("blk.", L, ".attn_k.weight")));   if (s != Status::kOk) return s;
     s = copyq4(lw.wv, f.tensor(cat("blk.", L, ".attn_v.weight")));   if (s != Status::kOk) return s;
     s = copyq4(lw.wo, f.tensor(cat("blk.", L, ".attn_output.weight"))); if (s != Status::kOk) return s;
+    }
     // router (fp32)
     if (const auto* t = f.tensor(cat("blk.", L, ".ffn_gate_inp"))) {
       SAGER_CUDA_CHECK(cudaMemcpy(lw.router, f.tensor_data(*t), t->nbytes, cudaMemcpyHostToDevice));
@@ -281,6 +375,15 @@ void Weights::unload() {
     if (lw.shared_gate) { cudaFree(lw.shared_gate); lw.shared_gate = nullptr; }
     if (lw.shared_up)   { cudaFree(lw.shared_up);   lw.shared_up = nullptr; }
     if (lw.shared_out)  { cudaFree(lw.shared_out);  lw.shared_out = nullptr; }
+    // GDN tensors: the 3 Q4 mats were carved from ONE cudaMalloc (lin_in_qkvz)
+    if (lw.lin_in_qkvz) { cudaFree(lw.lin_in_qkvz); lw.lin_in_qkvz = nullptr; }
+    if (lw.lin_conv_w)  { cudaFree(lw.lin_conv_w);  lw.lin_conv_w = nullptr; }
+    if (lw.lin_conv_b)  { cudaFree(lw.lin_conv_b);  lw.lin_conv_b = nullptr; }
+    if (lw.lin_A_log)   { cudaFree(lw.lin_A_log);   lw.lin_A_log = nullptr; }
+    if (lw.lin_dt_bias) { cudaFree(lw.lin_dt_bias); lw.lin_dt_bias = nullptr; }
+    if (lw.lin_q_norm)  { cudaFree(lw.lin_q_norm);  lw.lin_q_norm = nullptr; }
+    if (lw.lin_k_norm)  { cudaFree(lw.lin_k_norm);  lw.lin_k_norm = nullptr; }
+    if (lw.lin_o_norm)  { cudaFree(lw.lin_o_norm);  lw.lin_o_norm = nullptr; }
   }
   layers_.clear();
   if (tok_embd) { cudaFree(tok_embd); tok_embd = nullptr; }
