@@ -8,6 +8,7 @@
 #include "sager/core/expert_source.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <mutex>
@@ -52,7 +53,14 @@ class PoolImpl final : public CpuPool {
   }
 
   void stop() override {
-    if (!running_.exchange(false)) return;
+    {
+      // Flip the flag under mu_: a worker sitting between its predicate
+      // check and the futex sleep would otherwise lose the notify below and
+      // sleep forever while stop() joins it (observed as a load_cmd hang on
+      // a 2-vCPU box where that window is wide).
+      std::lock_guard<std::mutex> lk(mu_);
+      running_ = false;
+    }
     cv_.notify_all();
     for (auto& t : threads_) if (t.joinable()) t.join();
     threads_.clear();
@@ -100,8 +108,12 @@ class PoolImpl final : public CpuPool {
       MissJob* job = nullptr;
       {
         std::unique_lock<std::mutex> lk(mu_);
-        cv_.wait(lk, [&] { return !running_.load() || next_idx_ < ring_.size(); });
+        // Bounded wait: even if a notify were lost, the worker re-checks the
+        // predicate every 200 ms and exits, so shutdown cannot deadlock.
+        cv_.wait_for(lk, std::chrono::milliseconds(200),
+                     [&] { return !running_.load() || next_idx_ < ring_.size(); });
         if (!running_.load()) return;
+        if (next_idx_ >= ring_.size()) continue;
         job = &ring_[next_idx_++];
       }
       run_job(*job, scratch);
