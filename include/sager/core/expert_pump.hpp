@@ -54,16 +54,26 @@
 // after the expert's GEMMs - has completed).
 //
 // Session lifecycle (per prompt, from Session::prefill):
-//   begin_stream(plan) : plan = hot-tier misses in stream order. Clears the
-//                        LRU arena mapping (the ring owns the whole arena for
-//                        the prompt; chunks re-stream what no longer fits -
-//                        Strata does the same, "every expert is streamed once
-//                        per chunk").
+//   begin_stream(plan, compute) : plan = hot-tier AND arena misses in stream
+//                        order. Does NOT clear the arena: resident slots are
+//                        parked into the ring (previous chunk's survivors stay
+//                        reusable); a fence event orders the copy stream
+//                        behind the compute stream so no parked expert is
+//                        overwritten while a prior-chunk GEMM still reads it.
 //   stream_start(fd)   : starts SAGER_PF_READERS loader threads. Each loader:
-//                        take next pair -> take arena slot (free, or steal a
-//                        slot whose consumed event completed) -> take a pinned
-//                        slab -> pread(pool) -> cudaMemcpyAsync H2D on the
-//                        pump's copy stream -> record ready event -> publish.
+//                        take next pair (skipping pairs whose layer the
+//                        session already passed) -> take arena slot (free, or
+//                        steal a slot whose consumed event completed) -> take
+//                        a pinned slab -> pread(pool) -> cudaMemcpyAsync H2D
+//                        on the pump's copy stream -> record ready event ->
+//                        publish (or free the slot again if the pair went
+//                        stale during the copy).
+//   stream_progress(L) : called by the session after layer L-1's dispatch:
+//                        frees every slot owned by a pair of an earlier
+//                        layer. This is what keeps zero-count pairs (loaded
+//                        after their layer passed) and stale survivors from
+//                        clogging the ring - the failure mode that stalled
+//                        the first streamed run at 2 tok/s.
 //   stream_lookup(L,e) : slot if the pair is at least enqueued (blocks up to
 //                        SAGER_PF_ARM_TIMEOUT_MS, then -1 -> caller falls back
 //                        to the CPU pool; also the guard against a stalled
@@ -72,7 +82,7 @@
 //   stream_consume(s,slot): record the slot's consumed event on the compute
 //                        stream (frees the slot for the loader).
 //   stream_finish()    : join loaders; surviving slots stay LRU-resident for
-//                        decode (slot_of_/owner_ remain valid).
+//                        decode and for the next chunk's parked reuse.
 //
 // Zero-row pairs (an expert no token of this prompt routes to) would clog
 // slots forever, so the dispatch layer consumes them early: after a layer's
@@ -162,6 +172,7 @@ class ExpertPump {
     uint64_t stream_pairs = 0;    // pairs completed H2D this prompt
     uint64_t stream_steals = 0;   // slots taken from consumed experts
     uint64_t stream_drop = 0;     // zero-row pairs released early
+    uint64_t stream_skipped = 0;  // pairs skipped (session already past)
     uint64_t arm_timeouts = 0;    // stream_lookup gave up -> CPU pool
     uint64_t read_errors = 0;     // pread() short/failed
   };
@@ -184,8 +195,11 @@ class ExpertPump {
   static StreamPlan build_stream_plan(const std::vector<uint8_t>& resident,
                                       int n_layers, int n_experts);
 
-  // Hand the arena to the ring: clears the LRU mapping and stages the plan.
-  void begin_stream(const StreamPlan& plan);
+  // Hand the arena to the ring for ONE chunk: resident slots are parked (no
+  // copy needed), the plan covers only the misses. The fence event orders
+  // the copy stream behind the compute stream across the chunk boundary.
+  // No-op on CPU-only builds.
+  void begin_stream(const StreamPlan& plan, void* compute_stream);
 
   // Start the loaders against a pool FILE (pread source; mmap host_base_ is
   // pageable and defeats cudaMemcpyAsync - the slabs fix that). No-op on
@@ -199,6 +213,10 @@ class ExpertPump {
     return false;
 #endif
   }
+
+  // Session progress: release every slot owned by a pair of a layer below
+  // `layer` (the session never revisits earlier layers within a chunk).
+  void stream_progress(int layer);
 
   // Slot of (layer, expert) once its copy is enqueued, else -1 after a
   // bounded wait. Session thread only.
@@ -259,7 +277,10 @@ class ExpertPump {
   std::vector<uint8_t> ring_state_;    // per slot
   std::vector<uint8_t> ring_owned_;    // slot belongs to the live session
   std::vector<uint8_t> consumed_rec_;  // consume event recorded (host flag)
+  std::vector<uint8_t> parked_;        // resident at chunk start (no copy)
   std::vector<cudaEvent_t> consumed_ev_;
+  cudaEvent_t fence_ev_ = nullptr;     // chunk-boundary compute -> copy fence
+  std::atomic<int> done_layer_{-1};    // session progress (layers < this die)
   StreamPlan plan_;
   int pool_fd_ = -1;
   std::atomic<bool> stream_active_{false};

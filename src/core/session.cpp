@@ -952,8 +952,11 @@ void Session::moe_dispatch_batched(int layer, int n) {
         j.wg = base;
         j.wu = base + (hot_->per_expert_bytes / 3) / q4k::kBlockBytes;
         j.wo = base + 2 * (hot_->per_expert_bytes / 3) / q4k::kBlockBytes;
+      } else {
+        // Arm timeout: give up on the pair for this chunk AND release its
+        // slot if the loader did land it meanwhile (no GEMM will read it).
+        pump_->stream_consume_drop(layer, e);
       }
-      // slot < 0 (arm timeout): fall through to the CPU pool below
     } else if (pump_) {
       // tier 0c: per-expert pump submit (verify windows / small chunks)
       const int slot = pump_->submit(layer, e, step);
@@ -1106,6 +1109,13 @@ void Session::moe_dispatch_batched(int layer, int n) {
   // 13) combine: x_ = residual + sum_k w * expert_y (shared slot folded in).
   cuda::moe_combine_batched_f16(x_.get(), expert_y_.get(), route_w_.get(),
                                 K, H, n, s);
+
+  // 14) session progress: every slot owned by a pair of an EARLIER layer is
+  // reclaimable now (consumed ones once their event completes; parked ones
+  // immediately; loaders skip pairs of past layers). Without this sweep,
+  // zero-count pairs loaded after their layer passed clog the ring until it
+  // starves - the 2 tok/s failure mode of the first streamed run.
+  if (streaming) pump_->stream_progress(layer + 1);
 }
 
 // ---------------------------------------------------------------------------

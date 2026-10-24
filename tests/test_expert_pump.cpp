@@ -164,13 +164,14 @@ int main() {
     std::vector<uint8_t> res(kLayers * kExperts, 0);
     ExpertPump::StreamPlan plan =
         ExpertPump::build_stream_plan(res, kLayers, kExperts);
-    p.begin_stream(plan);
+    p.begin_stream(plan, nullptr);
     // CPU-only: stream_start is a no-op, nothing becomes resident; lookup
     // must time out (-1) instead of hanging, so dispatch can fall back.
     CHECK(p.stream_lookup(0, 0) == -1, "lookup without loaders times out");
     CHECK(!p.stream_active() || true, "session state queryable");
     p.stream_finish();
     CHECK(!p.stream_active(), "session closed after finish");
+    p.stream_progress(1);   // sweep must be a safe no-op on CPU-only
     // after finish, LRU submit still works (decode warm start contract)
     const int s = p.submit(1, 5, 99);
     CHECK(s >= 0, "submit works after a stream session");

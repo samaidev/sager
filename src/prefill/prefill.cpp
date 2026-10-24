@@ -38,33 +38,37 @@ Status Session::prefill(const std::vector<int>& ids,
   size_t done = 0;
   int n_chunks = static_cast<int>((ids.size() + chunk - 1) / chunk);
 
-  // Strata-style stream-all session: for a prompt big enough that nearly
-  // every expert is routed, copies do not need the routing - ALL hot-tier
-  // misses stream in fixed (layer, id) order through the pump arena ring
-  // while the compute stream consumes that same order layer by layer. The
-  // loaders pread the pool into pinned slabs and DMA from there, so PCIe
-  // runs at full bandwidth and stays independent of the routing syncs.
+  // Strata-style stream-all sessions, one PER CHUNK: for a chunk big enough
+  // that nearly every expert is routed, copies do not need the routing - all
+  // hot-tier AND arena misses stream in fixed (layer, id) order through the
+  // pump arena ring while the compute stream consumes that same order layer
+  // by layer. Arena survivors of the previous chunk are parked (reused
+  // without a copy) and the chunk-boundary fence keeps copies off the slots
+  // the previous chunk's GEMMs still read.
 #if defined(SAGER_HAVE_CUDA)
   const bool streaming = pf_batched_ && pump_ &&
-                         static_cast<int>(ids.size()) >= pf_stream_min_;
-  if (streaming) {
-    std::vector<uint8_t> hot_res(
+                         static_cast<int>(ids.size()) >= pf_stream_min_ &&
+                         w_.expert_pool_fd() >= 0;
+  auto stream_begin_chunk = [this]() {
+    if (!pump_) return;
+    std::vector<uint8_t> miss(
         static_cast<size_t>(mc_.dims.n_moe_layer) * mc_.dims.n_expert, 0);
     for (int L = 0; L < mc_.dims.n_moe_layer; ++L) {
       for (int e = 0; e < mc_.dims.n_expert; ++e) {
-        hot_res[static_cast<size_t>(L) * mc_.dims.n_expert + e] =
-            cache_.resident(L, e) ? 1 : 0;
+        miss[static_cast<size_t>(L) * mc_.dims.n_expert + e] =
+            (cache_.resident(L, e) || pump_->resident(L, e)) ? 0 : 1;
       }
     }
     ExpertPump::StreamPlan plan = ExpertPump::build_stream_plan(
-        hot_res, mc_.dims.n_moe_layer, mc_.dims.n_expert);
-    pump_->begin_stream(plan);
+        miss, mc_.dims.n_moe_layer, mc_.dims.n_expert);
+    pump_->begin_stream(plan, stream_.get());
     pump_->stream_start(w_.expert_pool_fd());
-  }
+  };
   auto stream_stop = [this]() {
     if (pump_ && pump_->stream_active()) pump_->stream_finish();
   };
 #else
+  auto stream_begin_chunk = []() {};
   auto stream_stop = []() {};
 #endif
 
@@ -76,9 +80,15 @@ Status Session::prefill(const std::vector<int>& ids,
     const size_t end = std::min(ids.size(), off + static_cast<size_t>(chunk));
     std::vector<int> part(ids.begin() + static_cast<long>(off),
                           ids.begin() + static_cast<long>(end));
+#if defined(SAGER_HAVE_CUDA)
+    if (streaming) stream_begin_chunk();
+#endif
     // forward_window: batched dense path + per-LAYER MoE dispatch; no
     // logits (nullptr) - the tail row's head runs once after the last chunk.
     Status s = forward_window(part, nullptr, abort_flag);
+#if defined(SAGER_HAVE_CUDA)
+    if (streaming) stream_stop();
+#endif
     if (s != Status::kOk) {
       stream_stop();
       return s;
@@ -88,7 +98,6 @@ Status Session::prefill(const std::vector<int>& ids,
       cb.on_prefill_progress(static_cast<int>(done), n_chunks * chunk);
     }
   }
-  stream_stop();
 
   // Tail logits: distribution for the position right after the prompt.
   const int last_row = static_cast<int>(
