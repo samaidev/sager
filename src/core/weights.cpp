@@ -9,6 +9,12 @@
 #include <cstring>
 #include <string>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 #include "sager/core/config.hpp"
 #include "sager/kernels/gdn.hpp"
 #include "sager/kernels/q4_k.hpp"
@@ -523,13 +529,38 @@ Status Weights::load_expert_pool(gguf::File& f, const ModelConfig& cfg) {
   // the full expert set (e.g. a 12 GB Colab against a 17 GB expert pool):
   // the kernel pages cold experts out, the pump faults them back on demand.
   // Slower than pinned RAM, but it keeps every address stable.
-  const bool pinned = !env_flag("SAGER_EXPERT_POOL_SWAP");
-  expert_pool_host_ = static_cast<uint8_t*>(
-      host_alloc(expert_pool_bytes_, pinned));
-  if (!expert_pool_host_) return Status::kOomRam;
-  SLOG_I("weights", "expert pool backing: %s (%.1f GB)",
-         pinned ? "pinned RAM" : "swappable (SAGER_EXPERT_POOL_SWAP=1)",
-         expert_pool_bytes_ / 1073741824.0);
+  const auto pool_file_opt = env_get("SAGER_EXPERT_POOL_FILE");
+  if (pool_file_opt) {
+    const char* pool_file = pool_file_opt->c_str();
+#ifndef _WIN32
+    // File-backed pool (SAGER_EXPERT_POOL_FILE=<path>): mmap a disk file
+    // MAP_SHARED - the kernel pages it in/out through the page cache, so a
+    // box whose RAM is smaller than the expert set still loads (no swap
+    // needed). Cold experts fault back from the file on demand.
+    const int fd = ::open(pool_file, O_RDWR | O_CREAT, 0644);
+    if (fd >= 0 && ::ftruncate(fd, static_cast<off_t>(expert_pool_bytes_)) == 0) {
+      void* m = ::mmap(nullptr, expert_pool_bytes_, PROT_READ | PROT_WRITE,
+                       MAP_SHARED, fd, 0);
+      if (m != MAP_FAILED) {
+        expert_pool_host_ = static_cast<uint8_t*>(m);
+        pool_map_fd_ = fd;
+        pool_map_size_ = expert_pool_bytes_;
+        SLOG_I("weights", "expert pool backing: file %s (%.1f GB, page cache)",
+               pool_file, expert_pool_bytes_ / 1073741824.0);
+      }
+    }
+    if (!expert_pool_host_ && fd >= 0) ::close(fd);
+#endif
+  }
+  if (!expert_pool_host_) {
+    const bool pinned = !env_flag("SAGER_EXPERT_POOL_SWAP");
+    expert_pool_host_ = static_cast<uint8_t*>(
+        host_alloc(expert_pool_bytes_, pinned));
+    if (!expert_pool_host_) return Status::kOomRam;
+    SLOG_I("weights", "expert pool backing: %s (%.1f GB)",
+           pinned ? "pinned RAM" : "swappable (SAGER_EXPERT_POOL_SWAP=1)",
+           expert_pool_bytes_ / 1073741824.0);
+  }
 
   auto tile = [&](size_t rows, size_t cols) { return rows * (cols / q4k::kQK_K) * q4k::kBlockBytes; };
   const size_t gu = tile(static_cast<size_t>(d.n_ff_exp), static_cast<size_t>(d.hidden));
@@ -642,7 +673,21 @@ void Weights::unload() {
   if (mtp_proj_in) { cudaFree(mtp_proj_in); mtp_proj_in = nullptr; }
   if (mtp_proj_out) { cudaFree(mtp_proj_out); mtp_proj_out = nullptr; }
 #endif
-  if (expert_pool_host_) { host_free(expert_pool_host_, true); expert_pool_host_ = nullptr; }
+  if (expert_pool_host_) {
+#ifndef _WIN32
+    if (pool_map_fd_ >= 0) {
+      ::munmap(expert_pool_host_, pool_map_size_);
+      ::close(pool_map_fd_);
+      pool_map_fd_ = -1;
+      pool_map_size_ = 0;
+    } else
+#endif
+    {
+      const bool was_pinned = !env_flag("SAGER_EXPERT_POOL_FILE");
+      host_free(expert_pool_host_, was_pinned);
+    }
+    expert_pool_host_ = nullptr;
+  }
   expert_pool_bytes_ = 0;
 }
 

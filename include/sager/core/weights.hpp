@@ -126,6 +126,8 @@ class Weights {
   // Pinned host pool holding EVERY routed expert in Q4_K (tier 1).
   uint8_t*  expert_pool_host_ = nullptr;
   size_t    expert_pool_bytes_ = 0;
+  int       pool_map_fd_ = -1;    // SAGER_EXPERT_POOL_FILE backing (mmap)
+  size_t    pool_map_size_ = 0;
 };
 
 // Convert one fp32 row to fp16 packed bytes (used across the loader).
