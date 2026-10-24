@@ -288,6 +288,11 @@ void ExpertPump::begin_stream(const StreamPlan& plan, void* compute_stream) {
   plan_ = plan;
   stream_next_ = 0;
   done_layer_.store(-1, std::memory_order_relaxed);
+  // v0.2.4c: a loader killed mid-hunt leaves a stale in-flight marker;
+  // never carry it into a new session (the lookup would wait forever).
+  for (size_t p = 0; p < slot_of_.size(); ++p) {
+    if (slot_of_[p] == -2) slot_of_[p] = -1;
+  }
   stream_active_ = true;
 #else
   (void)plan; (void)compute_stream;
@@ -371,9 +376,26 @@ int ExpertPump::stream_lookup(int layer, int expert) {
   std::unique_lock<std::mutex> lk(stream_mu_);
   const size_t p = sidx(layer, expert);
   while (slot_of_[p] < 0) {
+    if (slot_of_[p] != -2) {
+      // v0.2.4c: -1 with the walk already past this pair (take/publish-time
+      // skip or read failure) means the pair can never publish - fail fast
+      // instead of burning the session's retry budget on it. Without this
+      // the cold-disk path livelocks: compute waits on a pair the loader
+      // skipped, slots stay owned, loaders stall, nothing publishes.
+      const auto it = std::lower_bound(plan_.pairs.begin(),
+                                       plan_.pairs.end(),
+                                       static_cast<int32_t>(p));
+      const bool taken =
+          it != plan_.pairs.end() && *it == static_cast<int32_t>(p) &&
+          stream_next_ > static_cast<size_t>(it - plan_.pairs.begin());
+      if (taken || layer < done_layer_.load(std::memory_order_relaxed)) {
+        ++stats_.arm_timeouts;
+        return -1;
+      }
+    }
     if (std::chrono::steady_clock::now() >= deadline) {
       ++stats_.arm_timeouts;
-      return -1;   // loader stalled (or pair dropped): CPU-pool fallback
+      return -1;   // loader stalled: CPU-pool fallback
     }
     stream_cv_.wait_for(lk, std::chrono::milliseconds(2));
   }
@@ -497,15 +519,20 @@ void ExpertPump::loader_loop(int tid) {
   for (;;) {
     if (!stream_active_.load(std::memory_order_relaxed)) return;
     size_t i;
+    size_t p;
     {
       std::lock_guard<std::mutex> lk(stream_mu_);
       if (stream_next_ >= plan_.pairs.size()) return;
       i = stream_next_++;
+      // v0.2.4c: publish intent BEFORE the (unbounded) slot hunt so
+      // stream_lookup can tell "in flight" (-2) apart from "never coming"
+      // (-1 with the walk already past this pair).
+      p = static_cast<size_t>(plan_.pairs[i]);
+      slot_of_[p] = -2;
     }
-    const int32_t packed = plan_.pairs[i];
+    const int32_t packed = static_cast<int32_t>(p);
     const int L = packed / n_experts_;
     const int e = packed % n_experts_;
-    const size_t p = static_cast<size_t>(packed);
 
     // v0.2.4: prime the page cache AHEAD of the walk (fd-based, no mmap).
     // Steady state on hosts whose RAM is smaller than the pool (12.7 GB RAM
@@ -529,6 +556,7 @@ void ExpertPump::loader_loop(int tid) {
     // pair will never be consumed, loading it would only clog a slot.
     if (L < done_layer_.load(std::memory_order_relaxed)) {
       std::lock_guard<std::mutex> lk(stream_mu_);
+      slot_of_[p] = -1;   // clear the in-flight marker: this is a final state
       ++stats_.stream_skipped;
       continue;
     }
