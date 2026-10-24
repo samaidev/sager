@@ -441,7 +441,7 @@ void ExpertPump::stream_finish() {
 // one), stage pool -> pinned slab -> VRAM on the copy stream, publish.
 // Each reader owns its slabs (no cross-thread slab sharing).
 void ExpertPump::loader_loop(int tid) {
-  const auto& slabs = loader_slabs_[static_cast<size_t>(tid)];
+  auto& slabs = loader_slabs_[static_cast<size_t>(tid)];
   size_t slab_i = 0;
   for (;;) {
     if (!stream_active_.load(std::memory_order_relaxed)) return;
