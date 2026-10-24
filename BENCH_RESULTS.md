@@ -120,3 +120,69 @@ python3 bench_v023.py all    # arm A = streamed (default), arm B = per-row
 Run A twice and report the second pass: the first pass pays the cold disk
 reads, every later pass is the steady-state number (matching how the v0.2.2
 48.96 tok/s baseline was itself measured on a warm cache).
+
+## v0.2.5b (commits e016542, 67270b2) - stream-all unwedged, measured (2026-10-24)
+
+Two independent wedge modes sat between the streamed prefill and its design
+point. Both were found with a live gdb attach on the wedged engine.
+
+| Metric (Sage-A1.5-Q4_K_M, T4, warm cache) | v0.2.4 (wedged) | v0.2.5b | llama.cpp ngl30 | v0.2.2 per-row |
+|---|---|---|---|---|
+| prefill pp512  | 2.0 tok/s (316 s) | **36.0 tok/s (14.3 s)** | 20.51 tok/s | 48.96 tok/s |
+| prefill pp2048 | - | **65.0 tok/s (31.7 s)** | - | - |
+| arm timeouts   | 152 | **0** | - | - |
+| loader self-reclaim | - | take loop + lookup | - | - |
+
+pp2048 = 65 tok/s is the headline: the bigger the chunk, the more the fixed
+per-chunk costs (pool pread, plan build, graph-relevant warmup) amortize, and
+the more the copy engine overlaps attention/GDN compute - exactly the Strata
+regime this runtime set out to replicate.
+
+### Wedge mode 1 (v0.2.4/4b/4c/4d, pp512 = 2.0): ring deadlock
+
+The readers run ahead of the walk, fill the 606-slot ring with LOADED slots,
+and wedge in the take loop waiting for consumers; the walk, blocked in a
+lookup for a pair behind the wedge, never reaches the next stream_progress -
+the ring can only drain at the next layer boundary, which never comes. gdb:
+main in `stream_lookup` futex, no loader_loop thread alive, GPU util 0%.
+Net effect ~120 s per pair (60 x 2 s retry budget) + CPU-pool fallbacks.
+
+Fixes (e016542):
+- `reclaim_locked()`: shared scan freeing slots of layers behind the session;
+  called from `stream_progress` (session thread) AND from the loader take
+  loop - readers dig themselves out instead of waiting on a blocked session;
+- `live_loaders_` atomic (spawn-time increment, LiveGuard decrement on every
+  exit path) - v0.2.4d's check counted thread objects, which stay > 0 after
+  the plan drains;
+- session lookup retry 60 -> 8.
+
+### Wedge mode 2 (v0.2.5 first re-run, pp512 = 3.0): phantom lookups
+
+The stream plan covers chunk-start misses only, but dispatch routed parked
+survivors (pump-resident from earlier chunks/decode) into stream_lookup too -
+a pair no loader will ever copy burned the whole retry budget. Walk crawled
+at ~9 layers/min, readers skipped 5123 of 5309 planned pairs.
+
+Fixes (67270b2):
+- tier 0b consumes parked survivors via `stream_slot_of()` directly;
+- `stream_lookup` returns -1 immediately for pairs not in the plan;
+- walk-waits-for-loader semantics: arm timeout 2 s -> 30 s (cv wakes the
+  lookup on publish, so the long timeout costs nothing on the fast path;
+  deadline extends once while readers are live, fails immediately when
+  live_loaders_ == 0).
+
+### Bench harness fixes found during measurement
+
+- bench_v023.py counted `"type": "token"` (spaced) while the engine emits
+  compact JSON (`"type":"token"`) - token-stream counters were always 0;
+- decode_tps lives in the stdout done-line JSON, not stderr - tg was
+  always None; both fixed in the VM copy (repo bench/ pending sync).
+
+### Pending on next GPU session
+
+- re-run arm B (per-row baseline) under v0.2.5b so the TOKEN_STREAMS
+  gate compares same-code A/B output (the 48.96 tok/s v0.2.2 numbers
+  remain the reference until then);
+- decode tg128 number for v0.2.5b (the engine ran the 128 decode steps
+  but the harness parse missed it - fixed above);
+- publish the v0.2.5b engine binary to the GitHub Release.
