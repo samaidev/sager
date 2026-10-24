@@ -214,6 +214,18 @@ class ExpertPump {
 #endif
   }
 
+  // v0.2.4d: live loader-thread count. A stream session whose loaders never
+  // spawned (or already exited) can never publish a slot - dispatch must
+  // treat it as non-streaming (per-pump submit path) instead of waiting on
+  // lookups forever.
+  int stream_loader_count() const {
+#if defined(SAGER_HAVE_CUDA)
+    return static_cast<int>(loaders_.size());
+#else
+    return 0;
+#endif
+  }
+
   // Session progress: release every slot owned by a pair of a layer below
   // `layer` (the session never revisits earlier layers within a chunk).
   void stream_progress(int layer);

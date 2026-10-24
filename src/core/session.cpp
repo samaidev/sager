@@ -917,7 +917,11 @@ void Session::moe_dispatch_batched(int layer, int n) {
   std::vector<Job> jobs;
   std::vector<int> cpu_rows;      // (r * K + kk) packed, CPU-pool fallback
   jobs.reserve(static_cast<size_t>(E));
-  const bool streaming = pump_ && pump_->stream_active();
+  // v0.2.4d: require LIVE loader threads, not just an active session flag -
+  // a session whose loaders never spawned can never publish a slot, and
+  // waiting on its lookups hangs the whole prefill (observed on Colab).
+  const bool streaming = pump_ && pump_->stream_active() &&
+                         pump_->stream_loader_count() > 0;
   const uint64_t step = static_cast<uint64_t>(perf.steps) + 1;
   for (int e = 0; e < E; ++e) {
     const int m = count[static_cast<size_t>(e)];

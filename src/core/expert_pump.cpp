@@ -322,6 +322,11 @@ bool pread_full(int fd, void* dst, size_t n, off_t off) {
 
 void ExpertPump::stream_start(int pool_fd) {
   if (!stream_active_) return;
+  // v0.2.4d: entry observability - the stream-all path dead-ends silently
+  // if this bails; make every bail visible on stderr.
+  SLOG_I("pump", "stream_start: active=%d pool_fd=%d pairs=%zu slots=%zu",
+         stream_active_.load(std::memory_order_relaxed), pool_fd,
+         plan_.pairs.size(), slot_count_);
   if (pool_fd < 0 || plan_.pairs.empty() || slot_count_ == 0) {
     SLOG_W("pump", "stream-all prefill: nothing to stream (fd=%d pairs=%zu slots=%zu)",
            pool_fd, plan_.pairs.size(), slot_count_);
