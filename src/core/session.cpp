@@ -107,6 +107,18 @@ const float* Session::last_logits() const { return logits_host_.get(); }
 
 Status Session::alloc_scratch() {
   const EngineDims& d = mc_.dims;
+  { size_t f = 0, t = 0; cudaMemGetInfo(&f, &t);
+    SLOG_I("session", "scratch: %.0f MiB free of %.0f MiB before alloc",
+           f / 1048576.0, t / 1048576.0); }
+  auto ok = [](bool b, const char* what) {
+    if (!b) {
+      size_t f = 0, t = 0;
+      cudaMemGetInfo(&f, &t);
+      SLOG_E("session", "scratch OOM at %s (%.0f MiB free)",
+             what, f / 1048576.0);
+    }
+    return b ? Status::kOk : Status::kOomVram;
+  };
   const int H = d.hidden;
   const int Q = d.n_head * d.head_dim;
   const int KVd = d.n_embd_gqa();
@@ -116,87 +128,75 @@ Status Session::alloc_scratch() {
   const int T = cp_.chunk_prefill > 0 ? cp_.chunk_prefill : 1;
   const int V = d.n_vocab;
 
-  auto ok = [](bool b) { return b ? Status::kOk : Status::kOomVram; };
-
   // Activation slabs sized for the prefill chunk (fixed addresses: the same
   // buffers serve the 1-row decode path).
-  if (!ok(x_.alloc(static_cast<size_t>(T) * H))) return Status::kOomVram;
-  if (!ok(xn_.alloc(static_cast<size_t>(T) * H))) return Status::kOomVram;
+  if (!ok(x_.alloc(static_cast<size_t>(T) * H), "x_")) return Status::kOomVram;
+  if (!ok(xn_.alloc(static_cast<size_t>(T) * H), "xn_")) return Status::kOomVram;
   x2_.alloc(0);            // repurposed below: compact hit-out staging [K*H]
-  if (!ok(x2_.alloc(static_cast<size_t>(K) * H))) return Status::kOomVram;
+  if (!ok(x2_.alloc(static_cast<size_t>(K) * H), "x2_")) return Status::kOomVram;
   xn2_.alloc(0);           // reserved
-  if (!ok(q_.alloc(static_cast<size_t>(T) * Q))) return Status::kOomVram;
-  if (!ok(k_.alloc(static_cast<size_t>(T) * KVd))) return Status::kOomVram;
-  if (!ok(v_.alloc(static_cast<size_t>(T) * KVd))) return Status::kOomVram;
-  if (!ok(attn_out_.alloc(static_cast<size_t>(T) * Q))) return Status::kOomVram;
-  if (!ok(d_gate_.alloc(static_cast<size_t>(T) * Q))) return Status::kOomVram;
-  if (!ok(d_shared_gate_.alloc(1))) return Status::kOomVram;
-  if (!ok(o_proj_.alloc(static_cast<size_t>(T) * H))) return Status::kOomVram;
-  if (!ok(xf_.alloc(H))) return Status::kOomVram;        // MTP hidden stash
-  if (!ok(d_cat_.alloc(2 * H))) return Status::kOomVram;
-  if (!ok(d_m1_.alloc(H))) return Status::kOomVram;
+  if (!ok(q_.alloc(static_cast<size_t>(T) * Q), "q_")) return Status::kOomVram;
+  if (!ok(k_.alloc(static_cast<size_t>(T) * KVd), "k_")) return Status::kOomVram;
+  if (!ok(v_.alloc(static_cast<size_t>(T) * KVd), "v_")) return Status::kOomVram;
+  if (!ok(attn_out_.alloc(static_cast<size_t>(T) * Q), "attn_out_")) return Status::kOomVram;
+  if (!ok(d_gate_.alloc(static_cast<size_t>(T) * Q), "d_gate_")) return Status::kOomVram;
+  if (!ok(d_shared_gate_.alloc(1), "d_shared_gate_")) return Status::kOomVram;
+  if (!ok(o_proj_.alloc(static_cast<size_t>(T) * H), "o_proj_")) return Status::kOomVram;
+  if (!ok(xf_.alloc(H), "xf_")) return Status::kOomVram;        // MTP hidden stash
+  if (!ok(d_cat_.alloc(2 * H), "d_cat_")) return Status::kOomVram;
+  if (!ok(d_m1_.alloc(H), "d_m1_")) return Status::kOomVram;
 
   // MoE working set
-  if (!ok(expert_g_.alloc(static_cast<size_t>(K) * FFX))) return Status::kOomVram;
-  if (!ok(expert_u_.alloc(static_cast<size_t>(K) * FFX))) return Status::kOomVram;
-  if (!ok(expert_y_.alloc(static_cast<size_t>(K + 1) * H))) return Status::kOomVram;
-  if (!ok(shared_y_.alloc(static_cast<size_t>(H) + 2 * FFX))) return Status::kOomVram;
-  if (!ok(route_logits_.alloc(E))) return Status::kOomVram;
-  if (!ok(route_idx_.alloc(K + 1))) return Status::kOomVram;
-  if (!ok(route_w_.alloc(K + 1))) return Status::kOomVram;
-  if (!ok(d_miss_y_.alloc(static_cast<size_t>(K) * H))) return Status::kOomVram;
-  if (!ok(d_slot_of_k_.alloc(K))) return Status::kOomVram;
-  if (!ok(d_hit_rows_.alloc(K))) return Status::kOomVram;
-  if (!ok(d_ptrs_hit_.alloc(3 * K))) return Status::kOomVram;
+  if (!ok(expert_g_.alloc(static_cast<size_t>(K) * FFX), "expert_g_")) return Status::kOomVram;
+  if (!ok(expert_u_.alloc(static_cast<size_t>(K) * FFX), "expert_u_")) return Status::kOomVram;
+  if (!ok(expert_y_.alloc(static_cast<size_t>(K + 1) * H), "expert_y_")) return Status::kOomVram;
+  if (!ok(shared_y_.alloc(static_cast<size_t>(H) + 2 * FFX), "shared_y_")) return Status::kOomVram;
+  if (!ok(route_logits_.alloc(E), "route_logits_")) return Status::kOomVram;
+  if (!ok(route_idx_.alloc(K + 1), "route_idx_")) return Status::kOomVram;
+  if (!ok(route_w_.alloc(K + 1), "route_w_")) return Status::kOomVram;
+  if (!ok(d_miss_y_.alloc(static_cast<size_t>(K) * H), "d_miss_y_")) return Status::kOomVram;
+  if (!ok(d_slot_of_k_.alloc(K), "d_slot_of_k_")) return Status::kOomVram;
+  if (!ok(d_hit_rows_.alloc(K), "d_hit_rows_")) return Status::kOomVram;
+  if (!ok(d_ptrs_hit_.alloc(3 * K), "d_ptrs_hit_")) return Status::kOomVram;
 
   // Activation quant slabs: worst case = chunked batched GEMV activations.
   const size_t q8_blocks = std::max({static_cast<size_t>(T) * H,
                                      static_cast<size_t>(T) * Q,
                                      static_cast<size_t>(K) * FFX}) /
                            q4k::kQK_K;
-  if (!ok(d_xq_.alloc(q8_blocks))) return Status::kOomVram;
-  if (!ok(d_hq_.alloc(q8_blocks))) return Status::kOomVram;
-  if (!ok(d_mq_.alloc(H / q4k::kQK_K))) return Status::kOomVram;
+  if (!ok(d_xq_.alloc(q8_blocks), "d_xq_")) return Status::kOomVram;
+  if (!ok(d_hq_.alloc(q8_blocks), "d_hq_")) return Status::kOomVram;
+  if (!ok(d_mq_.alloc(H / q4k::kQK_K), "d_mq_")) return Status::kOomVram;
 
   // Head + io
-  if (!ok(logits_.alloc(V))) return Status::kOomVram;
-  if (!ok(d_logits16_.alloc(V))) return Status::kOomVram;
+  if (!ok(logits_.alloc(V), "logits_")) return Status::kOomVram;
+  if (!ok(d_logits16_.alloc(V), "d_logits16_")) return Status::kOomVram;
   mtp_logits_.alloc(0);
-  if (!ok(d_params_.alloc(1))) return Status::kOomVram;
-  if (!ok(d_ids_.alloc(T))) return Status::kOomVram;
-  if (!ok(d_pos_ids_.alloc(3 * T))) return Status::kOomVram;
-  if (!ok(d_recent_.alloc(kMaxRecent))) return Status::kOomVram;
+  if (!ok(d_params_.alloc(1), "d_params_")) return Status::kOomVram;
+  if (!ok(d_ids_.alloc(T), "d_ids_")) return Status::kOomVram;
+  if (!ok(d_pos_ids_.alloc(3 * T), "d_pos_ids_")) return Status::kOomVram;
+  if (!ok(d_recent_.alloc(kMaxRecent), "d_recent_")) return Status::kOomVram;
 
   // v0.2 expert pump staging
-  if (!ok(d_ptrs_pump_.alloc(3 * K))) return Status::kOomVram;
-  if (!ok(d_pump_rows_.alloc(K))) return Status::kOomVram;
-  if (!ok(d_xq_moe_.alloc(H / q4k::kQK_K))) return Status::kOomVram;
+  if (!ok(d_ptrs_pump_.alloc(3 * K), "d_ptrs_pump_")) return Status::kOomVram;
+  if (!ok(d_pump_rows_.alloc(K), "d_pump_rows_")) return Status::kOomVram;
+  if (!ok(d_xq_moe_.alloc(H / q4k::kQK_K), "d_xq_moe_")) return Status::kOomVram;
 
   // v0.2 GDN working set (fixed addresses; state slabs are per linear layer)
   const GdnParams g = mc_.gdn();
   const int n_gdn = mc_.n_linear();
-  if (!ok(lin_proj_.alloc(static_cast<size_t>(g.proj_rows()))))
-    return Status::kOomVram;
-  if (!ok(lin_ba_.alloc(static_cast<size_t>(g.ba_rows()))))
-    return Status::kOomVram;
-  if (!ok(lin_conv_.alloc(static_cast<size_t>(g.conv_dim()))))
-    return Status::kOomVram;
-  if (!ok(lin_qn_.alloc(static_cast<size_t>(g.n_k_heads) * g.key_dim)))
-    return Status::kOomVram;
-  if (!ok(lin_kn_.alloc(static_cast<size_t>(g.n_k_heads) * g.key_dim)))
-    return Status::kOomVram;
-  if (!ok(lin_y_.alloc(static_cast<size_t>(g.y_rows()))))
-    return Status::kOomVram;
-  if (!ok(lin_on_.alloc(static_cast<size_t>(g.y_rows()))))
-    return Status::kOomVram;
-  if (!ok(lin_ab_.alloc(static_cast<size_t>(2 * g.n_v_heads))))
-    return Status::kOomVram;
+  if (!ok(lin_proj_.alloc(static_cast<size_t>(g.proj_rows())), "lin_proj_")) return Status::kOomVram;
+  if (!ok(lin_ba_.alloc(static_cast<size_t>(g.ba_rows())), "lin_ba_")) return Status::kOomVram;
+  if (!ok(lin_conv_.alloc(static_cast<size_t>(g.conv_dim())), "lin_conv_")) return Status::kOomVram;
+  if (!ok(lin_qn_.alloc(static_cast<size_t>(g.n_k_heads) * g.key_dim), "lin_qn_")) return Status::kOomVram;
+  if (!ok(lin_kn_.alloc(static_cast<size_t>(g.n_k_heads) * g.key_dim), "lin_kn_")) return Status::kOomVram;
+  if (!ok(lin_y_.alloc(static_cast<size_t>(g.y_rows())), "lin_y_")) return Status::kOomVram;
+  if (!ok(lin_on_.alloc(static_cast<size_t>(g.y_rows())), "lin_on_")) return Status::kOomVram;
+  if (!ok(lin_ab_.alloc(static_cast<size_t>(2 * g.n_v_heads)), "lin_ab_")) return Status::kOomVram;
   if (!ok(lin_conv_state_.alloc(static_cast<size_t>(n_gdn) *
-                                g.conv_state_elems())))
-    return Status::kOomVram;
+                                g.conv_state_elems()), "lin_conv_state_")) return Status::kOomVram;
   if (!ok(lin_delta_state_.alloc(static_cast<size_t>(n_gdn) *
-                                 g.state_elems())))
-    return Status::kOomVram;
+                                 g.state_elems()), "lin_delta_state_")) return Status::kOomVram;
 
   // Host staging (pinned, C1: the SAME regions every call)
   if (!h_route_idx_.alloc(K + 1) || !h_route_w_.alloc(K + 1) ||
