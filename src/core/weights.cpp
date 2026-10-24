@@ -187,6 +187,18 @@ void dequant_row_q6(const uint8_t* src, float* out, int cols) {
   }
 }
 
+namespace {
+// llama.cpp-native GGUFs suffix every trained weight with ".weight" (norms,
+// routers and the stacked expert mats included); the legacy sager converter
+// emits bare names for those. Accept both spellings: try the suffixed name
+// first, then the bare one. Call sites that already pass a suffixed name are
+// unaffected.
+const gguf::TensorInfo* find_tensor_w(gguf::File& f, const std::string& name) {
+  if (const auto* t = f.tensor((name + ".weight").c_str())) return t;
+  return f.tensor(name.c_str());
+}
+}  // namespace
+
 Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
 #if defined(SAGER_HAVE_CUDA)
   const EngineDims& d = dims;
@@ -263,10 +275,10 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
     LayerWeights& lw = layers_[L];
     const std::string lp = "blk." + std::to_string(L) + ".";
     // ---- input + post-attention norms -----------------------------------
-    if (const auto* t = f.tensor((lp + "attn_norm").c_str()))
+    if (const auto* t = find_tensor_w(f, lp + "attn_norm"))
       if (copynorm(lw.attn_norm, t) != Status::kOk) return Status::kGgufParseError;
-    const auto* ffn_t = f.tensor((lp + "ffn_norm").c_str());
-    if (!ffn_t) ffn_t = f.tensor((lp + "post_attention_norm").c_str());
+    const auto* ffn_t = find_tensor_w(f, lp + "ffn_norm");
+    if (!ffn_t) ffn_t = find_tensor_w(f, lp + "post_attention_norm");
     if (ffn_t)
       if (copynorm(lw.ffn_norm, ffn_t) != Status::kOk)
         return Status::kGgufParseError;
@@ -402,9 +414,12 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
       }
     }
     // router (fp32)
-    if (const auto* t = f.tensor((lp + "ffn_gate_inp").c_str())) {
+    if (const auto* t = find_tensor_w(f, lp + "ffn_gate_inp")) {
       SAGER_CUDA_CHECK(cudaMemcpy(lw.router, f.tensor_data(*t), t->nbytes,
                                   cudaMemcpyHostToDevice));
+    } else {
+      SLOG_W("weights", "%sffn_gate_inp missing - MoE routing on layer %d "
+                        "would be uninitialized", lp.c_str(), L);
     }
     // shared-expert scalar router (fp32, one logit per token)
     if (const auto* t = f.tensor((lp + "ffn_gate_inp_shexp.weight").c_str())) {
@@ -570,9 +585,9 @@ Status Weights::load_expert_pool(gguf::File& f, const ModelConfig& cfg) {
     for (int e = 0; e < d.n_expert; ++e) {
       uint8_t* dst = expert_pool_host_ +
                      (static_cast<size_t>(L) * d.n_expert + e) * ebytes;
-      const auto* g = f.tensor("blk." + std::to_string(L) + ".ffn_gate_exps");
-      const auto* u = f.tensor("blk." + std::to_string(L) + ".ffn_up_exps");
-      const auto* dnw = f.tensor("blk." + std::to_string(L) + ".ffn_down_exps");
+      const auto* g = find_tensor_w(f, "blk." + std::to_string(L) + ".ffn_gate_exps");
+      const auto* u = find_tensor_w(f, "blk." + std::to_string(L) + ".ffn_up_exps");
+      const auto* dnw = find_tensor_w(f, "blk." + std::to_string(L) + ".ffn_down_exps");
       if (!g || !u || !dnw) return Status::kGgufParseError;
       if (g->type != 12 || u->type != 12) return Status::kGgufParseError;
       if (dnw->type != 12 && dnw->type != 14) return Status::kGgufParseError;
