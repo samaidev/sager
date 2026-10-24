@@ -57,3 +57,66 @@ echo '{"cmd":"load","model":"Sage-A1.5-Q4_K_M.gguf","ctx":8192,"vram_mb":8960,
 
 Artifacts in the release tarball are sm_75 CUDA binaries built by nvcc 13.0 on
 commit 7b070c7 (see BUILD_INFO.txt).
+
+---
+
+# v0.2.3 - Strata-style streamed prefill (status: code landed, re-bench pending)
+
+## What changed (commits 78b2f88..c754ed2)
+
+v0.2.2's prefill walked the prompt PER ROW: every (token, layer) dispatched
+its own top-k, synced the whole device, and submitted its own pageable
+copies - a 512-token chunk paid 20,480 device syncs (measured 48.96 tok/s).
+v0.2.3 rewrites the prefill MoE half the way Strata streams experts:
+
+- per-LAYER batched MoE: one route sync per layer, routed rows compacted
+  expert-major, batched per-expert GEMVs, batched combine (new kernels:
+  router_topk_batched, gather_rows_q8, scatter_routed, moe_combine_batched,
+  sigmoid_gate_scalar_batched, scatter_rows_generic);
+- stream-all ring in ExpertPump: for chunks >= SAGER_PF_STREAM_MIN (384
+  tokens, top-8 of 256 -> nearly every expert is routed) the routing is not
+  needed to schedule copies - hot-tier AND arena misses stream in fixed
+  (layer, id) order through the arena ring while compute consumes that same
+  order; copies overlap attention compute;
+- pinned-RAM loader threads (SAGER_PF_READERS x SAGER_PF_SLABS): pool file
+  -> pread -> pinned slab -> cudaMemcpyAsync -> arena slot. No more pageable
+  mmap as the copy source;
+- sessions are per CHUNK; resident slots are parked (reused without a copy)
+  and a fence event orders the copy stream behind compute across the chunk
+  boundary;
+- SAGER_PF_BATCHED=0 switches back to the exact v0.2.2 per-row walk (A/B).
+  Both walks share the same kernels per row - outputs are bit-identical.
+
+## Failure mode found and fixed (first streamed run, 2 tok/s)
+
+The first run stalled: zero-count pairs (experts no token routes to, ~15 of
+256 per layer on random-id prompts) that the loaders landed AFTER their
+layer had passed clogged ring slots forever -> 112 x 2s arm timeouts = the
+whole 238 s prefill. Fixed in c754ed2: stream_progress(L) releases every
+slot owned by a pair of an earlier layer (parked: immediately; consumed:
+once its down-projection event completes), loaders skip past-layer pairs at
+take AND publish time, sessions became per-chunk, timeout pairs are dropped.
+
+## Measured so far (pre-fix run + disk physics, Tesla T4 Colab)
+
+- non-hot plan per 512-token chunk: 4,931-5,309 pairs = 8.1-8.7 GB to stream
+  (52% hot residency is profile-driven and uncorrelated with random-id
+  routing);
+- Colab T4 box: 12.7 GB RAM < 16.9 GB pool -> the cold fraction of every
+  first pass reads from disk at ~261 MB/s sequential (dd measured). A fully
+  cold pass is therefore disk-bound: ~33 s/chunk floor, warm page-cache
+  passes are PCIe-bound (~1 s/chunk ceiling);
+- first (buggy) run: 5.74 GB H2D in 316 s - timeout-dominated, not
+  representative; post-fix numbers pending a fresh GPU session.
+
+## Reproduce the A/B
+
+```bash
+python3 bench_v023.py all    # arm A = streamed (default), arm B = per-row
+                             # (SAGER_PF_BATCHED=0); token streams must be
+                             # IDENTICAL - that is the correctness gate
+```
+
+Run A twice and report the second pass: the first pass pays the cold disk
+reads, every later pass is the steady-state number (matching how the v0.2.2
+48.96 tok/s baseline was itself measured on a warm cache).
