@@ -935,11 +935,13 @@ void Session::moe_dispatch_batched(int layer, int n) {
     j.m = m;
     j.ring_slot = -1;
     if (cache_.resident(layer, e)) {
-      // tier 0a: hot slab, computed in place
+      // tier 0a: hot slab, computed in place (tables hold raw uint16_t*)
       const size_t base = (static_cast<size_t>(layer) * 3 + 0) * E + e;
-      j.wg = hot_->tables_host[base];
-      j.wu = hot_->tables_host[base + static_cast<size_t>(E)];
-      j.wo = hot_->tables_host[base + 2 * static_cast<size_t>(E)];
+      j.wg = reinterpret_cast<const q4k::BlockQ4K*>(hot_->tables_host[base]);
+      j.wu = reinterpret_cast<const q4k::BlockQ4K*>(
+          hot_->tables_host[base + static_cast<size_t>(E)]);
+      j.wo = reinterpret_cast<const q4k::BlockQ4K*>(
+          hot_->tables_host[base + 2 * static_cast<size_t>(E)]);
     } else if (streaming) {
       // tier 0b: stream-all ring (the pair was planned at chunk start)
       const int slot = pump_->stream_lookup(layer, e);
@@ -1040,15 +1042,18 @@ void Session::moe_dispatch_batched(int layer, int n) {
 
   // 11) shared expert, batched (dense MLP over all chunk rows).
   if (lw.shared_gate) {
-    cuda::gemv_q4_k_q8_f16out_batched(lw.shared_gate, d_xq_moe_.get(),
-                                      sh_g_.get(), FFX, H, n, s);
-    cuda::gemv_q4_k_q8_f16out_batched(lw.shared_up, d_xq_moe_.get(),
-                                      sh_u_.get(), FFX, H, n, s);
+    cuda::gemv_q4_k_q8_f16out_batched(
+        reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_gate),
+        d_xq_moe_.get(), sh_g_.get(), FFX, H, n, s);
+    cuda::gemv_q4_k_q8_f16out_batched(
+        reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_up),
+        d_xq_moe_.get(), sh_u_.get(), FFX, H, n, s);
     cuda::silu_mul_f16(sh_g_.get(), sh_g_.get(), sh_u_.get(), 1, n * FFX, s);
     cuda::quantize_q8_k(sh_g_.get(), d_hqg_.get(),
                         static_cast<size_t>(n) * FFX, s);
-    cuda::gemv_q4_k_q8_f16out_batched(lw.shared_out, d_hqg_.get(),
-                                      shared_yb_.get(), H, FFX, n, s);
+    cuda::gemv_q4_k_q8_f16out_batched(
+        reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_out), d_hqg_.get(),
+        shared_yb_.get(), H, FFX, n, s);
     if (lw.shared_gate_w) {
       cuda::gemv_f32_out_f16x_batched(lw.shared_gate_w, xn_.get(),
                                       d_sgate_.get(), 1, H, n, s);
