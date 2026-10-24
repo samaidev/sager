@@ -75,8 +75,11 @@ class PoolImpl final : public CpuPool {
     if (jobs.empty()) return 0;
     if (!bound_) return 0;
     // Double-checked geometry: every job must match the bound geometry (C4).
+    // n_expert is a pool-level property (a job addresses one expert by
+    // pointer and carries no expert count), so only the per-job fields
+    // (hidden / n_ff / block bytes) participate in the check.
     for (const auto& j : jobs) {
-      PoolGeometry want{geo_.hidden, geo_.n_ff, geo_.n_expert, q4k::kBlockBytes};
+      PoolGeometry want{geo_.hidden, geo_.n_ff, 0, q4k::kBlockBytes};
       PoolGeometry got{j.hidden, j.n_ff, 0, q4k::kBlockBytes};
       if (validate_pool_geometry(want, got) != Status::kOk) {
         SLOG_E("pool", "geometry mismatch on submit - refusing job (C4)");
