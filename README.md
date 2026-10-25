@@ -39,6 +39,44 @@ Sage-A1.5 is a HYBRID (config.json: `full_attention_interval=4`, 40 blocks → *
 
 KV is now allocated only for the 10 full-attention layers (GDN layers keep fixed-size recurrence state — ~60 MB total instead of hundreds of MB of KV).
 
+## v0.6: full-layer decode graphs + native Q6_K head (NEWEST)
+
+Measured on the same T4 (Sage-A1.5-Q4_K_M, commit 16f2f59, warm pool):
+
+| metric | v0.5 | v0.6 | delta |
+|---|---|---|---|
+| decode tg128 | 24.56 tok/s | **30.26 tok/s** (median of 3) | **+23%** |
+| prefill pp512 | 223 tok/s | **232-235 tok/s** | +4-5% |
+| prefill pp2048 | 212 tok/s | **226-229 tok/s** | +7-8% |
+
+8. **Full-layer decode CUDA graphs** — v0.5 replayed a captured graph for each layer's
+   dense/GDN half and ran the MoE half as ~13 eager launches (~390 launches/step,
+   launch-bound). v0.6 captures the WHOLE layer - dense body + the device-dispatch
+   MoE body - into one graph per layer (40/40). The MoE body is graph-safe: the
+   routing plan is computed on device, the grouped-GEMV grids are host-fixed,
+   expert weights are read through the indirect residency table, and the
+   absent-expert mailbox becomes per-layer device slots + pinned memcpy nodes.
+   A step-end CPU-pool patch (`patch_graph_mailbox`) re-adds non-resident experts'
+   contributions from the preserved per-layer plan BEFORE the head, so logits stay
+   exact. `SAGER_FULL_GRAPH=0` reverts to the v0.5 split.
+9. **Native Q6_K head GEMV** — the 248k-row head no longer dequantizes to fp16 at
+   load: 401 MB of weight traffic per decode step instead of 1,017 MB, 616 MB less
+   VRAM, dp4a math in the model's own 6-bit format (`SAGER_HEAD_Q6K=0` / load-time
+   `SAGER_HEAD_F16=1` restore the fp16 path; logits differ at rounding level).
+10. **Two-phase top-k sampler** — parallel per-segment scans + one merge block
+    (~25 us vs ~700 us at n=248320), identical selection set and tie rule
+    (`SAGER_TOPK2=0` reverts).
+11. **Warp-per-row GDN chunk scan** — 4096 warps instead of 128 (4% occupancy),
+    state in registers, k/q through L2, no shared memory or block barriers;
+    fp32 reduction order changes at rounding level, the same trade Strata makes
+    (`SAGER_GDN_WS=0` reverts).
+12. **Fixed a silent v0.5 bug** — `quantize_q8_k_n` launched 0 blocks at the
+    single-token step (grid `n_max/256` rounded to 0), silently skipping the
+    routed experts' requant on the device decode path. v0.6 ceil-corrects it.
+
+Gates: ctest 3/3; legacy-vs-full-graph token streams IDENTICAL 128/128.
+Full report: [BENCH_RESULTS_v06.md](BENCH_RESULTS_v06.md).
+
 ## Measured on one Tesla T4 (v0.2.2, Sage-A1.5-Q4_K_M, commit 7b070c7)
 
 Native llama.cpp `qwen35moe` GGUFs load directly (`.weight`-suffixed tensor names accepted).
