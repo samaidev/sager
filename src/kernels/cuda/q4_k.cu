@@ -376,7 +376,7 @@ __global__ void gemv_q4_k_q8_f16out_mtok_kernel(
   if (nt <= 0) return;
 
   for (int t = 0; t < nt; ++t) {
-    stage_bytes(x_sh + t, xq + static_cast<size_t>(tok0 + t) * nb,
+    stage_bytes(x_sh + static_cast<size_t>(t) * nb, xq + static_cast<size_t>(tok0 + t) * nb,
                 x_row_bytes, threadIdx.x, blockDim.x);
   }
   if (row < n_rows) {
@@ -388,7 +388,7 @@ __global__ void gemv_q4_k_q8_f16out_mtok_kernel(
   if (row >= n_rows) return;
   const int nsg = nb * 8;
   for (int t = 0; t < nt; ++t) {
-    const q4k::BlockQ8K* xb = x_sh + t;
+    const q4k::BlockQ8K* xb_row = x_sh + static_cast<size_t>(t) * nb;
     float acc = 0.f;
     for (int g = lane; g < nsg; g += 32) {
       const int blk = g >> 3, sb = g & 7;
@@ -398,9 +398,9 @@ __global__ void gemv_q4_k_q8_f16out_mtok_kernel(
           __half2float(*reinterpret_cast<const __half*>(&b.dmin));
       float sd, sm;
       unpack_scales6(b.scales, sb, d, dmin, &sd, &sm);
-      const int dot = dp4a_subblock(b.qs + sb * 16, xb->qs + sb * 32);
-      acc += xb->d * (sd * static_cast<float>(dot) -
-                      sm * static_cast<float>(xb->bsums[sb]));
+      const int dot = dp4a_subblock(b.qs + sb * 16, xb_row[blk].qs + sb * 32);
+      acc += xb_row[blk].d * (sd * static_cast<float>(dot) -
+                      sm * static_cast<float>(xb_row[blk].bsums[sb]));
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -440,7 +440,7 @@ __global__ void gemv2_q4_k_q8_f16out_mtok_kernel(
   if (nt <= 0) return;
 
   for (int t = 0; t < nt; ++t) {
-    stage_bytes(x_sh + t, xq + static_cast<size_t>(tok0 + t) * nb,
+    stage_bytes(x_sh + static_cast<size_t>(t) * nb, xq + static_cast<size_t>(tok0 + t) * nb,
                 x_row_bytes, threadIdx.x, blockDim.x);
   }
   if (row < n_rows) {
@@ -454,28 +454,27 @@ __global__ void gemv2_q4_k_q8_f16out_mtok_kernel(
   if (row >= n_rows) return;
   const int nsg = nb * 8;
   for (int t = 0; t < nt; ++t) {
-    const q4k::BlockQ8K* xb = x_sh + t;
+    const q4k::BlockQ8K* xb_row = x_sh + static_cast<size_t>(t) * nb;
     float accg = 0.f, accu = 0.f;
     for (int g = lane; g < nsg; g += 32) {
       const int blk = g >> 3, sb = g & 7;
-      const q4k::BlockQ8K& xb_ref = *xb;
       const float d = __half2float(*reinterpret_cast<const __half*>(&wg_sh[blk].d));
       const float dmin =
           __half2float(*reinterpret_cast<const __half*>(&wg_sh[blk].dmin));
       float sd, sm;
       unpack_scales6(wg_sh[blk].scales, sb, d, dmin, &sd, &sm);
       const int dotg =
-          dp4a_subblock(wg_sh[blk].qs + sb * 16, xb_ref.qs + sb * 32);
-      accg += xb_ref.d * (sd * static_cast<float>(dotg) -
-                          sm * static_cast<float>(xb_ref.bsums[sb]));
+          dp4a_subblock(wg_sh[blk].qs + sb * 16, xb_row[blk].qs + sb * 32);
+      accg += xb_row[blk].d * (sd * static_cast<float>(dotg) -
+                          sm * static_cast<float>(xb_row[blk].bsums[sb]));
       const float d2 = __half2float(*reinterpret_cast<const __half*>(&wu_sh[blk].d));
       const float dmin2 =
           __half2float(*reinterpret_cast<const __half*>(&wu_sh[blk].dmin));
       unpack_scales6(wu_sh[blk].scales, sb, d2, dmin2, &sd, &sm);
       const int dotu =
-          dp4a_subblock(wu_sh[blk].qs + sb * 16, xb_ref.qs + sb * 32);
-      accu += xb_ref.d * (sd * static_cast<float>(dotu) -
-                          sm * static_cast<float>(xb_ref.bsums[sb]));
+          dp4a_subblock(wu_sh[blk].qs + sb * 16, xb_row[blk].qs + sb * 32);
+      accu += xb_row[blk].d * (sd * static_cast<float>(dotu) -
+                          sm * static_cast<float>(xb_row[blk].bsums[sb]));
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -526,7 +525,7 @@ __global__ void gemv_grouped2_q4_k_q8_f16out_mtok_kernel(
   if (nt <= 0 || row >= n_rows) return;
 
   for (int t = 0; t < nt; ++t) {
-    stage_bytes(x_sh + t, xq + static_cast<size_t>(joff + tok0 + t) * nb,
+    stage_bytes(x_sh + static_cast<size_t>(t) * nb, xq + static_cast<size_t>(joff + tok0 + t) * nb,
                 x_row_bytes, threadIdx.x, blockDim.x);
   }
   stage_bytes(wg_sh, wg[job] + static_cast<size_t>(row) * nb, w_row_bytes,
@@ -537,7 +536,7 @@ __global__ void gemv_grouped2_q4_k_q8_f16out_mtok_kernel(
 
   const int nsg = nb * 8;
   for (int t = 0; t < nt; ++t) {
-    const q4k::BlockQ8K* xb = x_sh + t;
+    const q4k::BlockQ8K* xb_row = x_sh + static_cast<size_t>(t) * nb;
     float accg = 0.f, accu = 0.f;
     for (int g = lane; g < nsg; g += 32) {
       const int blk = g >> 3, sb = g & 7;
@@ -547,17 +546,17 @@ __global__ void gemv_grouped2_q4_k_q8_f16out_mtok_kernel(
       float sd, sm;
       unpack_scales6(wg_sh[blk].scales, sb, d, dmin, &sd, &sm);
       const int dotg =
-          dp4a_subblock(wg_sh[blk].qs + sb * 16, xb->qs + sb * 32);
-      accg += xb->d * (sd * static_cast<float>(dotg) -
-                       sm * static_cast<float>(xb->bsums[sb]));
+          dp4a_subblock(wg_sh[blk].qs + sb * 16, xb_row[blk].qs + sb * 32);
+      accg += xb_row[blk].d * (sd * static_cast<float>(dotg) -
+                       sm * static_cast<float>(xb_row[blk].bsums[sb]));
       const float d2 = __half2float(*reinterpret_cast<const __half*>(&wu_sh[blk].d));
       const float dmin2 =
           __half2float(*reinterpret_cast<const __half*>(&wu_sh[blk].dmin));
       unpack_scales6(wu_sh[blk].scales, sb, d2, dmin2, &sd, &sm);
       const int dotu =
-          dp4a_subblock(wu_sh[blk].qs + sb * 16, xb->qs + sb * 32);
-      accu += xb->d * (sd * static_cast<float>(dotu) -
-                       sm * static_cast<float>(xb->bsums[sb]));
+          dp4a_subblock(wu_sh[blk].qs + sb * 16, xb_row[blk].qs + sb * 32);
+      accu += xb_row[blk].d * (sd * static_cast<float>(dotu) -
+                       sm * static_cast<float>(xb_row[blk].bsums[sb]));
     }
     #pragma unroll
     for (int offr = 16; offr > 0; offr >>= 1) {
@@ -602,7 +601,7 @@ __global__ void gemv_grouped_q4_k_q8_f16out_mtok_kernel(
   if (nt <= 0 || row >= n_rows) return;
 
   for (int t = 0; t < nt; ++t) {
-    stage_bytes(x_sh + t, xq + static_cast<size_t>(joff + tok0 + t) * nb,
+    stage_bytes(x_sh + static_cast<size_t>(t) * nb, xq + static_cast<size_t>(joff + tok0 + t) * nb,
                 x_row_bytes, threadIdx.x, blockDim.x);
   }
   stage_bytes(w_sh, w[job] + static_cast<size_t>(row) * nb, w_row_bytes,
@@ -611,7 +610,7 @@ __global__ void gemv_grouped_q4_k_q8_f16out_mtok_kernel(
 
   const int nsg = nb * 8;
   for (int t = 0; t < nt; ++t) {
-    const q4k::BlockQ8K* xb = x_sh + t;
+    const q4k::BlockQ8K* xb_row = x_sh + static_cast<size_t>(t) * nb;
     float acc = 0.f;
     for (int g = lane; g < nsg; g += 32) {
       const int blk = g >> 3, sb = g & 7;
@@ -621,9 +620,197 @@ __global__ void gemv_grouped_q4_k_q8_f16out_mtok_kernel(
           __half2float(*reinterpret_cast<const __half*>(&b.dmin));
       float sd, sm;
       unpack_scales6(b.scales, sb, d, dmin, &sd, &sm);
-      const int dot = dp4a_subblock(b.qs + sb * 16, xb->qs + sb * 32);
-      acc += xb->d * (sd * static_cast<float>(dot) -
-                      sm * static_cast<float>(xb->bsums[sb]));
+      const int dot = dp4a_subblock(b.qs + sb * 16, xb_row[blk].qs + sb * 32);
+      acc += xb_row[blk].d * (sd * static_cast<float>(dot) -
+                      sm * static_cast<float>(xb_row[blk].bsums[sb]));
+    }
+    #pragma unroll
+    for (int offr = 16; offr > 0; offr >>= 1) {
+      acc += __shfl_down_sync(0xFFFFFFFFu, acc, offr);
+    }
+    if (lane == 0) {
+      *reinterpret_cast<__half*>(
+          &y[static_cast<size_t>(joff + tok0 + t) * n_rows + row]) =
+          __float2half(acc);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// v0.4 device-dispatch grouped kernels (P1): the grouped plan (which expert a
+// flattened tile serves) is derived ON DEVICE from off[]/toff[] written by
+// moe_dispatch_scan; per-expert weights come from the chunk pointer table
+// (null = expert absent -> rows are zeroed so the combine adds 0, and the
+// CPU-pool patch fills them after the layer).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ int mtok_expert_of_tile(const int* toff,
+                                                   int n_expert, int tile) {
+  // last e with toff[e] <= tile (binary search over the E+1 prefix)
+  int lo = 0, hi = n_expert - 1, res = n_expert - 1;
+  while (lo <= hi) {
+    const int mid = (lo + hi) >> 1;
+    if (toff[mid + 1] <= tile) lo = mid + 1;
+    else { res = mid; hi = mid - 1; }
+  }
+  return res;
+}
+
+__global__ void gemv_grouped2_tab_q4_k_q8_f16out_mtok_kernel(
+    const q4k::BlockQ4K* const* __restrict__ wg_tab,
+    const q4k::BlockQ4K* const* __restrict__ wu_tab, const int* __restrict__ off,
+    const int* __restrict__ toff, const int* __restrict__ meta,
+    int* __restrict__ mail, int* __restrict__ mail_n,
+    const q4k::BlockQ8K* __restrict__ xq, uint16_t* __restrict__ yg,
+    uint16_t* __restrict__ yu, int n_rows, int k, int n_expert, int tok_per) {
+  extern __shared__ __align__(16) unsigned char smem[];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int nb = k / 256;
+  const int w_row_bytes = nb * static_cast<int>(sizeof(q4k::BlockQ4K));
+  const int x_row_bytes = nb * static_cast<int>(sizeof(q4k::BlockQ8K));
+  q4k::BlockQ4K* wg_sh =
+      reinterpret_cast<q4k::BlockQ4K*>(smem + warp * w_row_bytes);
+  q4k::BlockQ4K* wu_sh =
+      reinterpret_cast<q4k::BlockQ4K*>(smem + (8 + warp) * w_row_bytes);
+  q4k::BlockQ8K* x_sh = reinterpret_cast<q4k::BlockQ8K*>(
+      smem + 16 * w_row_bytes);
+
+  if (blockIdx.y >= *meta) return;          // meta[1] = total tiles
+  const int e = mtok_expert_of_tile(toff, n_expert, blockIdx.y);
+  const int joff = off[e];
+  const int jm = off[e + 1] - off[e];
+  const int tok0 = (blockIdx.y - toff[e]) * tok_per;
+  const int nt = min(tok_per, jm - tok0);
+  const int row = blockIdx.x * 8 + warp;
+  if (nt <= 0) return;
+
+  const q4k::BlockQ4K* wg = wg_tab[e];
+  const q4k::BlockQ4K* wu = wu_tab[e];
+  if (!wg || !wu) {
+    // absent expert: zero this tile's outputs (combine adds 0), mailbox once
+    if (row < n_rows) {
+      for (int t = 0; t < nt; ++t) {
+        yg[static_cast<size_t>(joff + tok0 + t) * n_rows + row] = 0;
+        yu[static_cast<size_t>(joff + tok0 + t) * n_rows + row] = 0;
+      }
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      const int mi = atomicAdd(mail_n, 1);
+      if (mi < n_expert) mail[mi] = e;
+    }
+    return;
+  }
+  if (row >= n_rows) return;
+
+  for (int t = 0; t < nt; ++t) {
+    stage_bytes(x_sh + static_cast<size_t>(t) * nb, xq + static_cast<size_t>(joff + tok0 + t) * nb,
+                x_row_bytes, threadIdx.x, blockDim.x);
+  }
+  stage_bytes(wg_sh, wg + static_cast<size_t>(row) * nb, w_row_bytes,
+              lane, 32);
+  stage_bytes(wu_sh, wu + static_cast<size_t>(row) * nb, w_row_bytes,
+              lane, 32);
+  __syncthreads();
+
+  const int nsg = nb * 8;
+  for (int t = 0; t < nt; ++t) {
+    const q4k::BlockQ8K* xb_row = x_sh + static_cast<size_t>(t) * nb;
+    float accg = 0.f, accu = 0.f;
+    for (int g = lane; g < nsg; g += 32) {
+      const int blk = g >> 3, sb = g & 7;
+      const float d = __half2float(*reinterpret_cast<const __half*>(&wg_sh[blk].d));
+      const float dmin =
+          __half2float(*reinterpret_cast<const __half*>(&wg_sh[blk].dmin));
+      float sd, sm;
+      unpack_scales6(wg_sh[blk].scales, sb, d, dmin, &sd, &sm);
+      const int dotg =
+          dp4a_subblock(wg_sh[blk].qs + sb * 16, xb_row[blk].qs + sb * 32);
+      accg += xb_row[blk].d * (sd * static_cast<float>(dotg) -
+                       sm * static_cast<float>(xb_row[blk].bsums[sb]));
+      const float d2 = __half2float(*reinterpret_cast<const __half*>(&wu_sh[blk].d));
+      const float dmin2 =
+          __half2float(*reinterpret_cast<const __half*>(&wu_sh[blk].dmin));
+      unpack_scales6(wu_sh[blk].scales, sb, d2, dmin2, &sd, &sm);
+      const int dotu =
+          dp4a_subblock(wu_sh[blk].qs + sb * 16, xb_row[blk].qs + sb * 32);
+      accu += xb_row[blk].d * (sd * static_cast<float>(dotu) -
+                       sm * static_cast<float>(xb_row[blk].bsums[sb]));
+    }
+    #pragma unroll
+    for (int offr = 16; offr > 0; offr >>= 1) {
+      accg += __shfl_down_sync(0xFFFFFFFFu, accg, offr);
+      accu += __shfl_down_sync(0xFFFFFFFFu, accu, offr);
+    }
+    if (lane == 0) {
+      *reinterpret_cast<__half*>(
+          &yg[static_cast<size_t>(joff + tok0 + t) * n_rows + row]) =
+          __float2half(accg);
+      *reinterpret_cast<__half*>(
+          &yu[static_cast<size_t>(joff + tok0 + t) * n_rows + row]) =
+          __float2half(accu);
+    }
+  }
+}
+
+__global__ void gemv_grouped_tab_q4_k_q8_f16out_mtok_kernel(
+    const q4k::BlockQ4K* const* __restrict__ w_tab,
+    const int* __restrict__ off, const int* __restrict__ toff,
+    const int* __restrict__ meta, const q4k::BlockQ8K* __restrict__ xq,
+    uint16_t* __restrict__ y, int n_rows, int k, int n_expert, int tok_per) {
+  extern __shared__ __align__(16) unsigned char smem[];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int nb = k / 256;
+  const int w_row_bytes = nb * static_cast<int>(sizeof(q4k::BlockQ4K));
+  const int x_row_bytes = nb * static_cast<int>(sizeof(q4k::BlockQ8K));
+  q4k::BlockQ4K* w_sh =
+      reinterpret_cast<q4k::BlockQ4K*>(smem + warp * w_row_bytes);
+  q4k::BlockQ8K* x_sh = reinterpret_cast<q4k::BlockQ8K*>(
+      smem + 8 * w_row_bytes);
+
+  if (blockIdx.y >= *meta) return;
+  const int e = mtok_expert_of_tile(toff, n_expert, blockIdx.y);
+  const int joff = off[e];
+  const int jm = off[e + 1] - off[e];
+  const int tok0 = (blockIdx.y - toff[e]) * tok_per;
+  const int nt = min(tok_per, jm - tok0);
+  const int row = blockIdx.x * 8 + warp;
+  if (nt <= 0) return;
+
+  const q4k::BlockQ4K* w = w_tab[e];
+  if (!w) {
+    if (row < n_rows) {
+      for (int t = 0; t < nt; ++t) {
+        y[static_cast<size_t>(joff + tok0 + t) * n_rows + row] = 0;
+      }
+    }
+    return;
+  }
+  if (row >= n_rows) return;
+
+  for (int t = 0; t < nt; ++t) {
+    stage_bytes(x_sh + static_cast<size_t>(t) * nb, xq + static_cast<size_t>(joff + tok0 + t) * nb,
+                x_row_bytes, threadIdx.x, blockDim.x);
+  }
+  stage_bytes(w_sh, w + static_cast<size_t>(row) * nb, w_row_bytes,
+              lane, 32);
+  __syncthreads();
+
+  const int nsg = nb * 8;
+  for (int t = 0; t < nt; ++t) {
+    const q4k::BlockQ8K* xb_row = x_sh + static_cast<size_t>(t) * nb;
+    float acc = 0.f;
+    for (int g = lane; g < nsg; g += 32) {
+      const int blk = g >> 3, sb = g & 7;
+      const q4k::BlockQ4K& b = w_sh[blk];
+      const float d = __half2float(*reinterpret_cast<const __half*>(&b.d));
+      const float dmin =
+          __half2float(*reinterpret_cast<const __half*>(&b.dmin));
+      float sd, sm;
+      unpack_scales6(b.scales, sb, d, dmin, &sd, &sm);
+      const int dot = dp4a_subblock(b.qs + sb * 16, xb_row[blk].qs + sb * 32);
+      acc += xb_row[blk].d * (sd * static_cast<float>(dot) -
+                      sm * static_cast<float>(xb_row[blk].bsums[sb]));
     }
     #pragma unroll
     for (int offr = 16; offr > 0; offr >>= 1) {
@@ -852,6 +1039,79 @@ void gemv_f32_out_f16x_mtok(const float* w, const uint16_t* x, float* y,
 void quantize_q8_k(const uint16_t* x_f16, q4k::BlockQ8K* out, int n,
                    cudaStream_t stream) {
   quantize_q8_k_kernel<<<n / 256, 256, 0, stream>>>(x_f16, out, n);
+}
+
+// device-row-count variant: total = (*d_rows) * row_mult (elements); the
+// grid is bounded by the host with the worst case (bit-identical math).
+__global__ void quantize_q8_k_n_kernel(const uint16_t* x, q4k::BlockQ8K* out,
+                                       const int* d_rows, int row_mult) {
+  __shared__ float red[32];
+  const int b = blockIdx.x;
+  const long long n = static_cast<long long>(*d_rows) * row_mult;
+  if (static_cast<long long>(b) * 256 >= n) return;
+  const int tid = threadIdx.x;
+  const int idx = b * 256 + tid;
+  const float v = (idx < n)
+      ? __half2float(*reinterpret_cast<const __half*>(&x[idx])) : 0.f;
+  float a = fabsf(v);
+
+  const int lane = tid & 31, warp = tid >> 5;
+  #pragma unroll
+  for (int off = 16; off > 0; off >>= 1) a = fmaxf(a, __shfl_down_sync(0xFFFFFFFFu, a, off));
+  if (lane == 0) red[warp] = a;
+  __syncthreads();
+  if (tid == 0) {
+    float m = 1e-30f;
+    const int nw = (blockDim.x + 31) / 32;
+    for (int i = 0; i < nw; ++i) m = fmaxf(m, red[i]);
+    red[0] = m;
+  }
+  __syncthreads();
+  const float amax = red[0];
+  const float d = amax / 127.f;
+  const float id = d > 0.f ? 1.f / d : 0.f;
+  const int q = static_cast<int>(rintf(v * id));
+  if (idx < n) {
+    out[b].qs[tid] = static_cast<int8_t>(max(-127, min(127, q)));
+    out[b].d = d;
+  }
+  __syncthreads();
+  if (tid < 8) {
+    int sum = 0;
+    for (int i = 0; i < 32; ++i) sum += out[b].qs[tid * 32 + i];
+    out[b].bsums[tid] = static_cast<int16_t>(sum);
+  }
+}
+
+void quantize_q8_k_n(const uint16_t* x_f16, q4k::BlockQ8K* out,
+                     const int* d_rows, int row_mult, int n_max,
+                     cudaStream_t stream) {
+  quantize_q8_k_n_kernel<<<n_max / 256, 256, 0, stream>>>(x_f16, out, d_rows,
+                                                          row_mult);
+}
+
+void gemv_grouped2_tab_q4_k_q8_f16out_mtok(
+    const q4k::BlockQ4K* const* wg_tab, const q4k::BlockQ4K* const* wu_tab,
+    const int* off, const int* toff, const int* meta, int* mail, int* mail_n,
+    int tiles_max, const q4k::BlockQ8K* xq, uint16_t* yg, uint16_t* yu,
+    int n_rows, int k, int n_expert, int tok_per, cudaStream_t stream) {
+  const int nb = k / 256;
+  dim3 grid((n_rows + 7) / 8, tiles_max);
+  gemv_grouped2_tab_q4_k_q8_f16out_mtok_kernel<<<grid, 256,
+      mtok_smem(nb, 16, tok_per), stream>>>(
+      wg_tab, wu_tab, off, toff, meta, mail, mail_n, xq, yg, yu, n_rows, k,
+      n_expert, tok_per);
+}
+
+void gemv_grouped_tab_q4_k_q8_f16out_mtok(
+    const q4k::BlockQ4K* const* w_tab, const int* off, const int* toff,
+    const int* meta, int tiles_max, const q4k::BlockQ8K* xq, uint16_t* y,
+    int n_rows, int k, int n_expert, int tok_per, cudaStream_t stream) {
+  const int nb = k / 256;
+  dim3 grid((n_rows + 7) / 8, tiles_max);
+  gemv_grouped_tab_q4_k_q8_f16out_mtok_kernel<<<grid, 256,
+      mtok_smem(nb, 8, tok_per), stream>>>(
+      w_tab, off, toff, meta, xq, y, n_rows, k, n_expert, tok_per);
 }
 
 void gemv_f32_out_f16x(const float* w_f32, const uint16_t* x_f16, float* y,

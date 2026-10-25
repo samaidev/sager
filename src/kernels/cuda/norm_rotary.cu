@@ -140,6 +140,21 @@ __global__ void silu_mul_kernel(uint16_t* out, const uint16_t* g,
   }
 }
 
+// device-total variant: total = (*d_rows) * n_ff, read per block; the grid is
+// bounded by the host with the worst-case row count (bit-identical math).
+__global__ void silu_mul_n_kernel(uint16_t* out, const uint16_t* g,
+                                  const uint16_t* u, const int* d_rows,
+                                  int n_ff) {
+  const long long total = static_cast<long long>(*d_rows) * n_ff;
+  const long long i = static_cast<long long>(blockIdx.x) * blockDim.x +
+                      threadIdx.x;
+  if (i < total) {
+    const float gv = ldh(g + i);
+    const float uv = ldh(u + i);
+    sth(out + i, gv / (1.f + expf(-gv)) * uv);
+  }
+}
+
 
 // ---------------------------------------------------------------------------
 // v0.2.1: qwen3.5 gated attention - out[i] *= sigmoid(gate_row[i]); the gate
@@ -258,6 +273,14 @@ void silu_mul_f16(uint16_t* out, const uint16_t* g, const uint16_t* u,
                   int rows, int n_ff, cudaStream_t stream) {
   const int total = rows * n_ff;
   silu_mul_kernel<<<(total + 255) / 256, 256, 0, stream>>>(out, g, u, total);
+}
+
+void silu_mul_f16_n(uint16_t* out, const uint16_t* g, const uint16_t* u,
+                    const int* d_rows, int rows_max, int n_ff,
+                    cudaStream_t stream) {
+  const long long total = static_cast<long long>(rows_max) * n_ff;
+  silu_mul_n_kernel<<<static_cast<int>((total + 255) / 256), 256, 0, stream>>>(
+      out, g, u, d_rows, n_ff);
 }
 
 

@@ -42,6 +42,12 @@ ExpertPump::~ExpertPump() {
   for (cudaEvent_t e : consumed_ev_) {
     if (e) cudaEventDestroy(e);
   }
+  for (cudaEvent_t e : pair_ev_) {
+    if (e) cudaEventDestroy(e);
+  }
+  for (auto p : tbl_stage_) {
+    if (p) cudaFreeHost(p);
+  }
   for (auto& slabs : loader_slabs_) {
     for (Slab& sb : slabs) {
       if (sb.ev) cudaEventDestroy(sb.ev);
@@ -300,6 +306,28 @@ void ExpertPump::begin_stream(const StreamPlan& plan, void* compute_stream) {
   plan_ = plan;
   stream_next_ = 0;
   done_layer_.store(-1, std::memory_order_relaxed);
+  // v0.4 (P1): per-pair publish events + per-layer plan index ranges. Events
+  // are REUSED across chunks (re-recording is safe: a StreamWaitEvent keeps
+  // the state captured at its own enqueue time).
+  if (pair_ev_.size() < plan.pairs.size()) {
+    const size_t old = pair_ev_.size();
+    pair_ev_.resize(plan.pairs.size(), nullptr);
+    for (size_t i = old; i < pair_ev_.size(); ++i) {
+      if (cudaEventCreateWithFlags(&pair_ev_[i], cudaEventDisableTiming) !=
+          cudaSuccess) {
+        pair_ev_[i] = nullptr;
+        cudaGetLastError();
+      }
+    }
+  }
+  plan_layer_start_.assign(static_cast<size_t>(plan.n_layers) + 1, 0);
+  for (int32_t packed : plan.pairs) {
+    const int l = packed / n_experts_;
+    if (l >= 0 && l < plan.n_layers) ++plan_layer_start_[l + 1];
+  }
+  for (size_t l = 1; l < plan_layer_start_.size(); ++l) {
+    plan_layer_start_[l] += plan_layer_start_[l - 1];
+  }
   // v0.2.4c: a loader killed mid-hunt leaves a stale in-flight marker;
   // never carry it into a new session (the lookup would wait forever).
   for (size_t p = 0; p < slot_of_.size(); ++p) {
@@ -392,6 +420,15 @@ void ExpertPump::stream_start(int pool_fd) {
     bool any = false;
     for (const Slab& sb : loader_slabs_[static_cast<size_t>(t)]) any = sb.ptr != nullptr;
     if (!any) continue;
+    // v0.4 (P1): per-reader pinned 3-pointer stage for the table patch.
+    if (static_cast<int>(tbl_stage_.size()) <= t) tbl_stage_.resize(t + 1, nullptr);
+    if (!tbl_stage_[static_cast<size_t>(t)] && d_table_) {
+      if (cudaMallocHost(&tbl_stage_[static_cast<size_t>(t)],
+                         3 * sizeof(q4k::BlockQ4K*)) != cudaSuccess) {
+        tbl_stage_[static_cast<size_t>(t)] = nullptr;
+        cudaGetLastError();
+      }
+    }
     try {
       loaders_.emplace_back([this, t] { loader_loop(t); });
       // v0.2.5: count the thread here (not inside loader_loop) so a slow
@@ -557,6 +594,57 @@ void ExpertPump::stream_consume_drop(int layer, int expert) {
   ++stats_.stream_drop;
 }
 
+// ---- v0.4 (P1): device-side dispatch support -------------------------------
+
+void ExpertPump::stream_set_table(void* d_table_base, int n_layers,
+                                  int n_experts) {
+  d_table_ = d_table_base;
+  tbl_layers_ = n_layers;
+  tbl_experts_ = n_experts;
+}
+
+void ExpertPump::stream_wait_layer(int layer, void* compute_stream) {
+  if (layer < 0 ||
+      layer + 1 >= static_cast<int>(plan_layer_start_.size())) {
+    return;
+  }
+  auto* s = static_cast<cudaStream_t>(compute_stream);
+  for (int i = plan_layer_start_[layer];
+       i < plan_layer_start_[layer + 1]; ++i) {
+    if (i < static_cast<int>(pair_ev_.size()) && pair_ev_[i]) {
+      cudaStreamWaitEvent(s, pair_ev_[i], 0);
+    }
+  }
+}
+
+void ExpertPump::stream_consume_layer(int layer, void* compute_stream) {
+  if (layer < 0 ||
+      layer + 1 >= static_cast<int>(plan_layer_start_.size())) {
+    return;
+  }
+  auto* s = static_cast<cudaStream_t>(compute_stream);
+  // Snapshot the published slots under the mutex (publishes happen on the
+  // loader threads), then record the consume events stream-side.
+  std::vector<int> slots;
+  {
+    std::lock_guard<std::mutex> lk(stream_mu_);
+    slots.reserve(static_cast<size_t>(plan_layer_start_[layer + 1] -
+                                      plan_layer_start_[layer]));
+    for (int i = plan_layer_start_[layer];
+         i < plan_layer_start_[layer + 1]; ++i) {
+      const int32_t packed = plan_.pairs[static_cast<size_t>(i)];
+      const int slot = slot_of_[static_cast<size_t>(packed)];
+      if (slot >= 0) {
+        slots.push_back(slot);
+        consumed_rec_[static_cast<size_t>(slot)] = 1;
+      }
+    }
+  }
+  for (int slot : slots) {
+    cudaEventRecord(consumed_ev_[static_cast<size_t>(slot)], s);
+  }
+}
+
 void ExpertPump::stream_finish() {
   if (!stream_active_) return;
   stream_active_ = false;
@@ -605,6 +693,11 @@ void ExpertPump::stream_finish() {
 // Loader body: pull the next pair, take a slot (free, or steal a consumed
 // one), stage pool -> pinned slab -> VRAM on the copy stream, publish.
 // Each reader owns its slabs (no cross-thread slab sharing).
+// v0.4 (P1): EVERY exit path records the plan pair's publish event (the
+// compute stream's stream_wait_layer waits on it; a dropped pair must fire
+// it too so the walk never hangs - its rows go to the CPU-pool mailbox),
+// and a successful publish PATCHES the device pointer table row before the
+// event is recorded (same stream -> ordered).
 void ExpertPump::loader_loop(int tid) {
   // v0.2.5: every exit path (plan drained, session off, wedged hunt) must
   // decrement the live count - dispatch gates streaming on it.
@@ -612,6 +705,11 @@ void ExpertPump::loader_loop(int tid) {
     std::atomic<int>& a;
     ~LiveGuard() { a.fetch_sub(1, std::memory_order_relaxed); }
   } lg{live_loaders_};
+  auto record_pair = [this](size_t i) {
+    if (i < pair_ev_.size() && pair_ev_[i]) {
+      cudaEventRecord(pair_ev_[i], copy_stream_);
+    }
+  };
   auto& slabs = loader_slabs_[static_cast<size_t>(tid)];
   size_t slab_i = 0;
   for (;;) {
@@ -653,9 +751,12 @@ void ExpertPump::loader_loop(int tid) {
     // Session progress check 1: the session already passed this layer - the
     // pair will never be consumed, loading it would only clog a slot.
     if (L < done_layer_.load(std::memory_order_relaxed)) {
-      std::lock_guard<std::mutex> lk(stream_mu_);
-      slot_of_[p] = -1;   // clear the in-flight marker: this is a final state
-      ++stats_.stream_skipped;
+      {
+        std::lock_guard<std::mutex> lk(stream_mu_);
+        slot_of_[p] = -1;   // clear the in-flight marker: this is a final state
+        ++stats_.stream_skipped;
+      }
+      record_pair(i);   // v0.4: the wait must not hang on a skipped pair
       continue;
     }
 
@@ -673,7 +774,10 @@ void ExpertPump::loader_loop(int tid) {
     int slot = -1;
     int hunts = 0;
     for (;;) {
-      if (!stream_active_.load(std::memory_order_relaxed)) return;
+      if (!stream_active_.load(std::memory_order_relaxed)) {
+        record_pair(i);
+        return;
+      }
       if (++hunts > 20000) {
         std::lock_guard<std::mutex> lk(stream_mu_);
         slot_of_[p] = -1;
@@ -741,14 +845,20 @@ void ExpertPump::loader_loop(int tid) {
       }
       std::this_thread::sleep_for(std::chrono::microseconds(150));
     }
-    if (slot < 0) continue;   // hunt gave up: pair dropped to CPU fallback
+    if (slot < 0) {
+      record_pair(i);   // v0.4: dropped pair fires its event (CPU fallback)
+      continue;
+    }
 
     // 2. pinned slab of this reader (its DMA must have completed). Bounded
     //    wait: slabs free up as the copy engine drains; a pathological stall
     //    fails the pair instead of hanging the session.
     Slab* sb = nullptr;
     for (int attempt = 0; attempt < 2000 && !sb; ++attempt) {
-      if (!stream_active_.load(std::memory_order_relaxed)) return;
+      if (!stream_active_.load(std::memory_order_relaxed)) {
+        record_pair(i);
+        return;
+      }
       for (int k = 0; k < static_cast<int>(slabs.size()); ++k) {
         Slab& cand = slabs[static_cast<size_t>((slab_i + k) % slabs.size())];
         if (!cand.ptr) continue;
@@ -760,14 +870,17 @@ void ExpertPump::loader_loop(int tid) {
       if (!sb) std::this_thread::sleep_for(std::chrono::microseconds(500));
     }
     if (!sb) {
-      std::lock_guard<std::mutex> lk(stream_mu_);
-      slot_of_[p] = -1;
-      const size_t s = static_cast<size_t>(slot);
-      ring_state_[s] = kRingFree;
-      ring_owned_[s] = 0;
-      owner_l_[s] = -1;
-      owner_e_[s] = -1;
-      ++stats_.read_errors;
+      {
+        std::lock_guard<std::mutex> lk(stream_mu_);
+        slot_of_[p] = -1;
+        const size_t s = static_cast<size_t>(slot);
+        ring_state_[s] = kRingFree;
+        ring_owned_[s] = 0;
+        owner_l_[s] = -1;
+        owner_e_[s] = -1;
+        ++stats_.read_errors;
+      }
+      record_pair(i);
       continue;   // dispatch layer's arm timeout routes this pair to the CPU
     }
 
@@ -783,19 +896,23 @@ void ExpertPump::loader_loop(int tid) {
       if (!copy_ok) cudaGetLastError();
     }
     if (!copy_ok) {
-      std::lock_guard<std::mutex> lk(stream_mu_);
-      slot_of_[p] = -1;
-      const size_t s = static_cast<size_t>(slot);
-      ring_state_[s] = kRingFree;
-      ring_owned_[s] = 0;
-      owner_l_[s] = -1;
-      owner_e_[s] = -1;
-      ++stats_.read_errors;
+      {
+        std::lock_guard<std::mutex> lk(stream_mu_);
+        slot_of_[p] = -1;
+        const size_t s = static_cast<size_t>(slot);
+        ring_state_[s] = kRingFree;
+        ring_owned_[s] = 0;
+        owner_l_[s] = -1;
+        owner_e_[s] = -1;
+        ++stats_.read_errors;
+      }
+      record_pair(i);
       continue;   // dispatch layer's arm timeout routes this pair to the CPU
     }
     cudaEventRecord(events_[static_cast<size_t>(slot)], copy_stream_);
     cudaEventRecord(sb->ev, copy_stream_);
     sb->used = true;
+    bool published = false;
     {
       std::lock_guard<std::mutex> lk(stream_mu_);
       // Session progress check 2: the layer went by while we were copying.
@@ -811,9 +928,36 @@ void ExpertPump::loader_loop(int tid) {
         ring_state_[static_cast<size_t>(slot)] = kRingLoaded;
         ++stats_.stream_pairs;
         stats_.bytes_copied += per_expert_bytes_;
+        published = true;
         stream_cv_.notify_all();
       }
     }
+    // v0.4 (P1): patch the device pointer table row, THEN fire the pair's
+    // publish event (same stream -> the compute stream's wait_layer sees a
+    // valid pointer). Single stage per reader is safe: one stream, FIFO.
+    if (published && d_table_ && tbl_stage_[static_cast<size_t>(tid)]) {
+      auto* stage =
+          reinterpret_cast<q4k::BlockQ4K**>(tbl_stage_[static_cast<size_t>(tid)]);
+      const uint8_t* base = static_cast<const uint8_t*>(arena_) +
+                            static_cast<size_t>(slot) * per_expert_bytes_;
+      const size_t gu = per_expert_bytes_ / 3;
+      stage[0] = reinterpret_cast<q4k::BlockQ4K*>(const_cast<uint8_t*>(base));
+      stage[1] = reinterpret_cast<q4k::BlockQ4K*>(const_cast<uint8_t*>(base + gu));
+      stage[2] = reinterpret_cast<q4k::BlockQ4K*>(const_cast<uint8_t*>(base + 2 * gu));
+      cudaMemcpyAsync(static_cast<q4k::BlockQ4K**>(d_table_) +
+                          (static_cast<size_t>(0) * tbl_layers_ + L) * tbl_experts_ + e,
+                      stage, sizeof(q4k::BlockQ4K*), cudaMemcpyHostToDevice,
+                      copy_stream_);
+      cudaMemcpyAsync(static_cast<q4k::BlockQ4K**>(d_table_) +
+                          (static_cast<size_t>(1) * tbl_layers_ + L) * tbl_experts_ + e,
+                      stage + 1, sizeof(q4k::BlockQ4K*), cudaMemcpyHostToDevice,
+                      copy_stream_);
+      cudaMemcpyAsync(static_cast<q4k::BlockQ4K**>(d_table_) +
+                          (static_cast<size_t>(2) * tbl_layers_ + L) * tbl_experts_ + e,
+                      stage + 2, sizeof(q4k::BlockQ4K*), cudaMemcpyHostToDevice,
+                      copy_stream_);
+    }
+    record_pair(i);
   }
 }
 #endif  // SAGER_HAVE_CUDA
@@ -825,6 +969,9 @@ void ExpertPump::loader_loop(int tid) {
 int ExpertPump::stream_lookup(int, int) { return -1; }
 void ExpertPump::stream_progress(int) {}
 void ExpertPump::stream_finish() {}
+void ExpertPump::stream_set_table(void*, int, int) {}
+void ExpertPump::stream_wait_layer(int, void*) {}
+void ExpertPump::stream_consume_layer(int, void*) {}
 #endif
 
 }  // namespace sager

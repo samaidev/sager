@@ -107,6 +107,53 @@ void gemv_grouped_q4_k_q8_f16out_mtok(
     const q4k::BlockQ8K* xq, uint16_t* y, int n_rows, int k, int tok_per,
     cudaStream_t stream);
 
+// ---- v0.4 device-side dispatch kernels (P1) ---------------------------------
+// The grouped plan is built ON DEVICE by moe_dispatch_scan (histogram +
+// prefix sums + row scatter); the GEMMs derive their (expert, tile) mapping
+// from off[]/toff[] and read per-expert weights from the chunk pointer table
+// (null pointer = expert absent -> outputs zeroed, expert id mailed to the
+// host for the CPU-pool patch). All bit-exact vs the host-compacted path.
+//
+// One block over the routed ids of a layer: writes off[E+1] (row prefix),
+// toff[E+1] (tile prefix), meta{R, tiles, bad_rows}, gslot/grows (grouped
+// order), and zeroes the weights of bounds-invalid rows. tok_per = GEMM tile.
+void moe_dispatch_scan(const int* idx, float* weight, int* gslot, int* grows,
+                       int* off, int* toff, int* meta, int* mail, int* mail_n,
+                       int n_rows, int k, int n_expert, int tok_per,
+                       cudaStream_t stream);
+
+// Device-count variants: the row/element count lives in device memory
+// (meta[0] resp. meta[0]*n_ff); the host only bounds the launch grid.
+void gather_rows_q8_n(q4k::BlockQ8K* dst, const q4k::BlockQ8K* src,
+                      const int* src_rows, const int* meta, int r_max,
+                      int row_blocks, cudaStream_t stream);
+void silu_mul_f16_n(uint16_t* out, const uint16_t* g, const uint16_t* u,
+                    const int* d_rows, int rows_max, int n_ff,
+                    cudaStream_t stream);
+void quantize_q8_k_n(const uint16_t* x_f16, q4k::BlockQ8K* out,
+                     const int* d_rows, int row_mult, int n_max,
+                     cudaStream_t stream);
+
+// Grouped fused gate+up driven by the device plan (meta[1] tiles).
+void gemv_grouped2_tab_q4_k_q8_f16out_mtok(
+    const q4k::BlockQ4K* const* wg_tab, const q4k::BlockQ4K* const* wu_tab,
+    const int* off, const int* toff, const int* meta, int* mail, int* mail_n,
+    int tiles_max, const q4k::BlockQ8K* xq, uint16_t* yg, uint16_t* yu,
+    int n_rows, int k, int n_expert, int tok_per, cudaStream_t stream);
+
+// Grouped down projection driven by the device plan.
+void gemv_grouped_tab_q4_k_q8_f16out_mtok(
+    const q4k::BlockQ4K* const* w_tab, const int* off, const int* toff,
+    const int* meta, int tiles_max, const q4k::BlockQ8K* xq, uint16_t* y,
+    int n_rows, int k, int n_expert, int tok_per, cudaStream_t stream);
+
+// CPU-pool patch: x[row] += weight[slot] * expert_y[slot] for the packed
+// (row * (n_used+1) + kk) slots in rk[0..n_list) - late add of the rows the
+// device path left at zero (absent experts), after the batched combine ran.
+void moe_combine_add_slots_f16(uint16_t* out, const uint16_t* expert_y,
+                               const float* weight, const int* rk, int n_used,
+                               int hidden, int n_list, cudaStream_t stream);
+
 // Router logits, tiled multi-token (fp32 W, fp16 x, fp32 out; accumulation
 // order per (row, token) preserved -> logits bit-identical to the batched
 // router).

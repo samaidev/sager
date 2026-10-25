@@ -143,6 +143,40 @@ json::Value load_cmd(EngineState& es, const json::Value& req) {
   out["graphs"] = es.session->graphs().valid();
   out["hot_experts"] = static_cast<int64_t>(es.cache->stats().resident_count);
   out["hot_capacity"] = static_cast<int64_t>(es.cache->capacity());
+  // v0.4 diag: full geometry dump - a silently-stale default (a GGUF key the
+  // parser missed) produces coherent-speed garbage, so make it visible.
+  SLOG_I("config",
+         "dims: layer=%d head=%d kv_head=%d head_dim=%d hidden=%d ff=%d "
+         "expert=%d used=%d ff_exp=%d vocab=%d moe_layer=%d shared=%d "
+         "gdn(k=%d v=%d kdim=%d vdim=%d conv=%d) rope(theta=%f partial=%f "
+         "style=%d mrope=%d) eps=%f linear_layers=%d",
+         d.n_layer, d.n_head, d.n_head_kv, d.head_dim, d.hidden, d.n_ff,
+         d.n_expert, d.n_expert_used, d.n_ff_exp, d.n_vocab, d.n_moe_layer,
+         d.shared_expert, d.n_gdn_k_heads, d.n_gdn_v_heads, d.gdn_key_dim,
+         d.gdn_value_dim, d.gdn_conv_kernel, es.mc.rope_theta,
+         es.mc.rope_partial, es.mc.rope_style, (int)es.mc.use_mrope,
+         es.mc.norm_eps, es.mc.n_linear());
+  // v0.4 diag: every GGUF KV key (config audit against the source model).
+  {
+    const auto& kvs = es.file->kv();
+    SLOG_I("config", "gguf kv count=%d", (int)kvs.size());
+    using VT = decltype(kvs.begin()->second.type);
+    for (const auto& kv : kvs) {
+      std::string v;
+      switch (kv.second.type) {
+        case VT::string: v = kv.second.str; break;
+        case VT::array:
+          v = "[arr et=" + std::to_string(static_cast<int>(kv.second.elem_type)) +
+              " n=" + std::to_string(kv.second.elem_count) + "]";
+          break;
+        case VT::f32: case VT::f64:
+          v = std::to_string(kv.second.f64v); break;
+        default:
+          v = std::to_string((uint64_t)kv.second.u64v); break;
+      }
+      SLOG_I("config", "ggufkv %s = %s", kv.first.c_str(), v.c_str());
+    }
+  }
   return out;
 }
 

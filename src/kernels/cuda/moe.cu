@@ -304,4 +304,144 @@ void scatter_rows_generic_f16(uint16_t* dst, const float* src,
                                                           hidden);
 }
 
+// ---------------------------------------------------------------------------
+// v0.4 device-side expert dispatch (P1): build the whole grouped plan of a
+// layer ON DEVICE - no per-layer D2H sync, no host bookkeeping, no job-table
+// uploads. One block: histogram of the routed ids, exclusive prefix sums for
+// rows (off) and GEMM tiles (toff), row scatter to expert-major order, and a
+// mailbox of experts whose weights are absent (null pointer in the chunk
+// pointer table -> CPU-pool patch runs after the layer, off the hot path).
+// meta[0] = total valid routed rows R, meta[1] = total GEMM tiles,
+// meta[2] = rows killed by bounds validation.
+// ---------------------------------------------------------------------------
+__global__ void moe_dispatch_scan_kernel(const int* idx, float* weight,
+                                         int* gslot, int* grows, int* off,
+                                         int* toff, int* meta, int* mail,
+                                         int* mail_n, int n_rows, int k,
+                                         int n_expert, int tok_per) {
+  extern __shared__ int smem[];          // hist[n_expert] + fill[n_expert]
+  int* hist = smem;
+  int* fill = smem + n_expert;
+  const int tid = threadIdx.x;
+  const int nth = blockDim.x;
+  if (tid == 0) {
+    meta[0] = 0;
+    meta[1] = 0;
+    meta[2] = 0;
+    *mail_n = 0;
+  }
+  for (int e = tid; e < n_expert; e += nth) hist[e] = 0;
+  __syncthreads();
+
+  // pass 1: histogram + bounds validation (corrupt ids zero the whole row)
+  const int total = n_rows * k;
+  for (int i = tid; i < total; i += nth) {
+    const int r = i / k;
+    const int kk = i % k;
+    const int e = idx[static_cast<size_t>(r) * (k + 1) + kk];
+    if (e < 0 || e >= n_expert) {
+      float* wr = weight + static_cast<size_t>(r) * (k + 1);
+      for (int q = 0; q <= k; ++q) wr[q] = 0.f;
+      atomicAdd(&meta[2], 1);
+      continue;
+    }
+    atomicAdd(&hist[e], 1);
+  }
+  __syncthreads();
+
+  // exclusive prefix sums (E <= 1024: a single thread is deterministic)
+  if (tid == 0) {
+    int acc = 0, tacc = 0;
+    for (int e = 0; e < n_expert; ++e) {
+      off[e] = acc;
+      toff[e] = tacc;
+      fill[e] = acc;
+      acc += hist[e];
+      tacc += (hist[e] + tok_per - 1) / tok_per;
+    }
+    off[n_expert] = acc;
+    toff[n_expert] = tacc;
+    meta[0] = acc;
+    meta[1] = tacc;
+  }
+  __syncthreads();
+
+  // pass 2: scatter routes to expert-major grouped slots. Order WITHIN an
+  // expert is arbitrary (atomics) - every consumer is position-keyed and the
+  // per-(row, token) accumulation order is unchanged, so results are
+  // bit-identical to the host-compacted path.
+  for (int i = tid; i < total; i += nth) {
+    const int r = i / k;
+    const int kk = i % k;
+    const int e = idx[static_cast<size_t>(r) * (k + 1) + kk];
+    if (e < 0 || e >= n_expert) {
+      gslot[static_cast<size_t>(r) * k + kk] = -1;
+      continue;
+    }
+    const int pos = atomicAdd(&fill[e], 1);
+    gslot[static_cast<size_t>(r) * k + kk] = pos;
+    grows[pos] = r;
+  }
+}
+
+void moe_dispatch_scan(const int* idx, float* weight, int* gslot, int* grows,
+                       int* off, int* toff, int* meta, int* mail, int* mail_n,
+                       int n_rows, int k, int n_expert, int tok_per,
+                       cudaStream_t stream) {
+  const int smem = 2 * n_expert * sizeof(int);
+  moe_dispatch_scan_kernel<<<1, 1024, smem, stream>>>(
+      idx, weight, gslot, grows, off, toff, meta, mail, mail_n, n_rows, k,
+      n_expert, tok_per);
+}
+
+// gather_rows_q8 variant whose row count is read from the device meta block
+// (meta[0]) - the host only bounds the launch grid.
+__global__ void gather_rows_q8_n_kernel(q4k::BlockQ8K* dst,
+                                        const q4k::BlockQ8K* src,
+                                        const int* src_rows, const int* meta,
+                                        int row_blocks) {
+  const int r = blockIdx.y;
+  if (r >= *meta) return;
+  const int b = blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= row_blocks) return;
+  const int src_r = src_rows[r];
+  dst[static_cast<size_t>(r) * row_blocks + b] =
+      src[static_cast<size_t>(src_r) * row_blocks + b];
+}
+
+void gather_rows_q8_n(q4k::BlockQ8K* dst, const q4k::BlockQ8K* src,
+                      const int* src_rows, const int* meta, int r_max,
+                      int row_blocks, cudaStream_t stream) {
+  dim3 block(8), grid((row_blocks + 7) / 8, r_max);
+  gather_rows_q8_n_kernel<<<grid, block, 0, stream>>>(dst, src, src_rows, meta,
+                                                      row_blocks);
+}
+
+// CPU-pool patch: after the batched combine already ran (absent experts
+// contributed 0), add the late CPU results for the patched (row, slot) list.
+// rk[i] packs r * (n_used + 1) + kk.
+__global__ void moe_combine_add_slots_kernel(uint16_t* out,
+                                             const uint16_t* expert_y,
+                                             const float* weight,
+                                             const int* rk, int n_used,
+                                             int hidden, int n_list) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= hidden) return;
+  const int li = blockIdx.y;
+  const size_t slot = static_cast<size_t>(rk[li]);
+  const size_t row = slot / (n_used + 1);
+  const float w = weight[slot];
+  const uint16_t* y = expert_y + slot * hidden + i;
+  float acc = ldh(out + row * hidden + i) + w * ldh(y);
+  sth(out + row * hidden + i, acc);
+}
+
+void moe_combine_add_slots_f16(uint16_t* out, const uint16_t* expert_y,
+                               const float* weight, const int* rk, int n_used,
+                               int hidden, int n_list, cudaStream_t stream) {
+  dim3 block(256), grid((hidden + 255) / 256, n_list);
+  moe_combine_add_slots_kernel<<<grid, block, 0, stream>>>(
+      out, expert_y, weight, rk, n_used, hidden, n_list);
+}
+
 }  // namespace sager::cuda

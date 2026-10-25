@@ -136,23 +136,25 @@ int main() {
 
   // ---- v0.2.3 stream plan: order, residency filter, coverage -------------
   {
-    // 2 layers x 8 experts; pairs (0,1), (0,2), (1,0) are hot-resident.
-    std::vector<uint8_t> res(kLayers * kExperts, 0);
-    res[0 * kExperts + 1] = 1;
-    res[0 * kExperts + 2] = 1;
-    res[1 * kExperts + 0] = 1;
+    // v0.3 semantics: the caller passes the MISS bitmap (1 = needs
+    // streaming; see Session::prefill's stream_begin_chunk). Pairs
+    // (0,1), (0,2), (1,0) are the misses of this chunk.
+    std::vector<uint8_t> miss(kLayers * kExperts, 0);
+    miss[0 * kExperts + 1] = 1;
+    miss[0 * kExperts + 2] = 1;
+    miss[1 * kExperts + 0] = 1;
     ExpertPump::StreamPlan plan =
-        ExpertPump::build_stream_plan(res, kLayers, kExperts);
-    CHECK(static_cast<int>(plan.pairs.size()) == kLayers * kExperts - 3,
-          "plan covers exactly the non-resident pairs");
+        ExpertPump::build_stream_plan(miss, kLayers, kExperts);
+    CHECK(static_cast<int>(plan.pairs.size()) == 3,
+          "plan covers exactly the miss pairs");
     bool ordered = true;
     int last = -1;
     for (int32_t packed : plan.pairs) {
       if (packed <= last) ordered = false;   // strictly (layer asc, id asc)
       last = packed;
       const int L = packed / kExperts, e = packed % kExperts;
-      CHECK(!res[static_cast<size_t>(L) * kExperts + e],
-            "plan never includes a resident pair");
+      CHECK(miss[static_cast<size_t>(L) * kExperts + e],
+            "plan never includes a non-miss pair");
     }
     CHECK(ordered, "plan is stream-ordered (layer, id)");
   }

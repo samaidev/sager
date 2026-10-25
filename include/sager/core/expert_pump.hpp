@@ -265,6 +265,35 @@ class ExpertPump {
   // warm start); ring bookkeeping resets to plain pump state.
   void stream_finish();
 
+  // ---- v0.4 device-side dispatch support (P1) ----------------------------
+  // The session builds a device pointer table [3][n_layers][n_experts] at
+  // chunk start: hot/parked pairs hold real arena/slab pointers, planned
+  // (streaming) pairs hold null. Each loader PATCHES the table row right
+  // after its H2D copy (same stream) and records the pair's event - so the
+  // compute stream, ordered behind that event, always reads a valid pointer.
+  // Call before begin_stream; d_table_base stays session-owned.
+  void stream_set_table(void* d_table_base, int n_layers, int n_experts);
+
+  // Order the compute stream behind EVERY plan pair of `layer` (publish
+  // events; failures record immediately, so a dropped pair can never hang
+  // the walk - its rows fall to the CPU-pool patch via the mailbox).
+  void stream_wait_layer(int layer, void* compute_stream);
+
+  // Record consume markers for every published pair of `layer` on the
+  // compute stream (frees the ring slots after the down GEMM).
+  void stream_consume_layer(int layer, void* compute_stream);
+
+  // Number of plan pairs belonging to `layer` (0 when not streaming).
+  int stream_layer_pairs(int layer) const {
+#if defined(SAGER_HAVE_CUDA)
+    if (layer < 0 || layer + 1 >= static_cast<int>(plan_layer_start_.size()))
+      return 0;
+    return plan_layer_start_[layer + 1] - plan_layer_start_[layer];
+#else
+    (void)layer; return 0;
+#endif
+  }
+
  private:
   size_t sidx(int layer, int expert) const {
     return static_cast<size_t>(layer) * n_experts_ + expert;
@@ -314,6 +343,17 @@ class ExpertPump {
   std::atomic<bool> stream_active_{false};
   std::vector<std::thread> loaders_;
   std::atomic<int> live_loaders_{0};   // v0.2.5: spawned minus exited
+
+  // v0.4 (P1): per-plan-pair publish events + the device pointer table the
+  // loaders patch on publish. pair_ev_[i] is recorded on the copy stream by
+  // the loader that took plan pair i - success OR failure - so a
+  // stream_wait_layer wait can never hang on a dropped pair.
+  std::vector<cudaEvent_t> pair_ev_;          // per plan index (reused)
+  std::vector<int> plan_layer_start_;         // plan index prefix per layer
+  void* d_table_ = nullptr;                   // [3][L][E] BlockQ4K* device
+  int tbl_layers_ = 0;
+  int tbl_experts_ = 0;
+  std::vector<q4k::BlockQ4K*> tbl_stage_;     // per-reader pinned 3-ptr stage
 
   // Requires stream_mu_ held. Releases every slot owned by a pair whose
   // layer is already behind the session (done_layer_): consumed pairs wait

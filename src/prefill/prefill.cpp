@@ -10,6 +10,8 @@
 // checks reusable_prefix() and calls prefill() with just the new suffix.
 #include "sager/core/session.hpp"
 
+#include "../core/layer_internal.hpp"   // HotTier (chunk pointer table build)
+
 #include <vector>
 
 #include "sager/log.hpp"
@@ -53,12 +55,51 @@ Status Session::prefill(const std::vector<int>& ids,
     if (!pump_) return;
     std::vector<uint8_t> miss(
         static_cast<size_t>(mc_.dims.n_moe_layer) * mc_.dims.n_expert, 0);
-    for (int L = 0; L < mc_.dims.n_moe_layer; ++L) {
-      for (int e = 0; e < mc_.dims.n_expert; ++e) {
-        miss[static_cast<size_t>(L) * mc_.dims.n_expert + e] =
+    const int E = mc_.dims.n_expert;
+    const int Lm = mc_.dims.n_moe_layer;
+    for (int L = 0; L < Lm; ++L) {
+      for (int e = 0; e < E; ++e) {
+        miss[static_cast<size_t>(L) * E + e] =
             (cache_.resident(L, e) || pump_->resident(L, e)) ? 0 : 1;
       }
     }
+    // v0.4 (P1): chunk pointer table - [3][n_moe_layer][E] device pointers.
+    // hot slab and parked arena slots hold REAL pointers now; planned pairs
+    // hold null until their loader patches the row on publish (event-fenced).
+    // Built from RESIDENCY ONLY (no routing needed) - one H2D per chunk.
+    for (size_t i = 0; i < h_ptr_table_.count(); ++i) {
+      h_ptr_table_.get()[i] = nullptr;
+    }
+    for (int L = 0; L < Lm; ++L) {
+      for (int e = 0; e < E; ++e) {
+        q4k::BlockQ4K* tri[3] = {nullptr, nullptr, nullptr};
+        if (cache_.resident(L, e)) {
+          const size_t base = (static_cast<size_t>(L) * 3 + 0) * E + e;
+          tri[0] = reinterpret_cast<q4k::BlockQ4K*>(hot_->tables_host[base]);
+          tri[1] = reinterpret_cast<q4k::BlockQ4K*>(
+              hot_->tables_host[base + static_cast<size_t>(E)]);
+          tri[2] = reinterpret_cast<q4k::BlockQ4K*>(
+              hot_->tables_host[base + 2 * static_cast<size_t>(E)]);
+        } else if (pump_->resident(L, e)) {
+          const int pslot = pump_->stream_slot_of(L, e);
+          if (pslot >= 0) {
+            auto* base = const_cast<q4k::BlockQ4K*>(pump_->dev_base(pslot));
+            const size_t gu = hot_->per_expert_bytes / 3 / q4k::kBlockBytes;
+            tri[0] = base;
+            tri[1] = base + gu;
+            tri[2] = base + 2 * gu;
+          }
+        }
+        for (int t = 0; t < 3; ++t) {
+          h_ptr_table_.get()[(static_cast<size_t>(t) * Lm + L) * E + e] =
+              tri[t];
+        }
+      }
+    }
+    cudaMemcpyAsync(d_ptr_table_.get(), h_ptr_table_.get(),
+                    h_ptr_table_.count() * sizeof(q4k::BlockQ4K*),
+                    cudaMemcpyHostToDevice, stream_.get());
+    pump_->stream_set_table(d_ptr_table_.get(), Lm, E);
     ExpertPump::StreamPlan plan = ExpertPump::build_stream_plan(
         miss, mc_.dims.n_moe_layer, mc_.dims.n_expert);
     pump_->begin_stream(plan, stream_.get());
@@ -93,6 +134,11 @@ Status Session::prefill(const std::vector<int>& ids,
       stream_stop();
       return s;
     }
+#if defined(SAGER_HAVE_CUDA)
+    // v0.4: feed the device path's route decisions into the residency decay
+    // (one bulk pass per chunk; syncs the stream at the chunk boundary).
+    drain_expert_touch(static_cast<int>(part.size()));
+#endif
     done = end;
     if (cb.on_prefill_progress) {
       cb.on_prefill_progress(static_cast<int>(done), n_chunks * chunk);

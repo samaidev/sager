@@ -154,6 +154,9 @@ class Session {
   void   moe_dispatch(int layer);                       // eager MoE half (row 0)
   void   moe_dispatch_row(int layer, int row);          // eager MoE for row r
   void   moe_dispatch_batched(int layer, int n);        // v0.2.3 whole-chunk MoE
+  void   moe_dispatch_device(int layer, int n);         // v0.4 device-side dispatch
+  void   resolve_cpu_mailbox(int layer, int n);         // v0.4 CPU-pool patch
+  void   drain_expert_touch(int n_rows);                // v0.4 chunk-level touch feed
   void   linear_layer_chunk(int layer, int n);          // v0.3 batched GDN walk
   void   head_launch();                                 // final norm+head
   void   head_launch_row(int row);                      // per-row head (prefill tail)
@@ -241,6 +244,23 @@ class Session {
   PinnedBuffer<q4k::BlockQ4K*> h_job_wg_, h_job_wu_, h_job_wo_;
   PinnedBuffer<int>      h_job_off_, h_job_m_, h_job_tbase_, h_job_jot_;
   bool pf_mtok_ = true;      // SAGER_MTOK=0 -> v0.2.3 batched kernels
+  // v0.4 device-side expert dispatch (P1): chunk pointer table + device plan
+  DeviceBuffer<q4k::BlockQ4K*> d_ptr_table_;   // [3][n_moe_layer][E] weights
+  PinnedBuffer<q4k::BlockQ4K*> h_ptr_table_;   // chunk-start staging
+  DeviceBuffer<int>      d_off_, d_toff_;      // [E+1] row / tile prefixes
+  DeviceBuffer<int>      d_meta_;              // {R, tiles, bad_rows}
+  DeviceBuffer<int>      d_mail_, d_mail_n_;   // absent-expert mailbox
+  PinnedBuffer<int>      h_mail_n_;            // async mirror of d_mail_n_
+  // CPU-pool patch staging (anomaly path only)
+  PinnedBuffer<int>      h_mail_, h_off_;
+  DeviceBuffer<int>      d_rk_;
+  PinnedBuffer<int>      h_rk_;
+  PinnedBuffer<int>      h_touch_idx_;         // [n_moe_layer][RT][K+1] async
+                                               // route-id mirror for touch
+  cudaEvent_t            ev_scan_ = nullptr;   // dispatch-scan completion
+  bool pf_device_ = true;    // SAGER_PF_DEVICE=0 -> v0.3 host dispatch
+  int  mail_pending_ = -1;   // v0.4: layer whose CPU mailbox is unresolved
+  int  pf_rt_ = 0;           // v0.4: batched route-slab row capacity (RT)
 #endif
 
   int pos_ = 0;
