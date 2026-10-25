@@ -72,6 +72,22 @@ cmake --build build -j
 ctest --test-dir build          # host-side Q4 contract tests (no GPU needed)
 ```
 
+### Prebuilt expert residency pool (skip the ~30-minute pool build)
+
+The 18,119,393,280-byte expert residency pool for `Sage-A1.5-Q4_K_M.gguf`
+(21,713,463,520 B, sha256 a64fe0bb…) is published for direct reuse. Download
+it once, point `SAGER_EXPERT_POOL_FILE` at it, and set
+`SAGER_EXPERT_POOL_REUSE=1` — the loader trusts a same-size pool file and
+skips the cold build:
+
+- Hugging Face: [tchbcb/sager-t4-cuda-artifacts](https://huggingface.co/tchbcb/sager-t4-cuda-artifacts) → `Sage-A1.5-Q4_K_M-expert-pool.bin`
+- ModelScope: [luoyunlan168/sager-t4-cuda-artifacts](https://www.modelscope.cn/models/luoyunlan168/sager-t4-cuda-artifacts) → `Sage-A1.5-Q4_K_M-expert-pool.bin`
+
+预构建专家驻留池（免约 30 分钟构建）：Sage-A1.5-Q4_K_M 对应的 18.1 GB
+`pool.bin` 已发布到上面两个镜像仓。下载后
+`SAGER_EXPERT_POOL_FILE=<路径> SAGER_EXPERT_POOL_REUSE=1` 即可直接复用
+（size 匹配即信任，无需重建）。编译产物同理在两个镜像仓的 release 区。
+
 Optional end-to-end GPU smoke (synthetic 1.3B model; exercises graph capture,
 chunked prefill, the hot/miss tiers and the CPU pool on real hardware):
 

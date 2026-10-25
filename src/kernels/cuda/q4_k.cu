@@ -10,6 +10,8 @@
 
 #include <cuda_fp16.h>
 
+#include <cstdlib>
+
 namespace sager::cuda {
 namespace {
 
@@ -824,6 +826,535 @@ __global__ void gemv_grouped_tab_q4_k_q8_f16out_mtok_kernel(
   }
 }
 
+// ---------------------------------------------------------------------------
+// v0.5 mtok reorder (SAGER_MTOK_REORDER, default on): the W-side per-sub-block
+// state (6-bit scale unpack + nibble de-interleave into dp4a-ready words) is
+// hoisted OUT of the token loop and precomputed once per (row, lane group)
+// into registers. The per-(token, sub-block) inner work shrinks from ~86 ALU
+// to 8 dp4a + 2 FMA + 8 LDS. Bit-exact: each (row, token) still accumulates
+// its sub-block terms in ascending-g order (g = lane + gi*32, gi ascending)
+// and the same per-token warp-shuffle reduction runs afterwards.
+// NG = max groups per lane = ceil(nsg/32) = ceil(nb/4); k <= 4096 -> NG <= 4.
+// ---------------------------------------------------------------------------
+struct MtokGState {
+  float sd, sm;        // unpacked 6-bit scale / min (post d, dmin multiply)
+  uint32_t wp[8];      // de-interleaved nibbles, dp4a operand layout
+};
+
+__device__ __forceinline__ void mtok_g_load(const q4k::BlockQ4K& b, int sb,
+                                            MtokGState& st) {
+  const float d = __half2float(*reinterpret_cast<const __half*>(&b.d));
+  const float dmin = __half2float(*reinterpret_cast<const __half*>(&b.dmin));
+  unpack_scales6(b.scales, sb, d, dmin, &st.sd, &st.sm);
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const uint32_t raw =
+        *reinterpret_cast<const uint16_t*>(b.qs + sb * 16 + i * 2);
+    st.wp[i] = (raw & 0xFu) | ((raw & 0xF0u) << 4) | ((raw & 0xF00u) << 8) |
+               ((raw & 0xF000u) << 12);
+  }
+}
+
+__device__ __forceinline__ float mtok_g_dot(const MtokGState& st,
+                                            const q4k::BlockQ8K& xb, int sb) {
+  const int8_t* xq32 = xb.qs + sb * 32;
+  int dot = 0;
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    dot = __dp4a(static_cast<int>(st.wp[i]),
+                 *reinterpret_cast<const int*>(xq32 + i * 4), dot);
+  }
+  return xb.d * (st.sd * static_cast<float>(dot) -
+                 st.sm * static_cast<float>(xb.bsums[sb]));
+}
+
+template <int NG>
+__global__ void gemv_mtok_ro_kernel(
+    const q4k::BlockQ4K* __restrict__ w, const q4k::BlockQ8K* __restrict__ xq,
+    uint16_t* __restrict__ y, int n_rows, int k, int n_tokens, int tok_per) {
+  extern __shared__ __align__(16) unsigned char smem[];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int nb = k / 256;
+  const int w_row_bytes = nb * static_cast<int>(sizeof(q4k::BlockQ4K));
+  const int x_row_bytes = nb * static_cast<int>(sizeof(q4k::BlockQ8K));
+  q4k::BlockQ4K* w_sh =
+      reinterpret_cast<q4k::BlockQ4K*>(smem + warp * w_row_bytes);
+  q4k::BlockQ8K* x_sh = reinterpret_cast<q4k::BlockQ8K*>(
+      smem + 8 * w_row_bytes);
+
+  const int row = blockIdx.x * 8 + warp;
+  const int tok0 = blockIdx.y * tok_per;
+  const int nt = min(tok_per, n_tokens - tok0);
+  if (nt <= 0) return;
+
+  for (int t = 0; t < nt; ++t) {
+    stage_bytes(x_sh + static_cast<size_t>(t) * nb,
+                xq + static_cast<size_t>(tok0 + t) * nb, x_row_bytes,
+                threadIdx.x, blockDim.x);
+  }
+  if (row < n_rows) {
+    stage_bytes(w_sh, w + static_cast<size_t>(row) * nb, w_row_bytes, lane, 32);
+  }
+  __syncthreads();
+  if (row >= n_rows) return;
+
+  const int nsg = nb * 8;
+  MtokGState st[NG];
+  int blk_of[NG], sb_of[NG];
+  #pragma unroll
+  for (int gi = 0; gi < NG; ++gi) {
+    const int g = lane + gi * 32;
+    blk_of[gi] = -1;
+    sb_of[gi] = 0;
+    if (g < nsg) {
+      blk_of[gi] = g >> 3;
+      sb_of[gi] = g & 7;
+      mtok_g_load(w_sh[blk_of[gi]], sb_of[gi], st[gi]);
+    }
+  }
+
+  for (int t = 0; t < nt; ++t) {
+    const q4k::BlockQ8K* xb_row = x_sh + static_cast<size_t>(t) * nb;
+    float acc = 0.f;
+    #pragma unroll
+    for (int gi = 0; gi < NG; ++gi) {
+      if (blk_of[gi] >= 0)
+        acc += mtok_g_dot(st[gi], xb_row[blk_of[gi]], sb_of[gi]);
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+    }
+    if (lane == 0) {
+      *reinterpret_cast<__half*>(
+          &y[static_cast<size_t>(tok0 + t) * n_rows + row]) =
+          __float2half(acc);
+    }
+  }
+}
+
+// Fused gate+up reorder: two weight matrices share the staged X rows.
+template <int NG>
+__global__ void gemv2_mtok_ro_kernel(
+    const q4k::BlockQ4K* __restrict__ wg, const q4k::BlockQ4K* __restrict__ wu,
+    const q4k::BlockQ8K* __restrict__ xq, uint16_t* __restrict__ yg,
+    uint16_t* __restrict__ yu, int n_rows, int k, int n_tokens, int tok_per) {
+  extern __shared__ __align__(16) unsigned char smem[];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int nb = k / 256;
+  const int w_row_bytes = nb * static_cast<int>(sizeof(q4k::BlockQ4K));
+  const int x_row_bytes = nb * static_cast<int>(sizeof(q4k::BlockQ8K));
+  q4k::BlockQ4K* wg_sh =
+      reinterpret_cast<q4k::BlockQ4K*>(smem + warp * w_row_bytes);
+  q4k::BlockQ4K* wu_sh =
+      reinterpret_cast<q4k::BlockQ4K*>(smem + (8 + warp) * w_row_bytes);
+  q4k::BlockQ8K* x_sh = reinterpret_cast<q4k::BlockQ8K*>(
+      smem + 16 * w_row_bytes);
+
+  const int row = blockIdx.x * 8 + warp;
+  const int tok0 = blockIdx.y * tok_per;
+  const int nt = min(tok_per, n_tokens - tok0);
+  if (nt <= 0) return;
+
+  for (int t = 0; t < nt; ++t) {
+    stage_bytes(x_sh + static_cast<size_t>(t) * nb,
+                xq + static_cast<size_t>(tok0 + t) * nb, x_row_bytes,
+                threadIdx.x, blockDim.x);
+  }
+  if (row < n_rows) {
+    stage_bytes(wg_sh, wg + static_cast<size_t>(row) * nb, w_row_bytes, lane, 32);
+    stage_bytes(wu_sh, wu + static_cast<size_t>(row) * nb, w_row_bytes, lane, 32);
+  }
+  __syncthreads();
+  if (row >= n_rows) return;
+
+  const int nsg = nb * 8;
+  MtokGState stg[NG], stu[NG];
+  int blk_of[NG], sb_of[NG];
+  #pragma unroll
+  for (int gi = 0; gi < NG; ++gi) {
+    const int g = lane + gi * 32;
+    blk_of[gi] = -1;
+    sb_of[gi] = 0;
+    if (g < nsg) {
+      blk_of[gi] = g >> 3;
+      sb_of[gi] = g & 7;
+      mtok_g_load(wg_sh[blk_of[gi]], sb_of[gi], stg[gi]);
+      mtok_g_load(wu_sh[blk_of[gi]], sb_of[gi], stu[gi]);
+    }
+  }
+
+  for (int t = 0; t < nt; ++t) {
+    const q4k::BlockQ8K* xb_row = x_sh + static_cast<size_t>(t) * nb;
+    float accg = 0.f, accu = 0.f;
+    #pragma unroll
+    for (int gi = 0; gi < NG; ++gi) {
+      if (blk_of[gi] < 0) continue;
+      const int blk = blk_of[gi], sb = sb_of[gi];
+      accg += mtok_g_dot(stg[gi], xb_row[blk], sb);
+      accu += mtok_g_dot(stu[gi], xb_row[blk], sb);
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      accg += __shfl_down_sync(0xFFFFFFFFu, accg, off);
+      accu += __shfl_down_sync(0xFFFFFFFFu, accu, off);
+    }
+    if (lane == 0) {
+      *reinterpret_cast<__half*>(
+          &yg[static_cast<size_t>(tok0 + t) * n_rows + row]) =
+          __float2half(accg);
+      *reinterpret_cast<__half*>(
+          &yu[static_cast<size_t>(tok0 + t) * n_rows + row]) =
+          __float2half(accu);
+    }
+  }
+}
+
+// v0.3 host-plan grouped fused gate+up reorder.
+template <int NG>
+__global__ void gemv_grouped2_mtok_ro_kernel(
+    const q4k::BlockQ4K* const* __restrict__ wg,
+    const q4k::BlockQ4K* const* __restrict__ wu, const int* __restrict__ off,
+    const int* __restrict__ m, const int* __restrict__ tile_base,
+    const int* __restrict__ job_of_tile, const q4k::BlockQ8K* __restrict__ xq,
+    uint16_t* __restrict__ yg, uint16_t* __restrict__ yu, int n_rows, int k,
+    int tok_per) {
+  extern __shared__ __align__(16) unsigned char smem[];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int nb = k / 256;
+  const int w_row_bytes = nb * static_cast<int>(sizeof(q4k::BlockQ4K));
+  const int x_row_bytes = nb * static_cast<int>(sizeof(q4k::BlockQ8K));
+  q4k::BlockQ4K* wg_sh =
+      reinterpret_cast<q4k::BlockQ4K*>(smem + warp * w_row_bytes);
+  q4k::BlockQ4K* wu_sh =
+      reinterpret_cast<q4k::BlockQ4K*>(smem + (8 + warp) * w_row_bytes);
+  q4k::BlockQ8K* x_sh = reinterpret_cast<q4k::BlockQ8K*>(
+      smem + 16 * w_row_bytes);
+
+  const int row = blockIdx.x * 8 + warp;
+  const int job = job_of_tile[blockIdx.y];
+  const int joff = off[job];
+  const int jm = m[job];
+  const int tok0 = (blockIdx.y - tile_base[job]) * tok_per;
+  const int nt = min(tok_per, jm - tok0);
+  if (nt <= 0 || row >= n_rows) return;
+
+  for (int t = 0; t < nt; ++t) {
+    stage_bytes(x_sh + static_cast<size_t>(t) * nb,
+                xq + static_cast<size_t>(joff + tok0 + t) * nb, x_row_bytes,
+                threadIdx.x, blockDim.x);
+  }
+  stage_bytes(wg_sh, wg[job] + static_cast<size_t>(row) * nb, w_row_bytes,
+              lane, 32);
+  stage_bytes(wu_sh, wu[job] + static_cast<size_t>(row) * nb, w_row_bytes,
+              lane, 32);
+  __syncthreads();
+
+  const int nsg = nb * 8;
+  MtokGState stg[NG], stu[NG];
+  int blk_of[NG], sb_of[NG];
+  #pragma unroll
+  for (int gi = 0; gi < NG; ++gi) {
+    const int g = lane + gi * 32;
+    blk_of[gi] = -1;
+    sb_of[gi] = 0;
+    if (g < nsg) {
+      blk_of[gi] = g >> 3;
+      sb_of[gi] = g & 7;
+      mtok_g_load(wg_sh[blk_of[gi]], sb_of[gi], stg[gi]);
+      mtok_g_load(wu_sh[blk_of[gi]], sb_of[gi], stu[gi]);
+    }
+  }
+
+  for (int t = 0; t < nt; ++t) {
+    const q4k::BlockQ8K* xb_row = x_sh + static_cast<size_t>(t) * nb;
+    float accg = 0.f, accu = 0.f;
+    #pragma unroll
+    for (int gi = 0; gi < NG; ++gi) {
+      if (blk_of[gi] < 0) continue;
+      const int blk = blk_of[gi], sb = sb_of[gi];
+      accg += mtok_g_dot(stg[gi], xb_row[blk], sb);
+      accu += mtok_g_dot(stu[gi], xb_row[blk], sb);
+    }
+    #pragma unroll
+    for (int offr = 16; offr > 0; offr >>= 1) {
+      accg += __shfl_down_sync(0xFFFFFFFFu, accg, offr);
+      accu += __shfl_down_sync(0xFFFFFFFFu, accu, offr);
+    }
+    if (lane == 0) {
+      *reinterpret_cast<__half*>(
+          &yg[static_cast<size_t>(joff + tok0 + t) * n_rows + row]) =
+          __float2half(accg);
+      *reinterpret_cast<__half*>(
+          &yu[static_cast<size_t>(joff + tok0 + t) * n_rows + row]) =
+          __float2half(accu);
+    }
+  }
+}
+
+// v0.3 host-plan grouped single-matrix (down) reorder.
+template <int NG>
+__global__ void gemv_grouped_mtok_ro_kernel(
+    const q4k::BlockQ4K* const* __restrict__ w, const int* __restrict__ off,
+    const int* __restrict__ m, const int* __restrict__ tile_base,
+    const int* __restrict__ job_of_tile, const q4k::BlockQ8K* __restrict__ xq,
+    uint16_t* __restrict__ y, int n_rows, int k, int tok_per) {
+  extern __shared__ __align__(16) unsigned char smem[];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int nb = k / 256;
+  const int w_row_bytes = nb * static_cast<int>(sizeof(q4k::BlockQ4K));
+  const int x_row_bytes = nb * static_cast<int>(sizeof(q4k::BlockQ8K));
+  q4k::BlockQ4K* w_sh =
+      reinterpret_cast<q4k::BlockQ4K*>(smem + warp * w_row_bytes);
+  q4k::BlockQ8K* x_sh = reinterpret_cast<q4k::BlockQ8K*>(
+      smem + 8 * w_row_bytes);
+
+  const int row = blockIdx.x * 8 + warp;
+  const int job = job_of_tile[blockIdx.y];
+  const int joff = off[job];
+  const int jm = m[job];
+  const int tok0 = (blockIdx.y - tile_base[job]) * tok_per;
+  const int nt = min(tok_per, jm - tok0);
+  if (nt <= 0 || row >= n_rows) return;
+
+  for (int t = 0; t < nt; ++t) {
+    stage_bytes(x_sh + static_cast<size_t>(t) * nb,
+                xq + static_cast<size_t>(joff + tok0 + t) * nb, x_row_bytes,
+                threadIdx.x, blockDim.x);
+  }
+  stage_bytes(w_sh, w[job] + static_cast<size_t>(row) * nb, w_row_bytes,
+              lane, 32);
+  __syncthreads();
+
+  const int nsg = nb * 8;
+  MtokGState st[NG];
+  int blk_of[NG], sb_of[NG];
+  #pragma unroll
+  for (int gi = 0; gi < NG; ++gi) {
+    const int g = lane + gi * 32;
+    blk_of[gi] = -1;
+    sb_of[gi] = 0;
+    if (g < nsg) {
+      blk_of[gi] = g >> 3;
+      sb_of[gi] = g & 7;
+      mtok_g_load(w_sh[blk_of[gi]], sb_of[gi], st[gi]);
+    }
+  }
+
+  for (int t = 0; t < nt; ++t) {
+    const q4k::BlockQ8K* xb_row = x_sh + static_cast<size_t>(t) * nb;
+    float acc = 0.f;
+    #pragma unroll
+    for (int gi = 0; gi < NG; ++gi) {
+      if (blk_of[gi] >= 0)
+        acc += mtok_g_dot(st[gi], xb_row[blk_of[gi]], sb_of[gi]);
+    }
+    #pragma unroll
+    for (int offr = 16; offr > 0; offr >>= 1) {
+      acc += __shfl_down_sync(0xFFFFFFFFu, acc, offr);
+    }
+    if (lane == 0) {
+      *reinterpret_cast<__half*>(
+          &y[static_cast<size_t>(joff + tok0 + t) * n_rows + row]) =
+          __float2half(acc);
+    }
+  }
+}
+
+// v0.4 device-plan grouped fused gate+up reorder (pointer table variant).
+template <int NG>
+__global__ void gemv_grouped2_tab_mtok_ro_kernel(
+    const q4k::BlockQ4K* const* __restrict__ wg_tab,
+    const q4k::BlockQ4K* const* __restrict__ wu_tab, const int* __restrict__ off,
+    const int* __restrict__ toff, const int* __restrict__ meta,
+    int* __restrict__ mail, int* __restrict__ mail_n,
+    const q4k::BlockQ8K* __restrict__ xq, uint16_t* __restrict__ yg,
+    uint16_t* __restrict__ yu, int n_rows, int k, int n_expert, int tok_per) {
+  extern __shared__ __align__(16) unsigned char smem[];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int nb = k / 256;
+  const int w_row_bytes = nb * static_cast<int>(sizeof(q4k::BlockQ4K));
+  const int x_row_bytes = nb * static_cast<int>(sizeof(q4k::BlockQ8K));
+  q4k::BlockQ4K* wg_sh =
+      reinterpret_cast<q4k::BlockQ4K*>(smem + warp * w_row_bytes);
+  q4k::BlockQ4K* wu_sh =
+      reinterpret_cast<q4k::BlockQ4K*>(smem + (8 + warp) * w_row_bytes);
+  q4k::BlockQ8K* x_sh = reinterpret_cast<q4k::BlockQ8K*>(
+      smem + 16 * w_row_bytes);
+
+  if (blockIdx.y >= *meta) return;
+  const int e = mtok_expert_of_tile(toff, n_expert, blockIdx.y);
+  const int joff = off[e];
+  const int jm = off[e + 1] - off[e];
+  const int tok0 = (blockIdx.y - toff[e]) * tok_per;
+  const int nt = min(tok_per, jm - tok0);
+  const int row = blockIdx.x * 8 + warp;
+  if (nt <= 0) return;
+
+  const q4k::BlockQ4K* wg = wg_tab[e];
+  const q4k::BlockQ4K* wu = wu_tab[e];
+  if (!wg || !wu) {
+    if (row < n_rows) {
+      for (int t = 0; t < nt; ++t) {
+        yg[static_cast<size_t>(joff + tok0 + t) * n_rows + row] = 0;
+        yu[static_cast<size_t>(joff + tok0 + t) * n_rows + row] = 0;
+      }
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      const int mi = atomicAdd(mail_n, 1);
+      if (mi < n_expert) mail[mi] = e;
+    }
+    return;
+  }
+  if (row >= n_rows) return;
+
+  for (int t = 0; t < nt; ++t) {
+    stage_bytes(x_sh + static_cast<size_t>(t) * nb,
+                xq + static_cast<size_t>(joff + tok0 + t) * nb, x_row_bytes,
+                threadIdx.x, blockDim.x);
+  }
+  stage_bytes(wg_sh, wg + static_cast<size_t>(row) * nb, w_row_bytes, lane, 32);
+  stage_bytes(wu_sh, wu + static_cast<size_t>(row) * nb, w_row_bytes, lane, 32);
+  __syncthreads();
+
+  const int nsg = nb * 8;
+  MtokGState stg[NG], stu[NG];
+  int blk_of[NG], sb_of[NG];
+  #pragma unroll
+  for (int gi = 0; gi < NG; ++gi) {
+    const int g = lane + gi * 32;
+    blk_of[gi] = -1;
+    sb_of[gi] = 0;
+    if (g < nsg) {
+      blk_of[gi] = g >> 3;
+      sb_of[gi] = g & 7;
+      mtok_g_load(wg_sh[blk_of[gi]], sb_of[gi], stg[gi]);
+      mtok_g_load(wu_sh[blk_of[gi]], sb_of[gi], stu[gi]);
+    }
+  }
+
+  for (int t = 0; t < nt; ++t) {
+    const q4k::BlockQ8K* xb_row = x_sh + static_cast<size_t>(t) * nb;
+    float accg = 0.f, accu = 0.f;
+    #pragma unroll
+    for (int gi = 0; gi < NG; ++gi) {
+      if (blk_of[gi] < 0) continue;
+      const int blk = blk_of[gi], sb = sb_of[gi];
+      accg += mtok_g_dot(stg[gi], xb_row[blk], sb);
+      accu += mtok_g_dot(stu[gi], xb_row[blk], sb);
+    }
+    #pragma unroll
+    for (int offr = 16; offr > 0; offr >>= 1) {
+      accg += __shfl_down_sync(0xFFFFFFFFu, accg, offr);
+      accu += __shfl_down_sync(0xFFFFFFFFu, accu, offr);
+    }
+    if (lane == 0) {
+      *reinterpret_cast<__half*>(
+          &yg[static_cast<size_t>(joff + tok0 + t) * n_rows + row]) =
+          __float2half(accg);
+      *reinterpret_cast<__half*>(
+          &yu[static_cast<size_t>(joff + tok0 + t) * n_rows + row]) =
+          __float2half(accu);
+    }
+  }
+}
+
+// v0.4 device-plan grouped single-matrix (down) reorder.
+template <int NG>
+__global__ void gemv_grouped_tab_mtok_ro_kernel(
+    const q4k::BlockQ4K* const* __restrict__ w_tab, const int* __restrict__ off,
+    const int* __restrict__ toff, const int* __restrict__ meta,
+    const q4k::BlockQ8K* __restrict__ xq, uint16_t* __restrict__ y, int n_rows,
+    int k, int n_expert, int tok_per) {
+  extern __shared__ __align__(16) unsigned char smem[];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int nb = k / 256;
+  const int w_row_bytes = nb * static_cast<int>(sizeof(q4k::BlockQ4K));
+  const int x_row_bytes = nb * static_cast<int>(sizeof(q4k::BlockQ8K));
+  q4k::BlockQ4K* w_sh =
+      reinterpret_cast<q4k::BlockQ4K*>(smem + warp * w_row_bytes);
+  q4k::BlockQ8K* x_sh = reinterpret_cast<q4k::BlockQ8K*>(
+      smem + 8 * w_row_bytes);
+
+  if (blockIdx.y >= *meta) return;
+  const int e = mtok_expert_of_tile(toff, n_expert, blockIdx.y);
+  const int joff = off[e];
+  const int jm = off[e + 1] - off[e];
+  const int tok0 = (blockIdx.y - toff[e]) * tok_per;
+  const int nt = min(tok_per, jm - tok0);
+  const int row = blockIdx.x * 8 + warp;
+  if (nt <= 0) return;
+
+  const q4k::BlockQ4K* w = w_tab[e];
+  if (!w) {
+    if (row < n_rows) {
+      for (int t = 0; t < nt; ++t) {
+        y[static_cast<size_t>(joff + tok0 + t) * n_rows + row] = 0;
+      }
+    }
+    return;
+  }
+  if (row >= n_rows) return;
+
+  for (int t = 0; t < nt; ++t) {
+    stage_bytes(x_sh + static_cast<size_t>(t) * nb,
+                xq + static_cast<size_t>(joff + tok0 + t) * nb, x_row_bytes,
+                threadIdx.x, blockDim.x);
+  }
+  stage_bytes(w_sh, w + static_cast<size_t>(row) * nb, w_row_bytes, lane, 32);
+  __syncthreads();
+
+  const int nsg = nb * 8;
+  MtokGState st[NG];
+  int blk_of[NG], sb_of[NG];
+  #pragma unroll
+  for (int gi = 0; gi < NG; ++gi) {
+    const int g = lane + gi * 32;
+    blk_of[gi] = -1;
+    sb_of[gi] = 0;
+    if (g < nsg) {
+      blk_of[gi] = g >> 3;
+      sb_of[gi] = g & 7;
+      mtok_g_load(w_sh[blk_of[gi]], sb_of[gi], st[gi]);
+    }
+  }
+
+  for (int t = 0; t < nt; ++t) {
+    const q4k::BlockQ8K* xb_row = x_sh + static_cast<size_t>(t) * nb;
+    float acc = 0.f;
+    #pragma unroll
+    for (int gi = 0; gi < NG; ++gi) {
+      if (blk_of[gi] >= 0)
+        acc += mtok_g_dot(st[gi], xb_row[blk_of[gi]], sb_of[gi]);
+    }
+    #pragma unroll
+    for (int offr = 16; offr > 0; offr >>= 1) {
+      acc += __shfl_down_sync(0xFFFFFFFFu, acc, offr);
+    }
+    if (lane == 0) {
+      *reinterpret_cast<__half*>(
+          &y[static_cast<size_t>(joff + tok0 + t) * n_rows + row]) =
+          __float2half(acc);
+    }
+  }
+}
+
+// Reorder kill-switch (SAGER_MTOK_REORDER=0 -> original kernels) and the
+// per-lane group dispatch: NG = ceil(nsg/32) = ceil(nb/4).
+inline bool mtok_reorder_on() {
+  static const bool on = [] {
+    const char* e = std::getenv("SAGER_MTOK_REORDER");
+    return !(e && e[0] == '0');
+  }();
+  return on;
+}
+
 // Router logits, tiled multi-token: W fp32 [n_rows x k] @ X fp16 -> fp32.
 // k is walked in 256-wide chunks (W chunk + X chunk staged in shared); the
 // per-lane global index sequence stays lane, lane+32, ... ascending, so the
@@ -984,7 +1515,25 @@ void gemv_q4_k_q8_f16out_mtok(const q4k::BlockQ4K* w, const q4k::BlockQ8K* xq,
   const int nb = k / 256;
   const int tile = mtok_tile(nb, 8);
   dim3 grid((n_rows + 7) / 8, (n_tokens + tile - 1) / tile);
-  gemv_q4_k_q8_f16out_mtok_kernel<<<grid, 256, mtok_smem(nb, 8, tile), stream>>>(
+  const size_t smem = mtok_smem(nb, 8, tile);
+  if (mtok_reorder_on()) {
+    const int nsg = nb * 8;
+    const int ng = (nsg + 31) / 32;
+    if (ng <= 1) {
+      gemv_mtok_ro_kernel<1><<<grid, 256, smem, stream>>>(
+          w, xq, y, n_rows, k, n_tokens, tile);
+      return;
+    } else if (ng <= 2) {
+      gemv_mtok_ro_kernel<2><<<grid, 256, smem, stream>>>(
+          w, xq, y, n_rows, k, n_tokens, tile);
+      return;
+    } else if (ng <= 4) {
+      gemv_mtok_ro_kernel<4><<<grid, 256, smem, stream>>>(
+          w, xq, y, n_rows, k, n_tokens, tile);
+      return;
+    }
+  }
+  gemv_q4_k_q8_f16out_mtok_kernel<<<grid, 256, smem, stream>>>(
       w, xq, y, n_rows, k, n_tokens, tile);
 }
 
@@ -996,7 +1545,25 @@ void gemv2_q4_k_q8_f16out_mtok(const q4k::BlockQ4K* wg, const q4k::BlockQ4K* wu,
   const int nb = k / 256;
   const int tile = mtok_tile(nb, 16);
   dim3 grid((n_rows + 7) / 8, (n_tokens + tile - 1) / tile);
-  gemv2_q4_k_q8_f16out_mtok_kernel<<<grid, 256, mtok_smem(nb, 16, tile), stream>>>(
+  const size_t smem = mtok_smem(nb, 16, tile);
+  if (mtok_reorder_on()) {
+    const int nsg = nb * 8;
+    const int ng = (nsg + 31) / 32;
+    if (ng <= 1) {
+      gemv2_mtok_ro_kernel<1><<<grid, 256, smem, stream>>>(
+          wg, wu, xq, yg, yu, n_rows, k, n_tokens, tile);
+      return;
+    } else if (ng <= 2) {
+      gemv2_mtok_ro_kernel<2><<<grid, 256, smem, stream>>>(
+          wg, wu, xq, yg, yu, n_rows, k, n_tokens, tile);
+      return;
+    } else if (ng <= 4) {
+      gemv2_mtok_ro_kernel<4><<<grid, 256, smem, stream>>>(
+          wg, wu, xq, yg, yu, n_rows, k, n_tokens, tile);
+      return;
+    }
+  }
+  gemv2_q4_k_q8_f16out_mtok_kernel<<<grid, 256, smem, stream>>>(
       wg, wu, xq, yg, yu, n_rows, k, n_tokens, tile);
 }
 
@@ -1009,7 +1576,28 @@ void gemv_grouped2_q4_k_q8_f16out_mtok(
   if (n_tiles <= 0) return;
   const int nb = k / 256;
   dim3 grid((n_rows + 7) / 8, n_tiles);
-  gemv_grouped2_q4_k_q8_f16out_mtok_kernel<<<grid, 256, mtok_smem(nb, 16, tok_per), stream>>>(
+  const size_t smem = mtok_smem(nb, 16, tok_per);
+  if (mtok_reorder_on()) {
+    const int nsg = nb * 8;
+    const int ng = (nsg + 31) / 32;
+    if (ng <= 1) {
+      gemv_grouped2_mtok_ro_kernel<1><<<grid, 256, smem, stream>>>(
+          wg, wu, off, m, tile_base, job_of_tile, xq, yg, yu, n_rows, k,
+          tok_per);
+      return;
+    } else if (ng <= 2) {
+      gemv_grouped2_mtok_ro_kernel<2><<<grid, 256, smem, stream>>>(
+          wg, wu, off, m, tile_base, job_of_tile, xq, yg, yu, n_rows, k,
+          tok_per);
+      return;
+    } else if (ng <= 4) {
+      gemv_grouped2_mtok_ro_kernel<4><<<grid, 256, smem, stream>>>(
+          wg, wu, off, m, tile_base, job_of_tile, xq, yg, yu, n_rows, k,
+          tok_per);
+      return;
+    }
+  }
+  gemv_grouped2_q4_k_q8_f16out_mtok_kernel<<<grid, 256, smem, stream>>>(
       wg, wu, off, m, tile_base, job_of_tile, xq, yg, yu, n_rows, k, tok_per);
 }
 
@@ -1021,7 +1609,25 @@ void gemv_grouped_q4_k_q8_f16out_mtok(
   if (n_tiles <= 0) return;
   const int nb = k / 256;
   dim3 grid((n_rows + 7) / 8, n_tiles);
-  gemv_grouped_q4_k_q8_f16out_mtok_kernel<<<grid, 256, mtok_smem(nb, 8, tok_per), stream>>>(
+  const size_t smem = mtok_smem(nb, 8, tok_per);
+  if (mtok_reorder_on()) {
+    const int nsg = nb * 8;
+    const int ng = (nsg + 31) / 32;
+    if (ng <= 1) {
+      gemv_grouped_mtok_ro_kernel<1><<<grid, 256, smem, stream>>>(
+          w, off, m, tile_base, job_of_tile, xq, y, n_rows, k, tok_per);
+      return;
+    } else if (ng <= 2) {
+      gemv_grouped_mtok_ro_kernel<2><<<grid, 256, smem, stream>>>(
+          w, off, m, tile_base, job_of_tile, xq, y, n_rows, k, tok_per);
+      return;
+    } else if (ng <= 4) {
+      gemv_grouped_mtok_ro_kernel<4><<<grid, 256, smem, stream>>>(
+          w, off, m, tile_base, job_of_tile, xq, y, n_rows, k, tok_per);
+      return;
+    }
+  }
+  gemv_grouped_q4_k_q8_f16out_mtok_kernel<<<grid, 256, smem, stream>>>(
       w, off, m, tile_base, job_of_tile, xq, y, n_rows, k, tok_per);
 }
 
@@ -1097,8 +1703,28 @@ void gemv_grouped2_tab_q4_k_q8_f16out_mtok(
     int n_rows, int k, int n_expert, int tok_per, cudaStream_t stream) {
   const int nb = k / 256;
   dim3 grid((n_rows + 7) / 8, tiles_max);
-  gemv_grouped2_tab_q4_k_q8_f16out_mtok_kernel<<<grid, 256,
-      mtok_smem(nb, 16, tok_per), stream>>>(
+  const size_t smem = mtok_smem(nb, 16, tok_per);
+  if (mtok_reorder_on()) {
+    const int nsg = nb * 8;
+    const int ng = (nsg + 31) / 32;
+    if (ng <= 1) {
+      gemv_grouped2_tab_mtok_ro_kernel<1><<<grid, 256, smem, stream>>>(
+          wg_tab, wu_tab, off, toff, meta, mail, mail_n, xq, yg, yu, n_rows,
+          k, n_expert, tok_per);
+      return;
+    } else if (ng <= 2) {
+      gemv_grouped2_tab_mtok_ro_kernel<2><<<grid, 256, smem, stream>>>(
+          wg_tab, wu_tab, off, toff, meta, mail, mail_n, xq, yg, yu, n_rows,
+          k, n_expert, tok_per);
+      return;
+    } else if (ng <= 4) {
+      gemv_grouped2_tab_mtok_ro_kernel<4><<<grid, 256, smem, stream>>>(
+          wg_tab, wu_tab, off, toff, meta, mail, mail_n, xq, yg, yu, n_rows,
+          k, n_expert, tok_per);
+      return;
+    }
+  }
+  gemv_grouped2_tab_q4_k_q8_f16out_mtok_kernel<<<grid, 256, smem, stream>>>(
       wg_tab, wu_tab, off, toff, meta, mail, mail_n, xq, yg, yu, n_rows, k,
       n_expert, tok_per);
 }
@@ -1109,8 +1735,25 @@ void gemv_grouped_tab_q4_k_q8_f16out_mtok(
     int n_rows, int k, int n_expert, int tok_per, cudaStream_t stream) {
   const int nb = k / 256;
   dim3 grid((n_rows + 7) / 8, tiles_max);
-  gemv_grouped_tab_q4_k_q8_f16out_mtok_kernel<<<grid, 256,
-      mtok_smem(nb, 8, tok_per), stream>>>(
+  const size_t smem = mtok_smem(nb, 8, tok_per);
+  if (mtok_reorder_on()) {
+    const int nsg = nb * 8;
+    const int ng = (nsg + 31) / 32;
+    if (ng <= 1) {
+      gemv_grouped_tab_mtok_ro_kernel<1><<<grid, 256, smem, stream>>>(
+          w_tab, off, toff, meta, xq, y, n_rows, k, n_expert, tok_per);
+      return;
+    } else if (ng <= 2) {
+      gemv_grouped_tab_mtok_ro_kernel<2><<<grid, 256, smem, stream>>>(
+          w_tab, off, toff, meta, xq, y, n_rows, k, n_expert, tok_per);
+      return;
+    } else if (ng <= 4) {
+      gemv_grouped_tab_mtok_ro_kernel<4><<<grid, 256, smem, stream>>>(
+          w_tab, off, toff, meta, xq, y, n_rows, k, n_expert, tok_per);
+      return;
+    }
+  }
+  gemv_grouped_tab_q4_k_q8_f16out_mtok_kernel<<<grid, 256, smem, stream>>>(
       w_tab, off, toff, meta, xq, y, n_rows, k, n_expert, tok_per);
 }
 

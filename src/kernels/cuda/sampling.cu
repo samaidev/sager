@@ -56,6 +56,76 @@ int argmax_f32(const float*, int, cudaStream_t) {
   return -1;
 }
 
+// ---------------------------------------------------------------------------
+// v0.5 device top-k selection (decode sampler): one block iteratively picks
+// the max (ties -> lower index), masks it in a register-local shadow via a
+// picked-flag scan... the simple version re-scans logits k times; with the
+// 1 MB fp32 head resident in L2 each pass is a stream through L2 (~40 us
+// for 248k logits on T4), so k <= 64 stays well under 0.5 ms.
+// ---------------------------------------------------------------------------
+__global__ void topk_select_kernel(const float* __restrict__ logits,
+                                   float* __restrict__ out_v,
+                                   int* __restrict__ out_i, int n, int k) {
+  __shared__ float red_v[32];
+  __shared__ int red_i[32];
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int nth = blockDim.x;
+
+  for (int it = 0; it < k; ++it) {
+    float bv = -3.4e38f;
+    int bi = -1;
+    for (int i = tid; i < n; i += nth) {
+      const float v = logits[i];
+      if (v > bv || (v == bv && bi >= 0 && i < bi)) { bv = v; bi = i; }
+    }
+    // warp reduce (max, then lowest index on ties)
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      const float ov = __shfl_down_sync(0xFFFFFFFFu, bv, off);
+      const int oi = __shfl_down_sync(0xFFFFFFFFu, bi, off);
+      if (ov > bv || (ov == bv && oi >= 0 && oi < bi)) { bv = ov; bi = oi; }
+    }
+    if (lane == 0) { red_v[warp] = bv; red_i[warp] = bi; }
+    __syncthreads();
+    if (tid == 0) {
+      float mv = -3.4e38f;
+      int mi = -1;
+      const int nw = (nth + 31) / 32;
+      for (int w = 0; w < nw; ++w) {
+        if (red_v[w] > mv || (red_v[w] == mv && red_i[w] >= 0 &&
+                              (mi < 0 || red_i[w] < mi))) {
+          mv = red_v[w];
+          mi = red_i[w];
+        }
+      }
+      out_v[it] = mv;
+      out_i[it] = mi;
+      // mask the winner for the next pass (logits buffer is a scratch copy)
+      if (mi >= 0) const_cast<float*>(logits)[mi] = -3.4e38f;
+    }
+    __syncthreads();
+  }
+}
+
+void topk_select_f32(const float* logits, int n, float* out_v, int* out_i,
+                     int k, cudaStream_t stream) {
+  if (k <= 0 || n <= 0) return;
+  if (k > 64) k = 64;
+  topk_select_kernel<<<1, 1024, 0, stream>>>(logits, out_v, out_i, n, k);
+}
+
+void apply_penalties_f32(float* logits, const int* recent_ids, int n_recent,
+                         float rep_penalty, float presence_penalty,
+                         cudaStream_t stream) {
+  if (n_recent <= 0 || (rep_penalty == 1.0f && presence_penalty == 0.f)) {
+    return;
+  }
+  apply_penalties_kernel<<<(n_recent + 255) / 256, 256, 0, stream>>>(
+      logits, recent_ids, n_recent, rep_penalty, presence_penalty);
+}
+
 int sample_topk_topp(const float* logits, int n_vocab, const int* recent_ids,
                      int n_recent, float temp, int top_k, float top_p,
                      float min_p, float rep_penalty, float presence_penalty,

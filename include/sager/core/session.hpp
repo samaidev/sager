@@ -112,6 +112,20 @@ class Session {
 
   // Host logits of the LAST completed forward (decode_step / prefill tail).
   const float* last_logits() const;
+#if defined(SAGER_HAVE_CUDA)
+  // v0.5 device sampler accessors (public: used by generate.cpp)
+  bool device_sample_valid() const { return dev_sample_valid_; }
+  void set_sampler_penalties(float rep, float pres) {
+    sam_rep_ = rep;
+    sam_pres_ = pres;
+  }
+  // Finish the device sample (softmax/top-p/min_p/multinomial on the host
+  // over the k device-selected candidates). Returns the id, or -1 when no
+  // valid device sample is pending.
+  int  finish_device_sample(float temp, int top_k, float top_p, float min_p,
+                            float rep_penalty, float presence_penalty,
+                            uint64_t& rng);
+#endif
 
   void reset();  // clear KV + positions (keep expert residency)
 
@@ -261,6 +275,28 @@ class Session {
   bool pf_device_ = true;    // SAGER_PF_DEVICE=0 -> v0.3 host dispatch
   int  mail_pending_ = -1;   // v0.4: layer whose CPU mailbox is unresolved
   int  pf_rt_ = 0;           // v0.4: batched route-slab row capacity (RT)
+
+  // v0.5 decode fast path: whole-step pipelined decode on the v0.4 device
+  // dispatch (no per-layer route sync) + device top-k sampler.
+  bool dec_device_ = false;      // SAGER_DECODE_DEVICE=0 -> per-row walk
+  bool dec_tbl_built_ = false;   // decode pointer table is current
+  bool dec_mail_ok_ = false;     // mailbox patch allowed w/o stream session
+  bool dev_sample_ = false;      // SAGER_DEVICE_SAMPLER=0 -> host sampler
+  int  dev_sample_id_ = -1;      // sampled id of the last decode_step
+  bool dev_sample_valid_ = false;
+  int  dev_sample_k_ = 0;        // candidates produced by the device top-k
+  float sam_rep_ = 1.0f;         // sampler penalties (set per request)
+  float sam_pres_ = 0.f;
+  std::vector<std::pair<int, int>> dec_promote_;  // mailed (layer, expert)
+  DeviceBuffer<float>    d_sample_logits_;  // [n_vocab] sampler scratch
+  DeviceBuffer<float>    d_topk_v_;         // [64]
+  DeviceBuffer<int>      d_topk_i_;         // [64]
+  PinnedBuffer<float>    h_topk_v_;         // [64]
+  PinnedBuffer<int>      h_topk_i_;         // [64]
+  PinnedBuffer<int>      h_step_stage_;     // {id | pos3 | SeqParams} staging
+  PinnedBuffer<int>      h_recent_stage_;   // recent-id upload staging
+
+  void build_decode_table();   // decode pointer table from residency
 #endif
 
   int pos_ = 0;

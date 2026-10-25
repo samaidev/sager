@@ -315,4 +315,19 @@ int sample_topk_topp(const float* logits, int n_vocab, const int* recent_ids,
 // Greedy argmax (used by the speculative verify window - bit-exact decoding).
 int argmax_f32(const float* logits, int n_vocab, cudaStream_t stream);
 
+// v0.5 device top-k selection: writes the top-`k` (value, index) pairs of
+// logits[0..n) into out_v/out_i (device buffers of >= k slots), ordered by
+// the iterative max+mask pass (descending values). Ties break toward the
+// lower index. k must be <= 64. NOTE: the logits buffer IS modified (picked
+// entries are masked) - pass a scratch copy. The host finishes
+// softmax/top-p/min_p/multinomial over the k candidates (see generate.cpp).
+void topk_select_f32(const float* logits, int n, float* out_v, int* out_i,
+                     int k, cudaStream_t stream);
+
+// v0.5: repetition/presence penalty pass over the recent-id window (the
+// decode device sampler applies it before the top-k selection).
+void apply_penalties_f32(float* logits, const int* recent_ids, int n_recent,
+                         float rep_penalty, float presence_penalty,
+                         cudaStream_t stream);
+
 }  // namespace sager::cuda

@@ -13,6 +13,7 @@
 // small-batch Turing decode.
 #include "layer_internal.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -259,6 +260,16 @@ Status Session::alloc_scratch() {
                           (K + 1))) {
     return Status::kOomRam;
   }
+  // v0.5 decode fast path staging (device sampler + step params)
+  if (!ok(d_sample_logits_.alloc(V), "d_sample_logits_") ||
+      !ok(d_topk_v_.alloc(64), "d_topk_v_") ||
+      !ok(d_topk_i_.alloc(64), "d_topk_i_")) {
+    return Status::kOomVram;
+  }
+  if (!h_topk_v_.alloc(64) || !h_topk_i_.alloc(64) ||
+      !h_step_stage_.alloc(32) || !h_recent_stage_.alloc(kMaxRecent)) {
+    return Status::kOomRam;
+  }
   if (cudaEventCreateWithFlags(&ev_scan_, cudaEventDisableTiming) !=
       cudaSuccess) {
     ev_scan_ = nullptr;
@@ -306,6 +317,13 @@ Status Session::prepare() {
     if (crc) pf_cpu_cap_ = std::clamp(std::atoi(crc->c_str()), 16, 4096);
     const auto dev = env_get("SAGER_PF_DEVICE");
     if (dev) pf_device_ = (*dev != "0");
+    // v0.5 decode fast-path knobs (read here, logged in the ready line)
+    {
+      const auto dd = env_get("SAGER_DECODE_DEVICE");
+      if (dd) dec_device_ = (*dd != "0");
+      const auto ds = env_get("SAGER_DEVICE_SAMPLER");
+      if (ds) dev_sample_ = (*ds != "0");
+    }
     const EngineDims& dd0 = mc_.dims;
     if (pf_batched_ &&
         (dd0.hidden % q4k::kQK_K != 0 || dd0.n_ff_exp % q4k::kQK_K != 0)) {
@@ -429,10 +447,11 @@ Status Session::prepare() {
 
   SLOG_I("session",
          "ready: ctx=%d chunk=%d graphs=%s hot_experts=%d/%d gdn_layers=%d "
-         "pump=%s(%d slots)",
+         "pump=%s(%d slots) dec_device=%d dev_sampler=%d",
          cp_.n_ctx, cp_.chunk_prefill, graphs_.valid() ? "on" : "off",
          hot_->resident_count, d.experts_total(), n_gdn_layers,
-         pump_ ? "on" : "off", pump_ ? pump_->slot_count() : 0);
+         pump_ ? "on" : "off", pump_ ? pump_->slot_count() : 0,
+         (int)dec_device_, (int)dev_sample_);
   prepared_ = true;
   return Status::kOk;
 }
@@ -1417,10 +1436,16 @@ void Session::moe_dispatch_device(int layer, int n) {
 
   // 4) device-side wait: this layer's planned pairs must have landed (their
   //    loaders patch the pointer table before firing the publish events).
-  pump_->stream_wait_layer(layer, s);
+  //    Decode fast path runs WITHOUT a stream session - the pointer table is
+  //    the decode-built residency table, nothing ever patches it mid-step.
+  if (pump_->stream_active()) pump_->stream_wait_layer(layer, s);
 
   // 5) gate+up for EVERY routed expert of the layer in ONE launch.
-  const int tiles_max = static_cast<int>(Rmax) / tile_gu + E + 16;
+  //    tiles <= total routed rows (each tile covers >= 1 row) - for the 1-row
+  //    decode step this caps the grid at Rmax (=K) tiles instead of the
+  //    residency-worst-case K/tile + E + 16, which is 94% empty blocks.
+  const int tiles_max = std::min(static_cast<int>(Rmax) / tile_gu + E + 16,
+                                 static_cast<int>(Rmax));
   const size_t lstride = static_cast<size_t>(d.n_moe_layer) * E;
   cuda::gemv_grouped2_tab_q4_k_q8_f16out_mtok(
       d_ptr_table_.get() + 0 * lstride,
@@ -1443,7 +1468,7 @@ void Session::moe_dispatch_device(int layer, int n) {
       tile_gu, s);
 
   // 8) ring slots of this layer's planned pairs free after the down GEMM.
-  pump_->stream_consume_layer(layer, s);
+  if (pump_->stream_active()) pump_->stream_consume_layer(layer, s);
 
   // 9) compact outputs into the combine slab (gslot built on device).
   cuda::scatter_routed_f16(expert_y_.get(), y_grouped_.get(), d_gslot_.get(),
@@ -1514,7 +1539,7 @@ void Session::drain_expert_touch(int n_rows) {
 // ---------------------------------------------------------------------------
 void Session::resolve_cpu_mailbox(int layer, int n) {
   if (layer < 0 || mail_pending_ != layer || !pump_ ||
-      !ev_scan_ || !pump_->stream_active()) {
+      !ev_scan_ || (!pump_->stream_active() && !dec_mail_ok_)) {
     return;
   }
   // Non-blocking first: the scan kernel of layer `layer` is near the head of
@@ -1557,6 +1582,11 @@ void Session::resolve_cpu_mailbox(int layer, int n) {
       mailed[static_cast<size_t>(e)] = 1;
       uniq.push_back(e);
     }
+  }
+  // v0.5 decode: queue arena promotion for the step end (GPU idle -> safe
+  // slot steals); the next step's table rebuild picks the slots up.
+  if (dec_mail_ok_) {
+    for (int e : uniq) dec_promote_.emplace_back(layer, e);
   }
 
   // Rebuild (row, kk) for the absent experts and run the AVX2 pool.
@@ -1664,6 +1694,115 @@ void Session::head_launch_row(int row) {
 }
 
 // ---------------------------------------------------------------------------
+// v0.5 decode fast path: residency-only pointer table for the device-dispatch
+// decode (no stream plan; hot slab + parked arena slots; absent experts mail
+// to the CPU pool). Rebuilt lazily and after any residency change.
+// ---------------------------------------------------------------------------
+void Session::build_decode_table() {
+  const EngineDims& d = mc_.dims;
+  const int E = d.n_expert;
+  const int Lm = d.n_moe_layer;
+  for (size_t i = 0; i < h_ptr_table_.count(); ++i) {
+    h_ptr_table_.get()[i] = nullptr;
+  }
+  for (int L = 0; L < Lm; ++L) {
+    for (int e = 0; e < E; ++e) {
+      q4k::BlockQ4K* tri[3] = {nullptr, nullptr, nullptr};
+      if (cache_.resident(L, e)) {
+        const size_t base = (static_cast<size_t>(L) * 3 + 0) * E + e;
+        tri[0] = reinterpret_cast<q4k::BlockQ4K*>(hot_->tables_host[base]);
+        tri[1] = reinterpret_cast<q4k::BlockQ4K*>(
+            hot_->tables_host[base + static_cast<size_t>(E)]);
+        tri[2] = reinterpret_cast<q4k::BlockQ4K*>(
+            hot_->tables_host[base + 2 * static_cast<size_t>(E)]);
+      } else if (pump_ && pump_->resident(L, e)) {
+        const int pslot = pump_->stream_slot_of(L, e);
+        if (pslot >= 0) {
+          auto* base = const_cast<q4k::BlockQ4K*>(pump_->dev_base(pslot));
+          const size_t gu = hot_->per_expert_bytes / 3 / q4k::kBlockBytes;
+          tri[0] = base;
+          tri[1] = base + gu;
+          tri[2] = base + 2 * gu;
+        }
+      }
+      for (int t = 0; t < 3; ++t) {
+        h_ptr_table_.get()[(static_cast<size_t>(t) * Lm + L) * E + e] = tri[t];
+      }
+    }
+  }
+  cudaMemcpyAsync(d_ptr_table_.get(), h_ptr_table_.get(),
+                  h_ptr_table_.count() * sizeof(q4k::BlockQ4K*),
+                  cudaMemcpyHostToDevice, stream_.get());
+  dec_tbl_built_ = true;
+}
+
+// ---------------------------------------------------------------------------
+// v0.5 device sampler host finish: softmax/temp + sort + min_p + top_p +
+// multinomial over the device-selected top-k candidates (same policy and
+// rng discipline as sample_host, which stays available as the fallback).
+// ---------------------------------------------------------------------------
+int Session::finish_device_sample(float temp, int top_k, float top_p,
+                                  float min_p, float rep_penalty,
+                                  float presence_penalty, uint64_t& rng) {
+  (void)rep_penalty;
+  (void)presence_penalty;   // penalties were applied on device pre-top-k
+  if (!dev_sample_valid_ || dev_sample_k_ <= 0) return -1;
+  dev_sample_valid_ = false;
+  struct Cand { float p; int id; };
+  Cand cand[64];
+  int nc = 0;
+  for (int i = 0; i < dev_sample_k_ && i < 64; ++i) {
+    if (h_topk_i_[i] < 0) break;
+    cand[nc].p = h_topk_v_[i];
+    cand[nc].id = h_topk_i_[i];
+    ++nc;
+  }
+  if (nc <= 0) return -1;
+  if (nc == 1) return cand[0].id;
+
+  const float t = temp > 1e-4f ? temp : 1e-4f;
+  float mx = -1e30f;
+  for (int i = 0; i < nc; ++i) mx = std::max(mx, cand[i].p);
+  float z = 0.f;
+  for (int i = 0; i < nc; ++i) {
+    cand[i].p = std::exp((cand[i].p - mx) / t);
+    z += cand[i].p;
+  }
+  for (int i = 0; i < nc; ++i) cand[i].p /= z;
+  std::sort(cand, cand + nc,
+            [](const Cand& a, const Cand& b) { return a.p > b.p; });
+
+  if (min_p > 0.f) {
+    const float floor_ = min_p * cand[0].p;
+    int keep = 0;
+    while (keep < nc && cand[keep].p >= floor_) ++keep;
+    nc = std::max(keep, 1);
+  }
+  if (top_p < 1.0f) {
+    float cum = 0.f;
+    int keep = nc;
+    for (int i = 0; i < nc; ++i) {
+      cum += cand[i].p;
+      if (cum >= top_p) { keep = i + 1; break; }
+    }
+    nc = std::max(keep, 1);
+  }
+
+  z = 0.f;
+  for (int i = 0; i < nc; ++i) z += cand[i].p;
+  rng ^= rng << 13;
+  rng ^= rng >> 7;
+  rng ^= rng << 17;
+  float r = static_cast<float>(
+      static_cast<double>(rng >> 11) / 9007199254740992.0) * z;
+  for (int i = 0; i < nc; ++i) {
+    r -= cand[i].p;
+    if (r <= 0.f) return cand[i].id;
+  }
+  return cand[0].id;
+}
+
+// ---------------------------------------------------------------------------
 // Decode step (graph path)
 // ---------------------------------------------------------------------------
 const float* Session::decode_step(int last_id) {
@@ -1671,6 +1810,119 @@ const float* Session::decode_step(int last_id) {
   const EngineDims& d = mc_.dims;
   const double t0 = now_ms();
   cudaStream_t s = stream_.get();
+  const bool dev_path = dec_device_ && pf_device_ && pump_ != nullptr;
+
+  if (dev_path) {
+    // ---- v0.5 device-dispatch decode: the whole step is enqueued with NO
+    // per-layer host sync. Layers replay their captured dense/GDN graphs;
+    // MoE runs the v0.4 device dispatch (device plan + grouped _tab GEMVs)
+    // against the decode residency table; absent experts zero + mail and
+    // the CPU pool patches them at the next boundary (stream-ordered).
+    dev_sample_valid_ = false;
+    if (!dec_tbl_built_) build_decode_table();
+
+    // per-step values via pinned staging (async uploads)
+    int* st = h_step_stage_.get();
+    st[0] = last_id;
+    const int p = pos_;
+    st[1] = p;
+    st[2] = p;
+    st[3] = p;
+    st[8] = p;
+    st[9] = 1;
+    cudaMemcpyAsync(d_ids_.get(), st, sizeof(int), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(d_pos_ids_.get(), st + 1,
+                    (mc_.use_mrope ? 3 : 1) * sizeof(int),
+                    cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(d_params_.get(), st + 8, sizeof(SeqParams),
+                    cudaMemcpyHostToDevice, s);
+
+    cuda::gather_embed(x_.get(), w_.tok_embd, d_ids_.get(), 1, d.hidden, s);
+
+    pump_->begin_step(static_cast<uint64_t>(perf.steps) + 1);
+    dec_mail_ok_ = true;
+    for (int L = 0; L < d.n_layer; ++L) {
+      resolve_cpu_mailbox(L - 1, 1);
+      if (graphs_.valid() && graphs_.layer_graph(L)) {
+        cudaGraphLaunch(static_cast<cudaGraphExec_t>(graphs_.layer_graph(L)),
+                        s);
+      } else if (mc_.is_linear(L)) {
+        linear_layer_launch(L, 1);
+      } else {
+        dense_layer_launch(L, 1);
+      }
+      moe_dispatch_device(L, 1);
+    }
+    resolve_cpu_mailbox(d.n_layer - 1, 1);
+    dec_mail_ok_ = false;
+    head_launch();
+
+    if (dev_sample_) {
+      // Device sampler: scratch copy + penalties + top-k; generate.cpp
+      // finishes softmax/top-p/multinomial after the sync below. Skips the
+      // ~1 MB full-logits D2H of the host-sampler path.
+      cudaMemcpyAsync(d_sample_logits_.get(), logits_.get(),
+                      d.n_vocab * sizeof(float), cudaMemcpyDeviceToDevice, s);
+      const int nr = static_cast<int>(recent_ids_.size());
+      if (nr > 0) {
+        for (int i = 0; i < nr; ++i) h_recent_stage_[i] = recent_ids_[i];
+        cudaMemcpyAsync(d_recent_.get(), h_recent_stage_.get(),
+                        nr * sizeof(int), cudaMemcpyHostToDevice, s);
+        cuda::apply_penalties_f32(d_sample_logits_.get(), d_recent_.get(), nr,
+                                  sam_rep_, sam_pres_, s);
+      }
+      const int ksel = 32;
+      cuda::topk_select_f32(d_sample_logits_.get(), d.n_vocab,
+                            d_topk_v_.get(), d_topk_i_.get(), ksel, s);
+      cudaMemcpyAsync(h_topk_v_.get(), d_topk_v_.get(),
+                      ksel * sizeof(float), cudaMemcpyDeviceToHost, s);
+      cudaMemcpyAsync(h_topk_i_.get(), d_topk_i_.get(), ksel * sizeof(int),
+                      cudaMemcpyDeviceToHost, s);
+      dev_sample_k_ = ksel;
+      dev_sample_valid_ = true;
+    } else {
+      cudaMemcpyAsync(logits_host_.get(), logits_.get(),
+                      d.n_vocab * sizeof(float), cudaMemcpyDeviceToHost, s);
+    }
+
+    // Stash the final hidden row for the MTP drafter (fixed buffer, D2D).
+    cudaMemcpyAsync(xf_.get(), xn_.get(), d.hidden * sizeof(uint16_t),
+                    cudaMemcpyDeviceToDevice, s);
+    stream_.sync();
+
+    pos_ = p + 1;
+    push_recent(last_id);
+
+    // Residency maintenance: decay + periodic rebalance (off the steady path).
+    cache_.tick(0.9995f);
+    if (perf.steps > 0 && perf.steps % 4096 == 0) {
+      if (cache_.rebalance() > 0) {
+        hot_->rebuild(cache_, w_, d.n_moe_layer, d.n_expert,
+                      mc_.expert_bytes());
+        dec_tbl_built_ = false;
+      }
+    }
+    // Arena promotion of this step's mailed experts: the GPU is idle here,
+    // so slot steals are race-free; copies fence in-stream via arm_wait and
+    // the table rebuilds before the next step.
+    if (!dec_promote_.empty()) {
+      for (const auto& le : dec_promote_) {
+        pump_->submit(le.first, le.second,
+                      static_cast<uint64_t>(perf.steps) + 1);
+      }
+      pump_->arm_wait(s);
+      dec_promote_.clear();
+      dec_tbl_built_ = false;
+    }
+    drain_expert_touch(1);
+
+    const double ms = now_ms() - t0;
+    perf.decode_tps = perf.decode_tps > 0
+                          ? 0.9 * perf.decode_tps + 0.1 * (1000.0 / ms)
+                          : 1000.0 / ms;
+    ++perf.steps;
+    return logits_host_.get();
+  }
 
   // Per-step values through fixed-address device blocks (graph contract).
   cudaMemcpy(d_ids_.get(), &last_id, sizeof(int), cudaMemcpyHostToDevice);

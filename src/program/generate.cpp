@@ -152,14 +152,32 @@ Status run_generation(Session& s, SpecController& ctrl, MtpDrafter& mtp,
 
   std::vector<float> cur_logits(s.last_logits(), s.last_logits() + n_vocab);
   const double decode_t0 = now_ms();
+#if defined(SAGER_HAVE_CUDA)
+  // v0.5: the device sampler applies penalties on device before the top-k
+  // selection; the host finish reuses the same policy for the tail.
+  s.set_sampler_penalties(p.repeat_penalty, p.presence_penalty);
+#endif
   SLOG_I("gen", "drafters: suffix_max=%d mtp_ready=%d mtp_max=%d",
          suffix.max_draft(), mtp.ready() ? 1 : 0, mtp.max_draft());
 
   while (out->tokens < p.max_tokens) {
     if (abort && *abort) { out->status = Status::kAborted; break; }
 
-    // 1. sample the next token
-    const int t = sample_host(cur_logits.data(), n_vocab, s.recent(), p, rng);
+    // 1. sample the next token (device top-k when the last decode_step
+    //    produced one; the prefill tail always goes through the host path)
+    int t;
+#if defined(SAGER_HAVE_CUDA)
+    if (s.device_sample_valid()) {
+      t = s.finish_device_sample(p.temperature, p.greedy ? 1 : p.top_k,
+                                 p.top_p, p.min_p, p.repeat_penalty,
+                                 p.presence_penalty, rng);
+      if (t < 0) t = sample_host(cur_logits.data(), n_vocab, s.recent(), p, rng);
+    } else {
+      t = sample_host(cur_logits.data(), n_vocab, s.recent(), p, rng);
+    }
+#else
+    t = sample_host(cur_logits.data(), n_vocab, s.recent(), p, rng);
+#endif
     ++out->tokens;
     bool stop = false;
     if (cb.on_token && !cb.on_token(t)) { stop = true; out->status = Status::kAborted; }
@@ -203,7 +221,12 @@ Status run_generation(Session& s, SpecController& ctrl, MtpDrafter& mtp,
     if (cand.empty()) {
       const float* lg = s.decode_step(t);
       if (!lg) { out->status = Status::kCudaError; break; }
-      std::memcpy(cur_logits.data(), lg, n_vocab * sizeof(float));
+#if defined(SAGER_HAVE_CUDA)
+      if (!s.device_sample_valid())
+#endif
+      {
+        std::memcpy(cur_logits.data(), lg, n_vocab * sizeof(float));
+      }
       continue;
     }
 
@@ -216,7 +239,12 @@ Status run_generation(Session& s, SpecController& ctrl, MtpDrafter& mtp,
       // Verify pass failed - fall back to a plain decode of t.
       const float* lg = s.decode_step(t);
       if (!lg) { out->status = Status::kCudaError; break; }
-      std::memcpy(cur_logits.data(), lg, n_vocab * sizeof(float));
+#if defined(SAGER_HAVE_CUDA)
+      if (!s.device_sample_valid())
+#endif
+      {
+        std::memcpy(cur_logits.data(), lg, n_vocab * sizeof(float));
+      }
       continue;
     }
 
