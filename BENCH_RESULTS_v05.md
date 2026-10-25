@@ -4,10 +4,10 @@
 
 | metric | v0.4.0-dev | v0.5.0 | gain |
 |---|---|---|---|
-| prefill pp512 | 136.0 tok/s | **211.0 tok/s** | **+55%** |
-| prefill pp2048 | 130.0 tok/s | **201.0 tok/s** | **+55%** |
-| decode tg128 | 22.43 tok/s | **24.22 tok/s** | +8% |
-| token-stream gate | — | **OLD == NEW, 128/128 ids IDENTICAL** | bit-exact |
+| prefill pp512 | 136.0 tok/s | **223.0 tok/s** | **+64%** |
+| prefill pp2048 | 130.0 tok/s | **212.0 tok/s** | **+63%** |
+| decode tg128 | 22.43 tok/s | **24.56 tok/s** | +9.5% |
+| token-stream gate | — | **OLD == NEW, 128/128 ids IDENTICAL** (both rounds) | bit-exact |
 
 Baseline re-measured on the same box/binary with
 `SAGER_MTOK_REORDER=0 SAGER_DECODE_DEVICE=0 SAGER_DEVICE_SAMPLER=0`
@@ -61,7 +61,16 @@ block, k ≤ 32 head-room) and `Session::finish_device_sample` finishes
 softmax/temp/top-p/min_p/multinomial on the host over the 32 candidates with
 the same rng discipline. `SAGER_DEVICE_SAMPLER=0` restores the host sampler.
 
-## Decode status / next lever
+### 4. Single-token GEMVs ride the same coalesced path (decode round 2)
+
+The single-token `gemv_q4_k_q8` (decode head: 248,320 rows × 2048 = ~285 MB
+of weights per token) and `gemv_q4_k_q8_f16out` (dense/GDN projections in the
+captured graphs) read W with per-lane 2-byte scattered global loads. They now
+dispatch to the reordered mtok kernels at n_tokens=1 (`gemv_mtok_ro_f32_kernel`
+for the fp32 head): coalesced 128-bit W staging into shared memory + hoisted
+per-sub-block state, ~11 KB smem → up to 5 blocks/SM. Same math in the same
+order — the round-2 token gate stays 128/128 IDENTICAL, and the prefill tail
+logits GEMV gains another ~12 tok/s on pp512/pp2048.
 
 tg128 moved 22.4 → 24.2 tok/s. The step is now ~41 ms of almost-pure GPU
 small-kernel time: the one-row dense/GDN GEMVs captured in the per-layer

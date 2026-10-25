@@ -1345,6 +1345,72 @@ __global__ void gemv_grouped_tab_mtok_ro_kernel(
   }
 }
 
+// v0.5 float-out variant for the single-token decode path (head): same
+// reordered math as gemv_mtok_ro_kernel, fp32 output write.
+template <int NG>
+__global__ void gemv_mtok_ro_f32_kernel(
+    const q4k::BlockQ4K* __restrict__ w, const q4k::BlockQ8K* __restrict__ xq,
+    float* __restrict__ y, int n_rows, int k, int n_tokens, int tok_per) {
+  extern __shared__ __align__(16) unsigned char smem[];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int nb = k / 256;
+  const int w_row_bytes = nb * static_cast<int>(sizeof(q4k::BlockQ4K));
+  const int x_row_bytes = nb * static_cast<int>(sizeof(q4k::BlockQ8K));
+  q4k::BlockQ4K* w_sh =
+      reinterpret_cast<q4k::BlockQ4K*>(smem + warp * w_row_bytes);
+  q4k::BlockQ8K* x_sh = reinterpret_cast<q4k::BlockQ8K*>(
+      smem + 8 * w_row_bytes);
+
+  const int row = blockIdx.x * 8 + warp;
+  const int tok0 = blockIdx.y * tok_per;
+  const int nt = min(tok_per, n_tokens - tok0);
+  if (nt <= 0) return;
+
+  for (int t = 0; t < nt; ++t) {
+    stage_bytes(x_sh + static_cast<size_t>(t) * nb,
+                xq + static_cast<size_t>(tok0 + t) * nb, x_row_bytes,
+                threadIdx.x, blockDim.x);
+  }
+  if (row < n_rows) {
+    stage_bytes(w_sh, w + static_cast<size_t>(row) * nb, w_row_bytes, lane, 32);
+  }
+  __syncthreads();
+  if (row >= n_rows) return;
+
+  const int nsg = nb * 8;
+  MtokGState st[NG];
+  int blk_of[NG], sb_of[NG];
+  #pragma unroll
+  for (int gi = 0; gi < NG; ++gi) {
+    const int g = lane + gi * 32;
+    blk_of[gi] = -1;
+    sb_of[gi] = 0;
+    if (g < nsg) {
+      blk_of[gi] = g >> 3;
+      sb_of[gi] = g & 7;
+      mtok_g_load(w_sh[blk_of[gi]], sb_of[gi], st[gi]);
+    }
+  }
+
+  for (int t = 0; t < nt; ++t) {
+    const q4k::BlockQ8K* xb_row = x_sh + static_cast<size_t>(t) * nb;
+    float acc = 0.f;
+    #pragma unroll
+    for (int gi = 0; gi < NG; ++gi) {
+      if (blk_of[gi] >= 0)
+        acc += mtok_g_dot(st[gi], xb_row[blk_of[gi]], sb_of[gi]);
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+    }
+    if (lane == 0) {
+      y[static_cast<size_t>(tok0 + t) * n_rows + row] = acc;
+    }
+  }
+}
+
 // Reorder kill-switch (SAGER_MTOK_REORDER=0 -> original kernels) and the
 // per-lane group dispatch: NG = ceil(nsg/32) = ceil(nb/4).
 inline bool mtok_reorder_on() {
@@ -1418,6 +1484,20 @@ __global__ void gemv_f32_out_f16x_mtok_kernel(const float* __restrict__ w,
   }
 }
 
+// tokens per block from the 48 KB dynamic-shared budget (sm_75 default cap;
+// keeps every variant opt-in free). w_rows_staged: 8 single / 16 fused.
+inline int mtok_tile(int nb, int w_rows_staged) {
+  const int w8 = w_rows_staged * nb * static_cast<int>(sizeof(q4k::BlockQ4K));
+  const int xrow = nb * static_cast<int>(sizeof(q4k::BlockQ8K));
+  int t = (49152 - w8 - 512) / (xrow > 0 ? xrow : 1);
+  return t < 4 ? 4 : (t > 16 ? 16 : t);
+}
+
+inline size_t mtok_smem(int nb, int w_rows_staged, int tile) {
+  return static_cast<size_t>(w_rows_staged) * nb * sizeof(q4k::BlockQ4K) +
+         static_cast<size_t>(tile) * nb * sizeof(q4k::BlockQ8K);
+}
+
 }  // namespace
 
 __global__ void gemv_f16_f16out_kernel(const uint16_t* __restrict__ w,
@@ -1443,11 +1523,59 @@ __global__ void gemv_f16_f16out_kernel(const uint16_t* __restrict__ w,
 
 void gemv_q4_k_q8(const q4k::BlockQ4K* w, const q4k::BlockQ8K* xq, float* y,
                   int n_rows, int k, cudaStream_t stream) {
+  // v0.5: single-token calls (the decode head) run the reordered kernel with
+  // coalesced W staging + hoisted state - same math, bit-exact. The old
+  // kernel's per-lane 2-byte scattered global loads waste ~4x DRAM/L2
+  // efficiency on the 248k-row head.
+  if (mtok_reorder_on()) {
+    const int nb = k / 256;
+    const int nsg = nb * 8;
+    const int ng = (nsg + 31) / 32;
+    if (ng <= 4) {
+      const size_t smem = mtok_smem(nb, 8, 1);
+      if (ng <= 1) {
+        gemv_mtok_ro_f32_kernel<1><<<dim3((n_rows + 7) / 8, 1), 256, smem,
+                                    stream>>>(w, xq, y, n_rows, k, 1, 1);
+        return;
+      } else if (ng <= 2) {
+        gemv_mtok_ro_f32_kernel<2><<<dim3((n_rows + 7) / 8, 1), 256, smem,
+                                    stream>>>(w, xq, y, n_rows, k, 1, 1);
+        return;
+      } else {
+        gemv_mtok_ro_f32_kernel<4><<<dim3((n_rows + 7) / 8, 1), 256, smem,
+                                    stream>>>(w, xq, y, n_rows, k, 1, 1);
+        return;
+      }
+    }
+  }
   gemv_q4_k_q8_kernel<<<(n_rows + 7) / 8, 256, 0, stream>>>(w, xq, y, n_rows, k);
 }
 
 void gemv_q4_k_q8_f16out(const q4k::BlockQ4K* w, const q4k::BlockQ8K* xq,
                          uint16_t* y, int n_rows, int k, cudaStream_t stream) {
+  // v0.5: single-token calls (decode dense/GDN projections) run the
+  // reordered kernel with coalesced W staging - bit-exact, same layout.
+  if (mtok_reorder_on()) {
+    const int nb = k / 256;
+    const int nsg = nb * 8;
+    const int ng = (nsg + 31) / 32;
+    if (ng <= 4) {
+      const size_t smem = mtok_smem(nb, 8, 1);
+      if (ng <= 1) {
+        gemv_mtok_ro_kernel<1><<<dim3((n_rows + 7) / 8, 1), 256, smem,
+                                stream>>>(w, xq, y, n_rows, k, 1, 1);
+        return;
+      } else if (ng <= 2) {
+        gemv_mtok_ro_kernel<2><<<dim3((n_rows + 7) / 8, 1), 256, smem,
+                                stream>>>(w, xq, y, n_rows, k, 1, 1);
+        return;
+      } else {
+        gemv_mtok_ro_kernel<4><<<dim3((n_rows + 7) / 8, 1), 256, smem,
+                                stream>>>(w, xq, y, n_rows, k, 1, 1);
+        return;
+      }
+    }
+  }
   gemv_q4_k_q8_f16_kernel<<<(n_rows + 7) / 8, 256, 0, stream>>>(w, xq, y, n_rows, k);
 }
 
@@ -1490,23 +1618,6 @@ void gemv_f16_f16out(const uint16_t* w, const uint16_t* x, uint16_t* y,
 }
 
 // ---- v0.3 mtok launchers ---------------------------------------------------
-namespace {
-
-// tokens per block from the 48 KB dynamic-shared budget (sm_75 default cap;
-// keeps every variant opt-in free). w_rows_staged: 8 single / 16 fused.
-inline int mtok_tile(int nb, int w_rows_staged) {
-  const int w8 = w_rows_staged * nb * static_cast<int>(sizeof(q4k::BlockQ4K));
-  const int xrow = nb * static_cast<int>(sizeof(q4k::BlockQ8K));
-  int t = (49152 - w8 - 512) / (xrow > 0 ? xrow : 1);
-  return t < 4 ? 4 : (t > 16 ? 16 : t);
-}
-
-inline size_t mtok_smem(int nb, int w_rows_staged, int tile) {
-  return static_cast<size_t>(w_rows_staged) * nb * sizeof(q4k::BlockQ4K) +
-         static_cast<size_t>(tile) * nb * sizeof(q4k::BlockQ8K);
-}
-
-}  // namespace
 
 void gemv_q4_k_q8_f16out_mtok(const q4k::BlockQ4K* w, const q4k::BlockQ8K* xq,
                               uint16_t* y, int n_rows, int k, int n_tokens,
