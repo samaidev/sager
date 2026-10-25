@@ -490,7 +490,8 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
   if (const auto* t = f.tensor("output_norm.weight")) {
     if (copynorm(output_norm, t) != Status::kOk) return Status::kGgufParseError;
   }
-  // output head: Q4_K native, or Q6_K dequantized to fp16.
+  // output head: Q4_K native, Q6_K native (v0.6 raw upload), or Q6_K
+  // dequantized to fp16 (legacy path, SAGER_HEAD_F16=1).
   if (const auto* t = f.tensor("output.weight")) {
     if (t->type == 12) {
       void* p = nullptr;
@@ -503,10 +504,21 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
     } else if (t->type == 14) {
       const int rows = static_cast<int>(t->dims[1]);
       const int cols = static_cast<int>(t->dims[0]);
-      void* p = nullptr;
-      if (cudaMalloc(&p, static_cast<size_t>(rows) * cols * 2) != cudaSuccess)
-        return Status::kOomVram;
-      output = static_cast<uint16_t*>(p);
+      const char* hf = std::getenv("SAGER_HEAD_F16");
+      if (!hf || hf[0] != '1') {
+        // v0.6: keep the model's own 6-bit format - the head GEMV runs the
+        // native Q6_K x q8 kernel (401 MB of weight traffic per decode step
+        // instead of 1017 MB fp16, and 616 MB less VRAM).
+        void* p = nullptr;
+        if (cudaMalloc(&p, t->nbytes) != cudaSuccess) return Status::kOomVram;
+        output = static_cast<uint16_t*>(p);
+        SAGER_CUDA_CHECK(cudaMemcpy(p, f.tensor_data(*t), t->nbytes,
+                                    cudaMemcpyHostToDevice));
+        head_type_ = 14;
+        head_rows_ = rows;
+        SLOG_I("weights", "head Q6_K native: %d rows (%zu KB)",
+               rows, static_cast<size_t>(t->nbytes) / 1024);
+      } else {
       const size_t row_bytes = static_cast<size_t>(t->row_bytes);
       std::vector<uint16_t> out(static_cast<size_t>(rows) * cols);
       std::vector<float> row(cols);
@@ -519,10 +531,15 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
         if ((r & 8191) == 0)
           SLOG_I("weights", "head Q6_K->F16: %d/%d rows", r, rows);
       }
+      void* p = nullptr;
+      if (cudaMalloc(&p, out.size() * 2) != cudaSuccess)
+        return Status::kOomVram;
+      output = static_cast<uint16_t*>(p);
       SAGER_CUDA_CHECK(cudaMemcpy(p, out.data(), out.size() * 2,
                                   cudaMemcpyHostToDevice));
       head_type_ = 1;
       head_rows_ = rows;
+      }
     } else {
       return Status::kGgufParseError;
     }

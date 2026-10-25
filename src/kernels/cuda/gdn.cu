@@ -494,6 +494,101 @@ void gdn_scan_chunk_f16(float* state, uint16_t* y, const uint16_t* qn,
       state, y, qn, kn, conv_out, conv_dim, ab, nk, K, ratio, V, n);
 }
 
+// ---------------------------------------------------------------------------
+// v0.6: warp-per-row chunk scan. The scalar kernel runs one 1-warp block per
+// 32 rows with the whole state slice in shared memory - at nk=16, rows=256
+// that is 128 warps for the whole GPU (4% occupancy), and the token loop
+// stalls on two __syncthreads plus per-token shared staging per step. The
+// warp version gives every (head, row) pair its own warp (nk*rows warps),
+// keeps the K state dims in registers (4 floats per lane, float4 loads) and
+// streams k/q through L2 as 8-byte half4 reads - no shared memory, no block
+// barriers, only warp shuffles. 32x the parallelism at the same math except
+// the fp32 reduction order (lane partials + shuffle tree instead of one
+// scalar chain), so outputs differ at the rounding level - the same trade
+// Strata makes for its chunked GDN scan (docs/DETAILS.md). Env-gated in
+// session.cpp (SAGER_GDN_WS=1).
+// Requires K % 32 == 0 (4 state dims per lane) and 16B-aligned row strides,
+// both checked in the launcher; anything else falls back to the scalar scan.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float gdn_h16f(uint32_t v) {
+  const uint16_t h = static_cast<uint16_t>(v & 0xFFFFu);
+  return __half2float(*reinterpret_cast<const __half*>(&h));
+}
+
+__global__ void gdn_scan_chunk_warp_kernel(float* __restrict__ state,
+                                           uint16_t* __restrict__ y,
+                                           const uint16_t* __restrict__ qn,
+                                           const uint16_t* __restrict__ kn,
+                                           const uint16_t* __restrict__ conv_out,
+                                           int conv_dim, const float* __restrict__ ab,
+                                           int nk, int K, int ratio, int V,
+                                           int n) {
+  const int h = blockIdx.x;
+  const int j = blockIdx.y;                // one row per block
+  const int lane = threadIdx.x & 31;
+  const int rows = ratio * V;
+  const int nv = nk * ratio;
+  const int vh = h * ratio + j / V;
+  float* srow = state + (static_cast<size_t>(h) * rows + j) * K;
+  const uint16_t* khead = kn + static_cast<size_t>(h) * K;
+  const uint16_t* qhead = qn + static_cast<size_t>(h) * K;
+  const uint16_t* vrow = conv_out + 2 * nk * K + static_cast<size_t>(h) * rows + j;
+
+  float4 s = *reinterpret_cast<const float4*>(srow + lane * 4);
+  for (int t = 0; t < n; ++t) {
+    // k/q are shared by every row of this head: L2 broadcasts them.
+    const uint2 kp = *reinterpret_cast<const uint2*>(
+        khead + static_cast<size_t>(t) * nk * K + lane * 4);
+    const uint2 qp = *reinterpret_cast<const uint2*>(
+        qhead + static_cast<size_t>(t) * nk * K + lane * 4);
+    const float k0 = gdn_h16f(kp.x), k1 = gdn_h16f(kp.x >> 16);
+    const float k2 = gdn_h16f(kp.y), k3 = gdn_h16f(kp.y >> 16);
+    const float q0 = gdn_h16f(qp.x), q1 = gdn_h16f(qp.x >> 16);
+    const float q2 = gdn_h16f(qp.y), q3 = gdn_h16f(qp.y >> 16);
+    const float alpha = ab[static_cast<size_t>(t) * 2 * nv + vh];
+    const float beta = ab[static_cast<size_t>(t) * 2 * nv + nv + vh];
+    const float vj = gdn_h16f(vrow[static_cast<size_t>(t) * conv_dim]);
+
+    float u = s.x * k0 + s.y * k1 + s.z * k2 + s.w * k3;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      u += __shfl_down_sync(0xFFFFFFFFu, u, off);
+    }
+    u = __shfl_sync(0xFFFFFFFFu, u, 0);
+    const float ku = -alpha * beta * u + beta * vj;   // k coefficient
+    s.x = alpha * s.x + ku * k0;
+    s.y = alpha * s.y + ku * k1;
+    s.z = alpha * s.z + ku * k2;
+    s.w = alpha * s.w + ku * k3;
+    float yj = s.x * q0 + s.y * q1 + s.z * q2 + s.w * q3;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      yj += __shfl_down_sync(0xFFFFFFFFu, yj, off);
+    }
+    if (lane == 0) {
+      *reinterpret_cast<__half*>(
+          y + static_cast<size_t>(t) * (nv * V) +
+          static_cast<size_t>(h) * rows + j) = __float2half(yj);
+    }
+  }
+  *reinterpret_cast<float4*>(srow + lane * 4) = s;
+}
+
+void gdn_scan_chunk_f16_warp(float* state, uint16_t* y, const uint16_t* qn,
+                             const uint16_t* kn, const uint16_t* conv_out,
+                             int conv_dim, const float* ab, int nk, int K,
+                             int ratio, int V, int n, cudaStream_t stream) {
+  const int rows = ratio * V;
+  if (K % 32 != 0 || (K * 2) % 16 != 0 || (rows * K) % 4 != 0) {
+    gdn_scan_chunk_f16(state, y, qn, kn, conv_out, conv_dim, ab, nk, K,
+                       ratio, V, n, stream);
+    return;
+  }
+  dim3 grid(nk, rows);
+  gdn_scan_chunk_warp_kernel<<<grid, 32, 0, stream>>>(
+      state, y, qn, kn, conv_out, conv_dim, ab, nk, K, ratio, V, n);
+}
+
 void gdn_out_norm_chunk_f16(uint16_t* out, const uint16_t* y,
                             const uint16_t* proj, int proj_rows, int conv_dim,
                             const uint16_t* w_on, int nv, int V, float eps,

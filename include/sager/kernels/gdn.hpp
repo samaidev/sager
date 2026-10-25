@@ -173,6 +173,16 @@ void gdn_scan_chunk_f16(float* state, uint16_t* y, const uint16_t* qn,
                         int conv_dim, const float* ab, int nk, int K,
                         int ratio, int V, int n, cudaStream_t stream);
 
+// v0.6 warp-per-row variant: one warp per (k-head, row) pair, state in
+// registers, k/q streamed through L2, no shared memory or block barriers.
+// Same recurrence, fp32 reduction order differs (lane partials + shuffle
+// tree) -> outputs differ at the rounding level, like Strata's chunked GDN
+// scan. Falls back to gdn_scan_chunk_f16 for shapes it cannot register-map.
+void gdn_scan_chunk_f16_warp(float* state, uint16_t* y, const uint16_t* qn,
+                             const uint16_t* kn, const uint16_t* conv_out,
+                             int conv_dim, const float* ab, int nk, int K,
+                             int ratio, int V, int n, cudaStream_t stream);
+
 // Output gating for every token: out [n x nv*V] = rmsnorm(y) * silu(z),
 // where z is the [nv*V] tail of each proj row.
 void gdn_out_norm_chunk_f16(uint16_t* out, const uint16_t* y,

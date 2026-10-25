@@ -65,18 +65,37 @@ class KVCache {
   size_t slab_bytes_ = 0;
 };
 
-// Decode CUDA graphs: one graph per layer, baked at prepare().
+// Decode CUDA graphs: one graph per layer, baked at prepare(). v0.6 adds a
+// second, FULL-layer graph per layer (dense/GDN body + the device-dispatch
+// MoE half) captured at prepare with the decode residency table in place;
+// replay is gated per layer on absent_cnt_[layer] == 0 (every expert of the
+// layer resident in the table), so the captured MoE body can never hit the
+// absent-expert mailbox. Gated layers replay the dense-only graph + eager
+// MoE dispatch exactly as v0.5.
 class GraphSet {
  public:
   bool valid() const { return valid_; }
   void set_valid(bool v) { valid_ = v; }
+  bool full_valid() const { return full_valid_; }
+  void set_full_valid(bool v) { full_valid_ = v; }
   void* layer_graph(int i) const { return graphs_[static_cast<size_t>(i)]; }
   void  set_layer_graph(int i, void* g) { graphs_[static_cast<size_t>(i)] = g; }
+  void* full_layer_graph(int i) const {
+    return full_graphs_[static_cast<size_t>(i)];
+  }
+  void  set_full_layer_graph(int i, void* g) {
+    full_graphs_[static_cast<size_t>(i)] = g;
+  }
   int   count() const { return static_cast<int>(graphs_.size()); }
-  void  init(int n) { graphs_.assign(static_cast<size_t>(n), nullptr); }
+  void  init(int n) {
+    graphs_.assign(static_cast<size_t>(n), nullptr);
+    full_graphs_.assign(static_cast<size_t>(n), nullptr);
+  }
  private:
   bool valid_ = false;
+  bool full_valid_ = false;
   std::vector<void*> graphs_;
+  std::vector<void*> full_graphs_;
 };
 
 // Internal hot-tier state (defined in layer.cpp / layer_internal.hpp).
@@ -156,6 +175,24 @@ class Session {
   };
   Perf perf;
 
+  // v0.6 dev profiler (SAGER_PROF=1): accumulated segment timings in ms.
+  // decode_step: per-layer dense-graph vs MoE-half split + head + sampler.
+  // forward_window: same split (prefill chunks AND spec-decode verify rows)
+  // plus which MoE dispatch path each call took. Accumulated from cudaEvents
+  // after the stream syncs; ~100 event records per step, PROF runs only.
+  struct Prof {
+    bool on = false;
+    double dec_upload = 0, dec_dense = 0, dec_moe = 0, dec_head = 0,
+           dec_samp = 0;
+    double fw_upload = 0, fw_dense = 0, fw_moe = 0, fw_head = 0;
+    double mtp_draft = 0;
+    int64_t dec_steps = 0;
+    int64_t fw_calls = 0, fw_tokens = 0;
+    int64_t fw_device = 0, fw_batched = 0, fw_rows = 0;
+    int64_t spec_windows = 0, drafted = 0, accepted = 0;
+  };
+  Prof prof;
+
   HostCallbacks cb;
 
  private:
@@ -170,7 +207,9 @@ class Session {
   void   moe_dispatch_batched(int layer, int n);        // v0.2.3 whole-chunk MoE
   void   moe_dispatch_device(int layer, int n);         // v0.4 device-side dispatch
   void   resolve_cpu_mailbox(int layer, int n);         // v0.4 CPU-pool patch
+  void   patch_graph_mailbox(int layer, int cnt);       // v0.6 step-end patch
   void   drain_expert_touch(int n_rows);                // v0.4 chunk-level touch feed
+  void   prof_accum_fw();                               // v0.6 fold fw events
   void   linear_layer_chunk(int layer, int n);          // v0.3 batched GDN walk
   void   head_launch();                                 // final norm+head
   void   head_launch_row(int row);                      // per-row head (prefill tail)
@@ -265,6 +304,31 @@ class Session {
   DeviceBuffer<int>      d_meta_;              // {R, tiles, bad_rows}
   DeviceBuffer<int>      d_mail_, d_mail_n_;   // absent-expert mailbox
   PinnedBuffer<int>      h_mail_n_;            // async mirror of d_mail_n_
+  // v0.6 full-layer decode graphs: per-layer mailbox slots (the captured MoE
+  // body writes its own layer's mail state; the host checks the pinned
+  // mirrors after the step sync - by construction zero for replayed layers).
+  DeviceBuffer<int>      d_mail_all_;          // [n_moe_layer * E]
+  DeviceBuffer<int>      d_mail_n_all_;        // [n_moe_layer]
+  PinnedBuffer<int>      h_mail_n_all_;        // [n_moe_layer] post-step mirror
+  PinnedBuffer<int>      h_mail_all_;          // [n_moe_layer * E] anomaly detail
+  // v0.6 preserved per-layer dispatch plan: lets the step-end CPU-pool patch
+  // recompute absent-expert rows after the graphs ran (the single-buffer plan
+  // is overwritten by later layers mid-step). Sizes are tiny (< 1 MB total).
+  DeviceBuffer<int>      d_off_all_;           // [Lm][E+1]
+  DeviceBuffer<int>      d_toff_all_;          // [Lm][E+1]
+  DeviceBuffer<int>      d_meta_all_;          // [Lm][4]
+  DeviceBuffer<int>      d_gslot_all_;         // [Lm][K]
+  DeviceBuffer<int>      d_grows_all_;         // [Lm][K]
+  DeviceBuffer<uint16_t> d_x16_all_;           // [Lm][H] layer input snapshot
+  DeviceBuffer<float>    d_route_w_all_;       // [Lm][K+1]
+  std::vector<int>       absent_cnt_;          // per MoE layer, from the table
+  std::vector<uint8_t>   used_full_;           // per MoE layer, this step
+  bool                   graphs_full_valid_ = true;   // SAGER_FULL_GRAPH=0 off
+  bool                   head_q6k_ = true;     // SAGER_HEAD_Q6K native head
+  bool                   topk2_ = true;        // SAGER_TOPK2=0 -> single-block
+  bool                   gdn_ws_ = true;       // SAGER_GDN_WS=0 -> scalar scan
+  int                    topk_seg_slots_ = 0;  // two-phase topk scratch slots
+  bool                   moe_dbg_ = false;     // SAGER_MOE_DEBUG=1 step probes
   // CPU-pool patch staging (anomaly path only)
   PinnedBuffer<int>      h_mail_, h_off_;
   DeviceBuffer<int>      d_rk_;
@@ -272,6 +336,11 @@ class Session {
   PinnedBuffer<int>      h_touch_idx_;         // [n_moe_layer][RT][K+1] async
                                                // route-id mirror for touch
   cudaEvent_t            ev_scan_ = nullptr;   // dispatch-scan completion
+  // v0.6 profiler event rings (allocated in prepare() when prof.on)
+  cudaEvent_t*           prof_ev_ = nullptr;   // decode ring
+  cudaEvent_t*           fw_ev_ = nullptr;     // forward_window ring
+  int                    prof_ev_n_ = 0, fw_ev_n_ = 0;
+  int                    fw_ev_pe_ = 0;   // >0: forward_window events pending
   bool pf_device_ = true;    // SAGER_PF_DEVICE=0 -> v0.3 host dispatch
   int  mail_pending_ = -1;   // v0.4: layer whose CPU mailbox is unresolved
   int  pf_rt_ = 0;           // v0.4: batched route-slab row capacity (RT)
@@ -289,8 +358,10 @@ class Session {
   float sam_pres_ = 0.f;
   std::vector<std::pair<int, int>> dec_promote_;  // mailed (layer, expert)
   DeviceBuffer<float>    d_sample_logits_;  // [n_vocab] sampler scratch
-  DeviceBuffer<float>    d_topk_v_;         // [64]
+  DeviceBuffer<float>    d_topk_v_;         // [64] final candidates
   DeviceBuffer<int>      d_topk_i_;         // [64]
+  DeviceBuffer<float>    d_topk_seg_v_;     // v0.6 two-phase scratch
+  DeviceBuffer<int>      d_topk_seg_i_;
   PinnedBuffer<float>    h_topk_v_;         // [64]
   PinnedBuffer<int>      h_topk_i_;         // [64]
   PinnedBuffer<int>      h_step_stage_;     // {id | pos3 | SeqParams} staging

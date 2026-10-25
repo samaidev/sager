@@ -97,6 +97,30 @@ Session::Session(Weights& w, ExpertCache& cache, CpuPool& pool,
     : w_(w), cache_(cache), pool_(pool), mc_(mc), cp_(cp) {}
 
 Session::~Session() {
+  if (prof.on) {
+    SLOG_I(
+        "prof",
+        "dec: steps=%ld upload=%.0f dense=%.0f moe=%.0f head=%.0f samp=%.0f ms | "
+        "fw: calls=%ld toks=%ld upload=%.0f dense=%.0f moe=%.0f head=%.0f ms | "
+        "fw-moe-path: device=%ld batched=%ld rowwalk=%ld | mtp: calls-by-time %.0fms | "
+        "spec: windows=%ld drafted=%ld accepted=%ld",
+        (long)prof.dec_steps, prof.dec_upload, prof.dec_dense, prof.dec_moe,
+        prof.dec_head, prof.dec_samp, (long)prof.fw_calls,
+        (long)prof.fw_tokens, prof.fw_upload, prof.fw_dense, prof.fw_moe,
+        prof.fw_head, (long)prof.fw_device, (long)prof.fw_batched,
+        (long)prof.fw_rows, prof.mtp_draft, (long)prof.spec_windows,
+        (long)prof.drafted, (long)prof.accepted);
+  }
+  if (prof_ev_) {
+    for (int i = 0; i < prof_ev_n_; ++i) cudaEventDestroy(prof_ev_[i]);
+    delete[] prof_ev_;
+    prof_ev_ = nullptr;
+  }
+  if (fw_ev_) {
+    for (int i = 0; i < fw_ev_n_; ++i) cudaEventDestroy(fw_ev_[i]);
+    delete[] fw_ev_;
+    fw_ev_ = nullptr;
+  }
   if (cache_.capacity() > 0) {
     // Persist the usage profile so the next start skips the cold ramp.
     if (const auto p = env_get("SAGER_PROFILE_PATH")) cache_.save_profile(*p);
@@ -245,6 +269,7 @@ Status Session::alloc_scratch() {
   const size_t tbl_entries =
       static_cast<size_t>(d.n_moe_layer) * 3 * E;
   if (!ok(d_ptr_table_.alloc(tbl_entries), "d_ptr_table_")) return Status::kOomVram;
+  const int Lm = d.n_moe_layer;
   if (!ok(d_off_.alloc(E + 1), "d_off_") ||
       !ok(d_toff_.alloc(E + 1), "d_toff_") ||
       !ok(d_meta_.alloc(4), "d_meta_") ||
@@ -253,17 +278,38 @@ Status Session::alloc_scratch() {
       !ok(d_rk_.alloc(static_cast<size_t>(RT) * K), "d_rk_")) {
     return Status::kOomVram;
   }
+  // v0.6 full-layer decode graphs: per-layer mailbox slots
+  if (!ok(d_mail_all_.alloc(static_cast<size_t>(Lm) * E), "d_mail_all_") ||
+      !ok(d_mail_n_all_.alloc(Lm), "d_mail_n_all_") ||
+      !ok(d_off_all_.alloc(static_cast<size_t>(Lm) * (E + 1)), "d_off_all_") ||
+      !ok(d_toff_all_.alloc(static_cast<size_t>(Lm) * (E + 1)), "d_toff_all_") ||
+      !ok(d_meta_all_.alloc(static_cast<size_t>(Lm) * 4), "d_meta_all_") ||
+      !ok(d_gslot_all_.alloc(static_cast<size_t>(Lm) * K), "d_gslot_all_") ||
+      !ok(d_grows_all_.alloc(static_cast<size_t>(Lm) * K), "d_grows_all_") ||
+      !ok(d_x16_all_.alloc(static_cast<size_t>(Lm) * H), "d_x16_all_") ||
+      !ok(d_route_w_all_.alloc(static_cast<size_t>(Lm) * (K + 1)),
+          "d_route_w_all_")) {
+    return Status::kOomVram;
+  }
   if (!h_ptr_table_.alloc(tbl_entries) ||
       !h_mail_n_.alloc(1) || !h_mail_.alloc(E) ||
       !h_off_.alloc(E + 1) || !h_rk_.alloc(static_cast<size_t>(RT) * K) ||
       !h_touch_idx_.alloc(static_cast<size_t>(d.n_moe_layer) * RT *
-                          (K + 1))) {
+                          (K + 1)) ||
+      !h_mail_n_all_.alloc(Lm) ||
+      !h_mail_all_.alloc(static_cast<size_t>(Lm) * E)) {
     return Status::kOomRam;
   }
+  absent_cnt_.assign(static_cast<size_t>(Lm), 0);
+  used_full_.assign(static_cast<size_t>(Lm), 0);
+  topk_seg_slots_ = (V + 2047) / 2048 * 64;
   // v0.5 decode fast path staging (device sampler + step params)
+  const int topk_seg_slots = (V + 2047) / 2048 * 64;
   if (!ok(d_sample_logits_.alloc(V), "d_sample_logits_") ||
       !ok(d_topk_v_.alloc(64), "d_topk_v_") ||
-      !ok(d_topk_i_.alloc(64), "d_topk_i_")) {
+      !ok(d_topk_i_.alloc(64), "d_topk_i_") ||
+      !ok(d_topk_seg_v_.alloc(topk_seg_slots), "d_topk_seg_v_") ||
+      !ok(d_topk_seg_i_.alloc(topk_seg_slots), "d_topk_seg_i_")) {
     return Status::kOomVram;
   }
   if (!h_topk_v_.alloc(64) || !h_topk_i_.alloc(64) ||
@@ -274,6 +320,16 @@ Status Session::alloc_scratch() {
       cudaSuccess) {
     ev_scan_ = nullptr;
     cudaGetLastError();
+  }
+  // v0.6 profiler: event rings (2 records per layer + 4 markers per pass).
+  if (prof.on) {
+    prof_ev_n_ = 2 * d.n_layer + 5;
+    fw_ev_n_ = 2 * d.n_layer + 5;
+    prof_ev_ = new cudaEvent_t[prof_ev_n_]{};
+    fw_ev_ = new cudaEvent_t[fw_ev_n_]{};
+    for (int i = 0; i < prof_ev_n_; ++i)
+      cudaEventCreate(&prof_ev_[i]);
+    for (int i = 0; i < fw_ev_n_; ++i) cudaEventCreate(&fw_ev_[i]);
   }
   if (!h_job_wg_.alloc(job_cap) || !h_job_wu_.alloc(job_cap) ||
       !h_job_wo_.alloc(job_cap) || !h_job_off_.alloc(job_cap) ||
@@ -304,6 +360,7 @@ Status Session::prepare() {
   }
 
   // v0.2.3 prefill knobs (before alloc_scratch - they size the route slabs).
+  if (const auto p = env_get("SAGER_PROF")) prof.on = (*p != "0");
   {
     const auto b = env_get("SAGER_PF_BATCHED");
     if (b) pf_batched_ = (*b != "0");
@@ -323,6 +380,17 @@ Status Session::prepare() {
       if (dd) dec_device_ = (*dd != "0");
       const auto ds = env_get("SAGER_DEVICE_SAMPLER");
       if (ds) dev_sample_ = (*ds != "0");
+      // v0.6 knobs (all default on; each flips cleanly back to v0.5 paths)
+      const auto fg = env_get("SAGER_FULL_GRAPH");
+      if (fg) graphs_full_valid_ = (*fg != "0");
+      const auto hq = env_get("SAGER_HEAD_Q6K");
+      if (hq) head_q6k_ = (*hq != "0");
+      const auto tk = env_get("SAGER_TOPK2");
+      if (tk) topk2_ = (*tk != "0");
+      const auto gw = env_get("SAGER_GDN_WS");
+      if (gw) gdn_ws_ = (*gw != "0");
+      const auto mdb = env_get("SAGER_MOE_DEBUG");
+      if (mdb) moe_dbg_ = (*mdb != "0");
     }
     const EngineDims& dd0 = mc_.dims;
     if (pf_batched_ &&
@@ -336,7 +404,7 @@ Status Session::prepare() {
            pf_cpu_cap_, (int)pf_device_);
   }
 
-  if (w_.head_type_ != 12 && w_.head_type_ != 1) {
+  if (w_.head_type_ != 12 && w_.head_type_ != 1 && w_.head_type_ != 14) {
     SLOG_E("session", "unsupported output head dtype %u (need Q4_K=12); "
                       "re-convert with tools/convert_hf_to_sager.py",
            w_.head_type_);
@@ -695,10 +763,17 @@ void Session::linear_layer_chunk(int layer, int n) {
                               lin_conv_b_.get(), g.conv_dim(), g.n_k_heads,
                               g.key_dim, mc_.norm_eps, n, s);
   // fused recurrence scan (state stays in shared memory across the chunk)
-  cuda::gdn_scan_chunk_f16(delta_st, lin_y_b_.get(), lin_qn_b_.get(),
-                           lin_kn_b_.get(), lin_conv_b_.get(), g.conv_dim(),
-                           lin_ab_b_.get(), g.n_k_heads, g.key_dim, g.ratio(),
-                           g.value_dim, n, s);
+  if (gdn_ws_) {
+    cuda::gdn_scan_chunk_f16_warp(delta_st, lin_y_b_.get(), lin_qn_b_.get(),
+                                  lin_kn_b_.get(), lin_conv_b_.get(),
+                                  g.conv_dim(), lin_ab_b_.get(), g.n_k_heads,
+                                  g.key_dim, g.ratio(), g.value_dim, n, s);
+  } else {
+    cuda::gdn_scan_chunk_f16(delta_st, lin_y_b_.get(), lin_qn_b_.get(),
+                             lin_kn_b_.get(), lin_conv_b_.get(), g.conv_dim(),
+                             lin_ab_b_.get(), g.n_k_heads, g.key_dim,
+                             g.ratio(), g.value_dim, n, s);
+  }
   // output gating + out projection + residual
   cuda::gdn_out_norm_chunk_f16(lin_on_b_.get(), lin_y_b_.get(),
                                lin_proj_b_.get(), g.proj_rows(), g.conv_dim(),
@@ -762,6 +837,92 @@ Status Session::capture_graphs() {
   }
   stream_.sync();
   graphs_.set_valid(true);
+
+  // ---------------------------------------------------------------------------
+  // v0.6 full-layer decode graphs: dense/GDN body + the device-dispatch MoE
+  // half in ONE graph per layer. The MoE body is graph-safe at n=1: the plan
+  // (histogram/prefix/scatter) is computed on device, the grouped GEMV grids
+  // are host-fixed (tiles_max), weights are read through the indirect decode
+  // residency table (updated in place between steps), and the mailbox writes
+  // go to per-layer device slots whose pinned mirrors become memcpy nodes.
+  // Replay is gated per layer on absent_cnt_[layer] == 0, so a replayed MoE
+  // body can never mail. Gated layers keep the v0.5 split (dense graph +
+  // eager dispatch) until promotions/rebalances open the gate.
+  // ---------------------------------------------------------------------------
+  if (graphs_full_valid_ && dec_device_ && pf_device_ && pump_) {
+    if (cudaError_t pe0 = cudaGetLastError(); pe0 != cudaSuccess) {
+      SLOG_W("session", "pre-warmup pending error: %s", cudaGetErrorString(pe0));
+    }
+    build_decode_table();
+    stream_.sync();
+    if (cudaError_t pe1 = cudaGetLastError(); pe1 != cudaSuccess) {
+      SLOG_W("session", "post-table error: %s", cudaGetErrorString(pe1));
+    }
+    // Module-load warmup for the MoE kernels (capture records launches but
+    // never executes them; the warmup runs once with zeroed routes so the
+    // routed experts are the lowest ids - absent ones simply zero their rows).
+    cudaMemsetAsync(route_idx_.get(), 0, (d.n_expert_used + 1) * sizeof(int),
+                    stream_.get());
+    cudaMemsetAsync(route_w_.get(), 0, (d.n_expert_used + 1) * sizeof(float),
+                    stream_.get());
+    stream_.sync();
+    if (cudaError_t pe2 = cudaGetLastError(); pe2 != cudaSuccess) {
+      SLOG_W("session", "post-memset error: %s", cudaGetErrorString(pe2));
+    }
+    moe_dispatch_device(0, 1);
+    stream_.sync();
+    mail_pending_ = -1;   // the warmup's mailbox state is stale - drop it
+    if (cudaError_t we = cudaGetLastError(); we != cudaSuccess) {
+      SLOG_W("session", "moe warmup left error: %s", cudaGetErrorString(we));
+      graphs_full_valid_ = false;
+    }
+  }
+  int full_ok = 0;
+  if (graphs_full_valid_ && dec_device_ && pf_device_ && pump_) {
+    for (int L = 0; L < d.n_layer; ++L) {
+      if (cudaStreamBeginCapture(stream_.get(),
+                                 cudaStreamCaptureModeThreadLocal) !=
+          cudaSuccess) {
+        cudaGetLastError();
+        graphs_full_valid_ = false;
+        break;
+      }
+      if (mc_.is_linear(L)) linear_layer_launch(L, 1);
+      else                  dense_layer_launch(L, 1);
+      moe_dispatch_device(L, 1);
+      cudaGraph_t graph = nullptr;
+      cudaError_t ec = cudaStreamEndCapture(stream_.get(), &graph);
+      if (ec != cudaSuccess) {
+        SLOG_W("session", "L%d: full capture failed: %s", L,
+               cudaGetErrorString(cudaGetLastError()));
+        cudaGetLastError();
+        graphs_full_valid_ = false;
+        break;
+      }
+      cudaGraphExec_t exec = nullptr;
+      if (cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) !=
+          cudaSuccess) {
+        SLOG_W("session", "L%d: full instantiate failed: %s", L,
+               cudaGetErrorString(cudaGetLastError()));
+        cudaGraphDestroy(graph);
+        cudaGetLastError();
+        graphs_full_valid_ = false;
+        break;
+      }
+      cudaGraphDestroy(graph);
+      graphs_.set_full_layer_graph(L, exec);
+      ++full_ok;
+    }
+    stream_.sync();
+    graphs_.set_full_valid(graphs_full_valid_ && full_ok == d.n_layer);
+    SLOG_I("session", "captured %d/%d full-layer decode graphs (%s)",
+           full_ok, d.n_layer,
+           graphs_.full_valid() ? "gate: absent_cnt==0" : "off");
+  } else {
+    graphs_full_valid_ = false;
+    graphs_.set_full_valid(false);
+  }
+
   // Warmup + capture DON'T execute the recorded kernels, but the warmup DID
   // mutate GDN state (one token through a linear layer) - reset it so real
   // inference starts from clean recurrence state.
@@ -1387,6 +1548,16 @@ void Session::moe_dispatch_batched(int layer, int n) {
 // zero and are mailed to the host; resolve_cpu_mailbox() patches them later
 // without stalling the healthy path.
 // ---------------------------------------------------------------------------
+#define MOE_DBG(tag) \
+  do { \
+    if (!moe_dbg_ || capturing) break; \
+    cudaError_t e_ = cudaStreamSynchronize(s); \
+    cudaError_t e2_ = cudaGetLastError(); \
+    if (e_ != cudaSuccess || e2_ != cudaSuccess) \
+      SLOG_E("moe", "dbg %s: sync=%s last=%s", tag, cudaGetErrorString(e_), \
+             cudaGetErrorString(e2_)); \
+  } while (0)
+
 void Session::moe_dispatch_device(int layer, int n) {
   const EngineDims& d = mc_.dims;
   const LayerWeights& lw = w_.layers()[static_cast<size_t>(layer)];
@@ -1398,13 +1569,54 @@ void Session::moe_dispatch_device(int layer, int n) {
   const int h_blocks = H / q4k::kQK_K;
   const long Rmax = static_cast<long>(n) * K;
 
+  // v0.6: during full-layer graph capture the MoE body runs against the
+  // per-layer mailbox slots (fixed addresses, one slice per layer) and skips
+  // the host-side event/mail_pending_ handshake - the captured graph has no
+  // host interplay at all; the pinned mirrors below become memcpy nodes and
+  // the host reads them after the step sync.
+  cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone;
+  const bool capturing =
+      cudaStreamIsCapturing(s, &cap_st) == cudaSuccess &&
+      cap_st == cudaStreamCaptureStatusActive;
+  int* mail_l = capturing ? d_mail_all_.get() + static_cast<size_t>(layer) * E
+                          : d_mail_.get();
+  int* mail_n_l = capturing ? d_mail_n_all_.get() + layer : d_mail_n_.get();
+  // v0.6: in capture mode every plan buffer is a per-layer slice so the
+  // step-end patch can still see this layer's dispatch state after later
+  // layers overwrote the shared single-step buffers.
+  int* gslot_l = capturing
+      ? d_gslot_all_.get() + static_cast<size_t>(layer) * K : d_gslot_.get();
+  int* grows_l = capturing
+      ? d_grows_all_.get() + static_cast<size_t>(layer) * K : d_grows_.get();
+  int* off_l = capturing
+      ? d_off_all_.get() + static_cast<size_t>(layer) * (E + 1)
+      : d_off_.get();
+  int* toff_l = capturing
+      ? d_toff_all_.get() + static_cast<size_t>(layer) * (E + 1)
+      : d_toff_.get();
+  int* meta_l = capturing
+      ? d_meta_all_.get() + static_cast<size_t>(layer) * 4 : d_meta_.get();
+
   // 1) quantize + route (same kernels as the host path - bit-identical).
   cuda::quantize_q8_k(xn_.get(), d_xq_moe_.get(),
                       static_cast<size_t>(n) * H, s);
+  if (capturing) {
+    // preserve this layer's input row for the step-end CPU patch (the next
+    // layer's rmsnorm overwrites xn_ inside the same graph)
+    cudaMemcpyAsync(d_x16_all_.get() + static_cast<size_t>(layer) * H,
+                    xn_.get(), H * sizeof(uint16_t), cudaMemcpyDeviceToDevice,
+                    s);
+  }
   cuda::gemv_f32_out_f16x_mtok(lw.router, xn_.get(), route_logits_.get(),
                                E, H, n, s);
   cuda::router_topk_batched(route_logits_.get(), route_idx_.get(),
                             route_w_.get(), E, K, K + 1, n, s);
+  if (capturing) {
+    cudaMemcpyAsync(d_route_w_all_.get() +
+                        static_cast<size_t>(layer) * (K + 1),
+                    route_w_.get(), (K + 1) * sizeof(float),
+                    cudaMemcpyDeviceToDevice, s);
+  }
 
   // 2) device plan: histogram + prefix sums + grouped scatter + mailbox.
   int tile_gu = 8;
@@ -1413,15 +1625,26 @@ void Session::moe_dispatch_device(int layer, int n) {
              512) / (h_blocks * static_cast<int>(sizeof(q4k::BlockQ8K)));
     tile_gu = t < 4 ? 4 : (t > 16 ? 16 : t);
   }
-  cuda::moe_dispatch_scan(route_idx_.get(), route_w_.get(), d_gslot_.get(),
-                          d_grows_.get(), d_off_.get(), d_toff_.get(),
-                          d_meta_.get(), d_mail_.get(), d_mail_n_.get(),
+  cuda::moe_dispatch_scan(route_idx_.get(), route_w_.get(), gslot_l,
+                          grows_l, off_l, toff_l,
+                          meta_l, mail_l, mail_n_l,
                           n, K, E, tile_gu, s);
-  // mailbox count mirror (lands before ev_scan_ fires)
-  cudaMemcpyAsync(h_mail_n_.get(), d_mail_n_.get(), sizeof(int),
-                  cudaMemcpyDeviceToHost, s);
-  cudaEventRecord(ev_scan_, s);
-  mail_pending_ = layer;
+  MOE_DBG("scan");
+  if (capturing) {
+    // Pinned mirrors as memcpy nodes; the host checks them after the step
+    // sync and runs the CPU-pool patch for any absent experts (rare - the
+    // decode residency covers ~99% of routed rows; see patch_graph_mailbox).
+    cudaMemcpyAsync(h_mail_n_all_.get() + layer, mail_n_l, sizeof(int),
+                    cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(h_mail_all_.get() + static_cast<size_t>(layer) * E,
+                    mail_l, E * sizeof(int), cudaMemcpyDeviceToHost, s);
+  } else {
+    // mailbox count mirror (lands before ev_scan_ fires)
+    cudaMemcpyAsync(h_mail_n_.get(), d_mail_n_.get(), sizeof(int),
+                    cudaMemcpyDeviceToHost, s);
+    cudaEventRecord(ev_scan_, s);
+    mail_pending_ = layer;
+  }
   // chunk-level touch feed: async route-id mirror (consumed by
   // drain_expert_touch at the chunk boundary - no per-layer sync). Layer
   // index == MoE-layer index for this arch (every block is MoE).
@@ -1431,8 +1654,8 @@ void Session::moe_dispatch_device(int layer, int n) {
       cudaMemcpyDeviceToHost, s);
 
   // 3) compact routed rows expert-major (row count read on device).
-  cuda::gather_rows_q8_n(d_xqg_.get(), d_xq_moe_.get(), d_grows_.get(),
-                         d_meta_.get(), static_cast<int>(Rmax), h_blocks, s);
+  cuda::gather_rows_q8_n(d_xqg_.get(), d_xq_moe_.get(), grows_l,
+                         meta_l, static_cast<int>(Rmax), h_blocks, s);
 
   // 4) device-side wait: this layer's planned pairs must have landed (their
   //    loaders patch the pointer table before firing the publish events).
@@ -1450,28 +1673,32 @@ void Session::moe_dispatch_device(int layer, int n) {
   cuda::gemv_grouped2_tab_q4_k_q8_f16out_mtok(
       d_ptr_table_.get() + 0 * lstride,
       d_ptr_table_.get() + 1 * lstride,
-      d_off_.get(), d_toff_.get(), d_meta_.get(), d_mail_.get(),
-      d_mail_n_.get(), tiles_max, d_xqg_.get(), expert_g2_.get(),
+      off_l, toff_l, meta_l, mail_l, mail_n_l,
+      tiles_max, d_xqg_.get(), expert_g2_.get(),
       expert_u2_.get(), FFX, H, E, tile_gu, s);
+  MOE_DBG("gu_tab");
 
   // 6) activation + requant over the compacted slab (device row count).
   cuda::silu_mul_f16_n(expert_g2_.get(), expert_g2_.get(), expert_u2_.get(),
-                       d_meta_.get(), static_cast<int>(Rmax), FFX, s);
-  cuda::quantize_q8_k_n(expert_g2_.get(), d_hqg_.get(), d_meta_.get(), FFX,
+                       meta_l, static_cast<int>(Rmax), FFX, s);
+  MOE_DBG("silu_n");
+  cuda::quantize_q8_k_n(expert_g2_.get(), d_hqg_.get(), meta_l, FFX,
                         static_cast<int>(Rmax) * (FFX / q4k::kQK_K), s);
+  MOE_DBG("requant_n");
 
   // 7) down projection (last reader of the ring slots; absent experts'
   //    output rows are zeroed in-kernel so the combine adds 0).
   cuda::gemv_grouped_tab_q4_k_q8_f16out_mtok(
-      d_ptr_table_.get() + 2 * lstride, d_off_.get(), d_toff_.get(),
-      d_meta_.get(), tiles_max, d_hqg_.get(), y_grouped_.get(), H, FFX, E,
+      d_ptr_table_.get() + 2 * lstride, off_l, toff_l,
+      meta_l, tiles_max, d_hqg_.get(), y_grouped_.get(), H, FFX, E,
       tile_gu, s);
+  MOE_DBG("down_tab");
 
   // 8) ring slots of this layer's planned pairs free after the down GEMM.
   if (pump_->stream_active()) pump_->stream_consume_layer(layer, s);
 
   // 9) compact outputs into the combine slab (gslot built on device).
-  cuda::scatter_routed_f16(expert_y_.get(), y_grouped_.get(), d_gslot_.get(),
+  cuda::scatter_routed_f16(expert_y_.get(), y_grouped_.get(), gslot_l,
                            n, K, H, s);
 
   // 10) shared expert, batched (identical to the host path).
@@ -1502,6 +1729,7 @@ void Session::moe_dispatch_device(int layer, int n) {
   // 11) combine: x_ = residual + sum_k w * expert_y (absent experts add 0).
   cuda::moe_combine_batched_f16(x_.get(), expert_y_.get(), route_w_.get(),
                                 K, H, n, s);
+  MOE_DBG("combine");
 }
 
 // ---------------------------------------------------------------------------
@@ -1516,6 +1744,7 @@ void Session::drain_expert_touch(int n_rows) {
   const EngineDims& d = mc_.dims;
   const int K = d.n_expert_used;
   stream_.sync();   // the chunk's D2H mirrors have landed
+  if (prof.on && fw_ev_pe_ > 0) prof_accum_fw();   // chunk fw events complete
   for (int L = 0; L < d.n_moe_layer; ++L) {
     const int* ids = h_touch_idx_.get() +
         static_cast<size_t>(L) * pf_rt_ * (K + 1);
@@ -1652,6 +1881,122 @@ void Session::resolve_cpu_mailbox(int layer, int n) {
 }
 
 // ---------------------------------------------------------------------------
+// v0.6 step-end CPU-pool patch for full-layer graph replay. Same math as
+// resolve_cpu_mailbox(), but reads the PRESERVED per-layer dispatch state
+// (d_*_all_ slices + the layer's input snapshot) because the shared
+// single-step buffers were overwritten by later layers while the graphs ran.
+// Runs after the step sync (GPU idle - plain blocking copies are fine) and
+// BEFORE the head, so the step's logits are exact.
+// ---------------------------------------------------------------------------
+void Session::patch_graph_mailbox(int layer, int cnt) {
+  const EngineDims& d = mc_.dims;
+  const int H = d.hidden;
+  const int E = d.n_expert;
+  const int K = d.n_expert_used;
+  const int FFX = d.n_ff_exp;
+  cudaStream_t s = stream_.get();
+  const size_t le = static_cast<size_t>(layer) * E;
+
+  // Device state of this layer was preserved by the captured graph.
+  cudaMemcpy(h_mail_.get(), d_mail_all_.get() + le,
+             static_cast<size_t>(cnt) * sizeof(int), cudaMemcpyDeviceToHost);
+  cudaMemcpy(h_off_.get(), d_off_all_.get() +
+                 static_cast<size_t>(layer) * (E + 1),
+             (E + 1) * sizeof(int), cudaMemcpyDeviceToHost);
+  cudaMemcpy(h_gslot_.get(), d_gslot_all_.get() +
+                 static_cast<size_t>(layer) * K,
+             static_cast<size_t>(K) * sizeof(int), cudaMemcpyDeviceToHost);
+  const int R = h_off_.get()[E];
+  if (R > 0 && R <= K) {
+    cudaMemcpy(h_grows_.get(), d_grows_all_.get() +
+                   static_cast<size_t>(layer) * K,
+               static_cast<size_t>(R) * sizeof(int), cudaMemcpyDeviceToHost);
+  }
+  cudaMemcpy(h_x16_.get(), d_x16_all_.get() + static_cast<size_t>(layer) * H,
+             static_cast<size_t>(H) * sizeof(uint16_t),
+             cudaMemcpyDeviceToHost);
+
+  // Dedup mailed experts (each absent expert mails once per tile-block).
+  std::vector<uint8_t> mailed(static_cast<size_t>(E), 0);
+  std::vector<int> uniq;
+  for (int i = 0; i < cnt && i < E; ++i) {
+    const int e = h_mail_.get()[i];
+    if (e >= 0 && e < E && !mailed[static_cast<size_t>(e)]) {
+      mailed[static_cast<size_t>(e)] = 1;
+      uniq.push_back(e);
+    }
+  }
+  // Queue arena promotion for the step end (the GPU is idle here; the next
+  // step's table rebuild picks the slots up).
+  for (int e : uniq) dec_promote_.emplace_back(layer, e);
+
+  // Rebuild (row, kk) for the absent experts and run the AVX2 pool. At the
+  // decode step n == 1, so the single routed row is row 0.
+  const size_t gu = hot_->per_expert_bytes / 3;
+  int n_patch = 0;
+  struct Patch { int r, kk, e; };
+  std::vector<Patch> patches;
+  for (int e : uniq) {
+    for (int pos = h_off_.get()[e]; pos < h_off_.get()[e + 1]; ++pos) {
+      if (pos < 0 || pos >= R) continue;
+      const int r = h_grows_.get()[pos];
+      for (int kk = 0; kk < K; ++kk) {
+        if (h_gslot_.get()[kk] == pos) {
+          patches.push_back({r, kk, e});
+          break;
+        }
+      }
+    }
+  }
+  if (static_cast<int>(patches.size()) > pf_cpu_cap_) {
+    SLOG_W("moe", "layer %d: %zu patch rows exceed cap %d - dropping tail",
+           layer, patches.size(), pf_cpu_cap_);
+    patches.resize(static_cast<size_t>(pf_cpu_cap_));
+  }
+  if (patches.empty()) return;
+
+  std::vector<MissJob> mjobs;
+  mjobs.reserve(patches.size());
+  for (const Patch& pc : patches) {
+    float* mx = miss_x_.get() + static_cast<size_t>(n_patch) * H;
+    const uint16_t* x16 = h_x16_.get() + static_cast<size_t>(pc.r) * H;
+    for (int t = 0; t < H; ++t) {
+      mx[t] = q4k::half_to_float(x16[t]);
+    }
+    const uint8_t* exp = w_.host_expert_base() +
+        (static_cast<size_t>(layer) * E + pc.e) * hot_->per_expert_bytes;
+    mjobs.push_back(MissJob{
+        layer, pc.e, reinterpret_cast<const q4k::BlockQ4K*>(exp),
+        reinterpret_cast<const q4k::BlockQ4K*>(exp + gu),
+        reinterpret_cast<const q4k::BlockQ4K*>(exp + 2 * gu), mx,
+        miss_y_.get() + static_cast<size_t>(n_patch) * H, H, FFX});
+    h_cflat_.get()[n_patch] = static_cast<int>(
+        (static_cast<size_t>(pc.r) * (K + 1) + pc.kk) * H);
+    h_rk_.get()[n_patch] =
+        static_cast<int>(static_cast<size_t>(pc.r) * (K + 1) + pc.kk);
+    ++n_patch;
+  }
+  pool_.submit(std::move(mjobs));
+  pool_.wait_done(nullptr);
+  cudaMemcpyAsync(d_miss_y_.get(), miss_y_.get(),
+                  static_cast<size_t>(n_patch) * H * sizeof(float),
+                  cudaMemcpyHostToDevice, s);
+  cudaMemcpyAsync(d_cflat_.get(), h_cflat_.get(),
+                  static_cast<size_t>(n_patch) * sizeof(int),
+                  cudaMemcpyHostToDevice, s);
+  cudaMemcpyAsync(d_rk_.get(), h_rk_.get(),
+                  static_cast<size_t>(n_patch) * sizeof(int),
+                  cudaMemcpyHostToDevice, s);
+  cuda::scatter_rows_generic_f16(expert_y_.get(), d_miss_y_.get(),
+                                 d_cflat_.get(), n_patch, H, s);
+  cuda::moe_combine_add_slots_f16(x_.get(), expert_y_.get(),
+                                  d_route_w_all_.get() +
+                                      static_cast<size_t>(layer) * (K + 1),
+                                  d_rk_.get(), K, H, n_patch, s);
+  stream_.sync();
+}
+
+// ---------------------------------------------------------------------------
 // Head
 // ---------------------------------------------------------------------------
 void Session::head_launch() {
@@ -1664,6 +2009,12 @@ void Session::head_launch() {
     cuda::gemv_f16_f16out(w_.output, xn_.get(), d_logits16_.get(), d.n_vocab,
                           d.hidden, s);
     cuda::convert_f16_to_f32(d_logits16_.get(), logits_.get(), d.n_vocab, s);
+  } else if (w_.head_type_ == 14 && head_q6k_) {
+    // v0.6: native Q6_K head - 401 MB of weight traffic per step instead of
+    // the 1017 MB fp16 copy, no separate convert launch.
+    cuda::quantize_q8_k(xn_.get(), d_xq_.get(), d.hidden, s);
+    cuda::gemv_q6_k_q8(w_.output, d_xq_.get(), logits_.get(), d.n_vocab,
+                       d.hidden, s);
   } else {
     cuda::quantize_q8_k(xn_.get(), d_xq_.get(), d.hidden, s);
     cuda::gemv_q4_k_q8(Q4W(w_.output), d_xq_.get(), logits_.get(), d.n_vocab,
@@ -1683,6 +2034,10 @@ void Session::head_launch_row(int row) {
     cuda::gemv_f16_f16out(w_.output, xn_.get(), d_logits16_.get(), d.n_vocab,
                           d.hidden, s);
     cuda::convert_f16_to_f32(d_logits16_.get(), logits_.get(), d.n_vocab, s);
+  } else if (w_.head_type_ == 14 && head_q6k_) {
+    cuda::quantize_q8_k(xn_.get(), d_xq_.get(), d.hidden, s);
+    cuda::gemv_q6_k_q8(w_.output, d_xq_.get(), logits_.get(), d.n_vocab,
+                       d.hidden, s);
   } else {
     cuda::quantize_q8_k(xn_.get(), d_xq_.get(), d.hidden, s);
     cuda::gemv_q4_k_q8(Q4W(w_.output), d_xq_.get(), logits_.get(), d.n_vocab,
@@ -1734,6 +2089,16 @@ void Session::build_decode_table() {
                   h_ptr_table_.count() * sizeof(q4k::BlockQ4K*),
                   cudaMemcpyHostToDevice, stream_.get());
   dec_tbl_built_ = true;
+  // v0.6: per-layer absent-expert counts drive the full-graph replay gate
+  // (a layer is only replayed from its captured graph when every expert is
+  // resident, so the captured MoE body can never hit the mailbox).
+  for (int L = 0; L < Lm; ++L) {
+    int cnt = 0;
+    for (int e = 0; e < E; ++e) {
+      if (!h_ptr_table_.get()[static_cast<size_t>(L) * E + e]) ++cnt;
+    }
+    absent_cnt_[static_cast<size_t>(L)] = cnt;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1830,6 +2195,7 @@ const float* Session::decode_step(int last_id) {
     st[3] = p;
     st[8] = p;
     st[9] = 1;
+    if (prof.on) cudaEventRecord(prof_ev_[0], s);
     cudaMemcpyAsync(d_ids_.get(), st, sizeof(int), cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(d_pos_ids_.get(), st + 1,
                     (mc_.use_mrope ? 3 : 1) * sizeof(int),
@@ -1841,9 +2207,21 @@ const float* Session::decode_step(int last_id) {
 
     pump_->begin_step(static_cast<uint64_t>(perf.steps) + 1);
     dec_mail_ok_ = true;
+    int pe = 1;
+    std::fill(used_full_.begin(), used_full_.end(), 0);
     for (int L = 0; L < d.n_layer; ++L) {
       resolve_cpu_mailbox(L - 1, 1);
-      if (graphs_.valid() && graphs_.layer_graph(L)) {
+      // v0.6: replay the FULL layer (dense + MoE) from one graph. Absent
+      // experts zero their rows in-kernel and mail to the per-layer slot;
+      // the step-end patch recomputes them from the CPU pool before the
+      // head runs (same exact-logits semantics as the v0.4 boundary patch).
+      const bool use_full =
+          graphs_.full_valid() && graphs_.full_layer_graph(L) != nullptr;
+      if (use_full) {
+        cudaGraphLaunch(
+            static_cast<cudaGraphExec_t>(graphs_.full_layer_graph(L)), s);
+        if (L < static_cast<int>(used_full_.size())) used_full_[L] = 1;
+      } else if (graphs_.valid() && graphs_.layer_graph(L)) {
         cudaGraphLaunch(static_cast<cudaGraphExec_t>(graphs_.layer_graph(L)),
                         s);
       } else if (mc_.is_linear(L)) {
@@ -1851,11 +2229,32 @@ const float* Session::decode_step(int last_id) {
       } else {
         dense_layer_launch(L, 1);
       }
-      moe_dispatch_device(L, 1);
+      if (prof.on) cudaEventRecord(prof_ev_[pe++], s);
+      if (!use_full) moe_dispatch_device(L, 1);
+      if (prof.on) cudaEventRecord(prof_ev_[pe++], s);
     }
+    if (prof.on) cudaEventRecord(prof_ev_[pe++], s);   // layers done
     resolve_cpu_mailbox(d.n_layer - 1, 1);
     dec_mail_ok_ = false;
+
+    // v0.6: land the per-layer mail mirrors, then patch any absent-expert
+    // rows (CPU pool + AVX2) into x_ BEFORE the head - the step's logits stay
+    // exact even when a routed expert is not resident (v0.4 semantics).
+    stream_.sync();
+    if (graphs_.full_valid()) {
+      for (int L = 0;
+           L < d.n_layer && L < static_cast<int>(used_full_.size()); ++L) {
+        if (!used_full_[L] ||
+            L >= static_cast<int>(h_mail_n_all_.count())) {
+          continue;
+        }
+        const int cnt = h_mail_n_all_.get()[L];
+        if (cnt > 0) patch_graph_mailbox(L, cnt);
+      }
+    }
+
     head_launch();
+    if (prof.on) cudaEventRecord(prof_ev_[pe++], s);   // head done
 
     if (dev_sample_) {
       // Device sampler: scratch copy + penalties + top-k; generate.cpp
@@ -1872,8 +2271,15 @@ const float* Session::decode_step(int last_id) {
                                   sam_rep_, sam_pres_, s);
       }
       const int ksel = 32;
-      cuda::topk_select_f32(d_sample_logits_.get(), d.n_vocab,
-                            d_topk_v_.get(), d_topk_i_.get(), ksel, s);
+      if (topk2_) {
+        cuda::topk_select_f32_2p(
+            d_sample_logits_.get(), d_topk_seg_v_.get(), d_topk_seg_i_.get(),
+            topk_seg_slots_, d_topk_v_.get(), d_topk_i_.get(), d.n_vocab,
+            ksel, s);
+      } else {
+        cuda::topk_select_f32(d_sample_logits_.get(), d.n_vocab,
+                              d_topk_v_.get(), d_topk_i_.get(), ksel, s);
+      }
       cudaMemcpyAsync(h_topk_v_.get(), d_topk_v_.get(),
                       ksel * sizeof(float), cudaMemcpyDeviceToHost, s);
       cudaMemcpyAsync(h_topk_i_.get(), d_topk_i_.get(), ksel * sizeof(int),
@@ -1884,11 +2290,32 @@ const float* Session::decode_step(int last_id) {
       cudaMemcpyAsync(logits_host_.get(), logits_.get(),
                       d.n_vocab * sizeof(float), cudaMemcpyDeviceToHost, s);
     }
+    if (prof.on) cudaEventRecord(prof_ev_[pe++], s);   // sampler done
 
     // Stash the final hidden row for the MTP drafter (fixed buffer, D2D).
     cudaMemcpyAsync(xf_.get(), xn_.get(), d.hidden * sizeof(uint16_t),
                     cudaMemcpyDeviceToDevice, s);
     stream_.sync();
+
+    if (prof.on) {
+      ++prof.dec_steps;
+      float ms = 0.f;
+      cudaEventElapsedTime(&ms, prof_ev_[0], prof_ev_[1]);
+      prof.dec_upload += ms;
+      for (int i = 1; i + 1 < pe; i += 2) {
+        cudaEventElapsedTime(&ms, prof_ev_[i], prof_ev_[i + 1]);
+        prof.dec_moe += ms;
+        if (i + 2 < pe) {
+          cudaEventElapsedTime(&ms, prof_ev_[i + 1], prof_ev_[i + 2]);
+          prof.dec_dense += ms;
+        }
+      }
+      // pe-3: layers-done marker, pe-2: head-done, pe-1: sampler-done
+      cudaEventElapsedTime(&ms, prof_ev_[pe - 3], prof_ev_[pe - 2]);
+      prof.dec_head += ms;
+      cudaEventElapsedTime(&ms, prof_ev_[pe - 2], prof_ev_[pe - 1]);
+      prof.dec_samp += ms;
+    }
 
     pos_ = p + 1;
     push_recent(last_id);
@@ -2029,11 +2456,21 @@ Status Session::forward_window(const std::vector<int>& window,
   const bool device_dispatch = batched && pf_device_ &&
                                pump_->stream_active() &&
                                pump_->stream_loader_count() > 0;
+  if (prof.on) {
+    ++prof.fw_calls;
+    prof.fw_tokens += n;
+    if (device_dispatch)      ++prof.fw_device;
+    else if (batched)         ++prof.fw_batched;
+    else                      prof.fw_rows += n;
+    fw_ev_pe_ = 1;
+    cudaEventRecord(fw_ev_[0], s);
+  }
   for (int L = 0; L < d.n_layer; ++L) {
     if (abort_flag && *abort_flag) return Status::kAborted;
     resolve_cpu_mailbox(L - 1, n);   // no-op unless the prior layer mailed
     if (mc_.is_linear(L)) linear_layer_launch(L, n);
     else                  dense_layer_launch(L, n);
+    if (prof.on) cudaEventRecord(fw_ev_[fw_ev_pe_++], s);
     if (device_dispatch) {
       moe_dispatch_device(L, n);
     } else if (batched) {
@@ -2041,6 +2478,7 @@ Status Session::forward_window(const std::vector<int>& window,
     } else {
       for (int t = 0; t < n; ++t) moe_dispatch_row(L, t);
     }
+    if (prof.on) cudaEventRecord(fw_ev_[fw_ev_pe_++], s);
   }
   resolve_cpu_mailbox(d.n_layer - 1, n);   // force the last layer's mailbox
   pos_ = p + n;
@@ -2050,6 +2488,7 @@ Status Session::forward_window(const std::vector<int>& window,
 
   if (logits_out) {
     // Batched head: all rows at once, then one D2H.
+    if (prof.on) cudaEventRecord(fw_ev_[fw_ev_pe_++], s);   // layers done
     cuda::rmsnorm_batched_f16(xn_.get(), x_.get(), w_.output_norm, d.hidden,
                               mc_.norm_eps, n, s);
     // MTP stash: the drafter must condition on the pass actually executed
@@ -2071,8 +2510,36 @@ Status Session::forward_window(const std::vector<int>& window,
                     lwin.get() + static_cast<size_t>(n - 1) * d.n_vocab,
                     d.n_vocab * sizeof(float), cudaMemcpyDeviceToHost, s);
     stream_.sync();
+    if (prof.on) {
+      cudaEventRecord(fw_ev_[fw_ev_pe_++], s);   // head done (synced above)
+      prof_accum_fw();
+    }
+  } else if (prof.on) {
+    cudaEventRecord(fw_ev_[fw_ev_pe_++], s);   // head runs at prefill tail
   }
   return Status::kOk;
+}
+
+// v0.6: fold the pending forward_window event ring into prof. Called after a
+// stream sync that is guaranteed to be ordered after the recorded events
+// (verify head sync, or drain_expert_touch's chunk-boundary sync).
+void Session::prof_accum_fw() {
+  if (!prof.on || fw_ev_pe_ <= 1) return;
+  const int pe = fw_ev_pe_;
+  float ms = 0.f;
+  cudaEventElapsedTime(&ms, fw_ev_[0], fw_ev_[1]);
+  prof.fw_upload += ms;
+  for (int i = 1; i + 1 < pe; i += 2) {
+    cudaEventElapsedTime(&ms, fw_ev_[i], fw_ev_[i + 1]);
+    prof.fw_moe += ms;
+    if (i + 2 < pe) {
+      cudaEventElapsedTime(&ms, fw_ev_[i + 1], fw_ev_[i + 2]);
+      prof.fw_dense += ms;
+    }
+  }
+  cudaEventElapsedTime(&ms, fw_ev_[pe - 2], fw_ev_[pe - 1]);
+  prof.fw_head += ms;
+  fw_ev_pe_ = 0;
 }
 
 void Session::reset() {

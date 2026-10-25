@@ -1551,6 +1551,94 @@ void gemv_q4_k_q8(const q4k::BlockQ4K* w, const q4k::BlockQ8K* xq, float* y,
   gemv_q4_k_q8_kernel<<<(n_rows + 7) / 8, 256, 0, stream>>>(w, xq, y, n_rows, k);
 }
 
+// ---------------------------------------------------------------------------
+// v0.6: native Q6_K GEMV (single token - the decode head). Weights stay in
+// the model's own 6-bit super-block format (210 B per 256 weights) instead of
+// the load-time fp16 dequant copy: 401 MB of weight traffic per decode step
+// instead of 1017 MB on the 248k-row head, and 616 MB less VRAM. One warp
+// per row; 16-weight sub-groups run on dp4a with the -32 zero point corrected
+// by a ones-vector dp4a against the int8 activations; per-sub-group scales
+// accumulate in fp32. Layout is llama.cpp's block_q6_K: ql[128] | qh[64] |
+// sc int8[16] | d fp16 (weights.cpp dequant_row_q6 documents the mapping).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float q6_u16f(uint16_t v) {
+  return __half2float(*reinterpret_cast<const __half*>(&v));
+}
+
+__global__ void gemv_q6_k_q8_kernel(const uint8_t* __restrict__ w6,
+                                    const q4k::BlockQ8K* __restrict__ xq,
+                                    float* __restrict__ y, int n_rows, int k) {
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int row = blockIdx.x * 8 + warp;
+  if (row >= n_rows) return;
+  const int nb = k / 256;                 // super-blocks per row (2048 -> 8)
+  const uint8_t* roww =
+      w6 + static_cast<size_t>(row) * static_cast<size_t>(nb) * 210;
+
+  float acc = 0.f;
+  // 16 sub-groups of 16 weights per super-block; lane strides sub-groups.
+  // Within a block, sub-group t decomposes as n = t >> 3, r = t & 7,
+  // qslot = r >> 1, is = r & 1; weights are n*128 + qslot*32 + is*16 + j
+  // (j < 16) with scale sc[t]. ql byte l = is*16 + j lives at byte offset
+  // (qslot & 1) * 32 + is*16 + j of the block, low nibble for qslot 0/1 and
+  // high nibble for qslot 2/3; the 2-bit high field sits in qh[l] >> 2*qslot.
+  for (int sg = lane; sg < nb * 16; sg += 32) {
+    const int blk = sg >> 4;
+    const int t = sg & 15;
+    const int qslot = (t & 7) >> 1;
+    const int is = t & 1;
+    const uint8_t* blk6 = roww + static_cast<size_t>(blk) * 210;
+    const uint8_t* ql = blk6 + (qslot & 1) * 32 + is * 16;
+    const uint8_t* qh = blk6 + 128 + is * 16;
+    const int8_t* sc = reinterpret_cast<const int8_t*>(blk6 + 192);
+    const float d = q6_u16f(*reinterpret_cast<const uint16_t*>(blk6 + 208));
+    const q4k::BlockQ8K& xb = xq[blk];
+    const int colbase = (t >> 3) * 128 + qslot * 32 + is * 16;
+    const int nib = (qslot & 2) ? 4 : 0;
+    const int hshift = qslot * 2;
+
+    int isum = 0, xsum = 0;
+    #pragma unroll
+    for (int g = 0; g < 4; ++g) {         // 4 weights per dp4a
+      uint32_t wpack = 0;
+      uint32_t xpack;
+      int x0, x1, x2, x3;
+      {
+        const int8_t* xp = xb.qs + colbase + g * 4;
+        x0 = xp[0]; x1 = xp[1]; x2 = xp[2]; x3 = xp[3];
+        xpack = static_cast<uint32_t>(static_cast<uint8_t>(x0)) |
+                (static_cast<uint32_t>(static_cast<uint8_t>(x1)) << 8) |
+                (static_cast<uint32_t>(static_cast<uint8_t>(x2)) << 16) |
+                (static_cast<uint32_t>(static_cast<uint8_t>(x3)) << 24);
+      }
+      #pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        const int j = g * 4 + q;
+        const int lo = (ql[j] >> nib) & 0xF;
+        const int hi = (qh[j] >> hshift) & 3;
+        const int qv = lo | (hi << 4);
+        if (q == 0) wpack = static_cast<uint32_t>(qv);
+        else wpack |= static_cast<uint32_t>(qv) << (q * 8);
+      }
+      isum = __dp4a(static_cast<int>(wpack), static_cast<int>(xpack), isum);
+      xsum = __dp4a(static_cast<int>(xpack), 0x01010101, xsum);
+    }
+    acc += d * static_cast<float>(sc[t]) *
+           static_cast<float>(isum - 32 * xsum);
+  }
+
+  #pragma unroll
+  for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+  if (lane == 0) y[row] = acc;
+}
+
+void gemv_q6_k_q8(const void* w6, const q4k::BlockQ8K* xq, float* y,
+                  int n_rows, int k, cudaStream_t stream) {
+  gemv_q6_k_q8_kernel<<<(n_rows + 7) / 8, 256, 0, stream>>>(
+      static_cast<const uint8_t*>(w6), xq, y, n_rows, k);
+}
+
 void gemv_q4_k_q8_f16out(const q4k::BlockQ4K* w, const q4k::BlockQ8K* xq,
                          uint16_t* y, int n_rows, int k, cudaStream_t stream) {
   // v0.5: single-token calls (decode dense/GDN projections) run the
@@ -1803,8 +1891,13 @@ __global__ void quantize_q8_k_n_kernel(const uint16_t* x, q4k::BlockQ8K* out,
 void quantize_q8_k_n(const uint16_t* x_f16, q4k::BlockQ8K* out,
                      const int* d_rows, int row_mult, int n_max,
                      cudaStream_t stream) {
-  quantize_q8_k_n_kernel<<<n_max / 256, 256, 0, stream>>>(x_f16, out, d_rows,
-                                                          row_mult);
+  // v0.6 FIX: this was `n_max / 256` - at the single-token decode step
+  // (n_max = K * FFX/256 = 16) the grid rounded DOWN to 0 and the launch
+  // failed with "invalid argument", silently leaving the routed experts'
+  // quantized activations stale in d_hqg_ (v0.5 device-path corruption).
+  quantize_q8_k_n_kernel<<<(n_max + 255) / 256, 256, 0, stream>>>(x_f16, out,
+                                                                  d_rows,
+                                                                  row_mult);
 }
 
 void gemv_grouped2_tab_q4_k_q8_f16out_mtok(

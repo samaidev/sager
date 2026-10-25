@@ -207,6 +207,7 @@ Status run_generation(Session& s, SpecController& ctrl, MtpDrafter& mtp,
     std::vector<int> cand;
     const int depth = ctrl.choose_depth(ctrl.config().miss_ms_expected);
     if (depth > 0) {
+      const double mtp_t0 = now_ms();
       cand = suffix.draft(last3);
       if (static_cast<int>(cand.size()) > depth) cand.resize(static_cast<size_t>(depth));
       if (mtp.ready()) {
@@ -215,6 +216,9 @@ Status run_generation(Session& s, SpecController& ctrl, MtpDrafter& mtp,
         if (m.size() > room) m.resize(room);
         cand.insert(cand.end(), m.begin(), m.end());
       }
+#if defined(SAGER_HAVE_CUDA)
+      s.prof.mtp_draft += now_ms() - mtp_t0;
+#endif
     }
 
     // 3. verify or plain decode
@@ -235,6 +239,10 @@ Status run_generation(Session& s, SpecController& ctrl, MtpDrafter& mtp,
     window.push_back(t);
     window.insert(window.end(), cand.begin(), cand.end());
     VerifyResult vr = verify_window(s, window);
+#if defined(SAGER_HAVE_CUDA)
+    ++s.prof.spec_windows;
+    s.prof.drafted += static_cast<int>(cand.size());
+#endif
     if (vr.next_token < 0) {
       // Verify pass failed - fall back to a plain decode of t.
       const float* lg = s.decode_step(t);
@@ -252,6 +260,9 @@ Status run_generation(Session& s, SpecController& ctrl, MtpDrafter& mtp,
                  vr.accepted);
     out->drafted += static_cast<int>(cand.size());
     out->accepted += vr.accepted;
+#if defined(SAGER_HAVE_CUDA)
+    s.prof.accepted += vr.accepted;
+#endif
 
     // 4. emit the accepted candidates (window[0]=t already emitted).
     bool broke = false;

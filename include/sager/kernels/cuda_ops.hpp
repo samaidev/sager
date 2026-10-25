@@ -41,6 +41,13 @@ static_assert(sizeof(SeqParams) == 8, "");
 void gemv_q4_k_q8(const q4k::BlockQ4K* w, const q4k::BlockQ8K* x_q8, float* y,
                   int n_rows, int k, cudaStream_t stream);
 
+// v0.6: native Q6_K x q8 GEMV (single token - the decode head). w_q6 points
+// at raw block_q6_K bytes (210 B per 256 weights, llama.cpp layout); the
+// result matches the f16-dequant head up to weight-rounding differences (the
+// native dot is the more faithful of the two). One warp per row, dp4a math.
+void gemv_q6_k_q8(const void* w_q6, const q4k::BlockQ8K* x_q8, float* y,
+                  int n_rows, int k, cudaStream_t stream);
+
 // fp16-output variant (activations already fp16; saves the f32->f16 convert
 // for the small per-expert projections).
 void gemv_q4_k_q8_f16out(const q4k::BlockQ4K* w, const q4k::BlockQ8K* x_q8,
@@ -323,6 +330,15 @@ int argmax_f32(const float* logits, int n_vocab, cudaStream_t stream);
 // softmax/top-p/min_p/multinomial over the k candidates (see generate.cpp).
 void topk_select_f32(const float* logits, int n, float* out_v, int* out_i,
                      int k, cudaStream_t stream);
+
+// v0.6 two-phase top-k: same selected set and tie rule as topk_select_f32,
+// computed by parallel per-segment scans + one merge block (~25 us at
+// n=248320, k=32 on T4). seg_v/seg_i: scratch for the per-segment candidates
+// (>= ceil(n/2048) * k slots); falls back to the single-block kernel when the
+// scratch is too small.
+void topk_select_f32_2p(const float* logits, float* seg_v, int* seg_i,
+                        int seg_slots, float* out_v, int* out_i, int n, int k,
+                        cudaStream_t stream);
 
 // v0.5: repetition/presence penalty pass over the recent-id window (the
 // decode device sampler applies it before the top-k selection).

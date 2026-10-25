@@ -116,6 +116,135 @@ void topk_select_f32(const float* logits, int n, float* out_v, int* out_i,
   topk_select_kernel<<<1, 1024, 0, stream>>>(logits, out_v, out_i, n, k);
 }
 
+// ---------------------------------------------------------------------------
+// v0.6 two-phase top-k. Phase 1 computes a per-segment top-k in parallel
+// (one block per 2048-logit segment, the same (value, lower-index) rule as
+// the single-block kernel), phase 2 merges the segment candidates in one
+// block. The union of the segment sets always covers the global top-k (every
+// segment holds >= k elements) and both phases apply the identical tie rule,
+// so the selected set is exactly the single-block kernel's - the split only
+// changes which SM scans what. ~25 us instead of ~700 us at n=248320, k=32.
+// ---------------------------------------------------------------------------
+inline constexpr int kTopkSeg = 2048;
+
+__global__ void topk_seg_kernel(const float* __restrict__ logits,
+                                float* __restrict__ out_v,
+                                int* __restrict__ out_i, int n, int k,
+                                int seg) {
+  extern __shared__ float sm[];          // segment copy, winners masked
+  const int base = blockIdx.x * seg;
+  const int cnt = min(seg, n - base);
+  for (int i = threadIdx.x; i < seg; i += blockDim.x) {
+    sm[i] = (i < cnt) ? logits[base + i] : -3.4e38f;
+  }
+  __syncthreads();
+  __shared__ float red_v[32];
+  __shared__ int red_i[32];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int nth = blockDim.x;
+  for (int it = 0; it < k; ++it) {
+    float bv = -3.4e38f;
+    int bi = -1;
+    for (int i = threadIdx.x; i < seg; i += nth) {
+      const float v = sm[i];
+      const int gi = base + i;
+      if (v > bv || (v == bv && bi >= 0 && gi < bi)) { bv = v; bi = gi; }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      const float ov = __shfl_down_sync(0xFFFFFFFFu, bv, off);
+      const int oi = __shfl_down_sync(0xFFFFFFFFu, bi, off);
+      if (ov > bv || (ov == bv && oi >= 0 && oi < bi)) { bv = ov; bi = oi; }
+    }
+    if (lane == 0) { red_v[warp] = bv; red_i[warp] = bi; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      float mv = -3.4e38f;
+      int mi = -1;
+      const int nw = (nth + 31) / 32;
+      for (int w = 0; w < nw; ++w) {
+        if (red_v[w] > mv || (red_v[w] == mv && red_i[w] >= 0 &&
+                              (mi < 0 || red_i[w] < mi))) {
+          mv = red_v[w];
+          mi = red_i[w];
+        }
+      }
+      out_v[static_cast<size_t>(blockIdx.x) * k + it] = mv;
+      out_i[static_cast<size_t>(blockIdx.x) * k + it] = mi;
+      if (mi >= 0) sm[mi - base] = -3.4e38f;
+    }
+    __syncthreads();
+  }
+}
+
+__global__ void topk_merge_kernel(const float* __restrict__ in_v,
+                                  int* __restrict__ in_i,
+                                  float* __restrict__ out_v,
+                                  int* __restrict__ out_i, int m, int k) {
+  __shared__ float red_v[32];
+  __shared__ int red_i[32];
+  __shared__ int red_s[32];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int nth = blockDim.x;
+  for (int it = 0; it < k; ++it) {
+    float bv = -3.4e38f;
+    int bi = -1, bs = -1;                 // value, candidate id, slot
+    for (int i = threadIdx.x; i < m; i += nth) {
+      const float v = in_v[i];
+      const int gi = in_i[i];
+      if (v > bv || (v == bv && gi >= 0 && (bi < 0 || gi < bi))) {
+        bv = v; bi = gi; bs = i;
+      }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      const float ov = __shfl_down_sync(0xFFFFFFFFu, bv, off);
+      const int oi = __shfl_down_sync(0xFFFFFFFFu, bi, off);
+      const int os = __shfl_down_sync(0xFFFFFFFFu, bs, off);
+      if (ov > bv || (ov == bv && oi >= 0 && (bi < 0 || oi < bi))) {
+        bv = ov; bi = oi; bs = os;
+      }
+    }
+    if (lane == 0) { red_v[warp] = bv; red_i[warp] = bi; red_s[warp] = bs; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      float mv = -3.4e38f;
+      int mi = -1, ms = -1;
+      const int nw = (nth + 31) / 32;
+      for (int w = 0; w < nw; ++w) {
+        if (red_v[w] > mv || (red_v[w] == mv && red_i[w] >= 0 &&
+                              (mi < 0 || red_i[w] < mi))) {
+          mv = red_v[w];
+          mi = red_i[w];
+          ms = red_s[w];
+        }
+      }
+      out_v[it] = mv;
+      out_i[it] = mi;
+      if (ms >= 0) const_cast<float*>(in_v)[ms] = -3.4e38f;
+    }
+    __syncthreads();
+  }
+}
+
+void topk_select_f32_2p(const float* logits, float* seg_v, int* seg_i,
+                        int seg_slots, float* out_v, int* out_i, int n, int k,
+                        cudaStream_t stream) {
+  if (k <= 0 || n <= 0) return;
+  if (k > 64) k = 64;
+  const int nblk = (n + kTopkSeg - 1) / kTopkSeg;
+  if (nblk * k > seg_slots) {
+    topk_select_kernel<<<1, 1024, 0, stream>>>(logits, out_v, out_i, n, k);
+    return;
+  }
+  topk_seg_kernel<<<nblk, 256, kTopkSeg * sizeof(float), stream>>>(
+      logits, seg_v, seg_i, n, k, kTopkSeg);
+  topk_merge_kernel<<<1, 256, 0, stream>>>(seg_v, seg_i, out_v, out_i,
+                                           nblk * k, k);
+}
+
 void apply_penalties_f32(float* logits, const int* recent_ids, int n_recent,
                          float rep_penalty, float presence_penalty,
                          cudaStream_t stream) {
