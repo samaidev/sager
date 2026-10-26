@@ -551,8 +551,10 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
                                          static_cast<float>(d.head_dim));
   cudaStream_t s = stream_.get();
 
-  if (dec_fuse_) {
-    // v0.8: rmsnorm + Q8_K quant in one launch (bit-identical to the pair)
+  if (dec_fuse_ && n_tokens == 1) {
+    // v0.8: rmsnorm + Q8_K quant in one launch (bit-identical to the pair);
+    // decode-only - at n>1 the two-kernel sequence's spread-out quantize
+    // grid wins (the fused kernel is barrier-heavy per row)
     cuda::rmsnorm_quant_f16(xn_.get(), x_.get(), lw.attn_norm, d_xq_.get(),
                             H, mc_.norm_eps, n_tokens, s);
   } else {
@@ -687,7 +689,7 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
   if (!(n_tokens == 1 && dec_fuse_)) {
     cuda::add_f16(x_.get(), o_proj_.get(), n_tokens * H, s);
   }
-  if (dec_fuse_) {
+  if (dec_fuse_ && n_tokens == 1) {
     cuda::rmsnorm_quant_f16(xn_.get(), x_.get(), lw.ffn_norm, d_xq_.get(),
                             H, mc_.norm_eps, n_tokens, s);
     moe_xq_in_ = d_xq_.get();   // the MoE quantizes xn - reuse the fused q8
@@ -1862,17 +1864,15 @@ void Session::moe_dispatch_device(int layer, int n) {
                     xn_.get(), H * sizeof(uint16_t), cudaMemcpyDeviceToDevice,
                     s);
   }
-  if (n == 1 && dec_fuse_) {
-    // v0.8: router logits + warp-parallel top-k in ONE launch (the v0.7
-    // batched kernel selects serially in thread 0 - ~20-40 us per layer).
-    cuda::router_topk_fused(lw.router, xn_.get(), route_idx_.get(),
-                            route_w_.get(), E, K, H, s);
-  } else {
-    cuda::gemv_f32_out_f16x_mtok(lw.router, xn_.get(), route_logits_.get(),
-                                 E, H, n, s);
-    cuda::router_topk_batched(route_logits_.get(), route_idx_.get(),
-                              route_w_.get(), E, K, K + 1, n, s);
-  }
+  // v0.8: the router GEMV stays multi-block (2 MB of fp32 W through one SM
+  // is a loss); the win is the batched top-k kernel's warp-parallel
+  // selection (below in moe.cu) - the v0.7 kernel selected serially in
+  // thread 0 (~20-40 us per layer).
+  cuda::gemv_f32_out_f16x_mtok(lw.router, xn_.get(), route_logits_.get(),
+                               E, H, n, s);
+  cuda::router_topk_batched(route_logits_.get(), route_idx_.get(),
+                            route_w_.get(), E, K, K + 1, n, s);
+  (void)dec_fuse_;
   if (capturing) {
     cudaMemcpyAsync(d_route_w_all_.get() +
                         static_cast<size_t>(layer) * (K + 1),
