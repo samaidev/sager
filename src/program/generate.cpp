@@ -159,6 +159,9 @@ Status run_generation(Session& s, SpecController& ctrl, MtpDrafter& mtp,
 #endif
   SLOG_I("gen", "drafters: suffix_max=%d mtp_ready=%d mtp_max=%d",
          suffix.max_draft(), mtp.ready() ? 1 : 0, mtp.max_draft());
+  // v0.7 fix: the device-side penalties read these - v0.5/v0.6 never set
+  // them, so the device route sampled without the request's penalties.
+  s.set_sampler_penalties(p.repeat_penalty, p.presence_penalty);
 
   while (out->tokens < p.max_tokens) {
     if (abort && *abort) { out->status = Status::kAborted; break; }

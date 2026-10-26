@@ -249,6 +249,7 @@ class Session {
   DeviceBuffer<q4k::BlockQ8K> d_xq_, d_hq_, d_mq_;
   DeviceBuffer<float>    logits_, mtp_logits_;
   DeviceBuffer<int>      d_recent_;
+  DeviceBuffer<int>  d_recent_n_;             // v0.7: recent-window count (graph-safe)
   // v0.2 expert pump staging (C7: fixed addresses, session-thread only)
   DeviceBuffer<q4k::BlockQ4K*> d_ptrs_pump_;  // compact pump ptr table (3*K)
   DeviceBuffer<int>      d_pump_rows_;         // pumped row -> routed slot k
@@ -374,6 +375,18 @@ class Session {
   std::vector<int> recent_ids_;
   std::vector<int> h_pos_tmp_;   // pinned-less pos staging for window forwards
   static constexpr int kMaxRecent = 64;
+
+  // v0.7 whole-step decode graph (embed + all layers in ONE graph; head +
+  // sampler in a second graph). Cuts per-step CPU dispatch from ~40 graph
+  // launches + eager calls to 2 launches - the 2-vCPU host can otherwise not
+  // feed the T4 (68% GPU idle measured at 643 launches/step).
+  Status capture_step_graph();
+  void* step_graph_ = nullptr;    // cudaGraphExec_t, owned raw
+  void* head_graph_ = nullptr;    // cudaGraphExec_t, owned raw
+  bool  step_graph_ok_ = false;
+  bool  step_graph_on_ = true;
+  bool  fast_sample_ = true;   // device top-k on the legacy decode path
+  bool  capturing_step_ = false;  // whole-step capture in progress
 
   // v0.2.3 prefill knobs (read once in prepare())
   bool pf_batched_ = true;    // SAGER_PF_BATCHED=0 -> legacy per-row walk

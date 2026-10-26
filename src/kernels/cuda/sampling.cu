@@ -47,7 +47,50 @@ __global__ void softmax_inplace_kernel(float* logits, int n) {
   if (i < n) logits[i] = expf(logits[i] - m_sh) / z_sh;
 }
 
+__global__ void apply_penalties_devn_kernel(float* logits,
+                                            const int* recent_ids,
+                                            const int* n_recent,
+                                            const float* params) {
+  // Deterministic duplicate handling: the sequential walk applies f(v) =
+  // (v/rep - pres) once per occurrence of the id. Fold all m applications
+  // into the LAST occurrence's thread (others exit) - race-free and equal to
+  // the ideal sequential semantics for any rep/pres combination.
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int n = *n_recent;
+  if (i >= n) return;
+  const int id = recent_ids[i];
+  if (id < 0) return;                       // sentinel slot
+  int total = 0, ordinal = 0;
+  for (int j = 0; j < n; ++j) {
+    if (recent_ids[j] == id) {
+      ++total;
+      if (j <= i) ++ordinal;
+    }
+  }
+  if (ordinal != total) return;             // a later occurrence applies it
+  float v = logits[id];
+  const float rep = params[0];
+  const float pres = params[1];
+  // Same application order as sample_host: all rep divisions, then all
+  // presence subtractions.
+  if (rep != 1.0f) {
+    for (int r = 0; r < total; ++r) v = (v > 0.f) ? v / rep : v * rep;
+  }
+  if (pres != 0.f) {
+    for (int r = 0; r < total; ++r) v -= pres;
+  }
+  logits[id] = v;
+}
+
 }  // namespace
+
+void apply_penalties_f32_devn(float* logits, const int* recent_ids,
+                              const int* n_recent, const float* params,
+                              cudaStream_t s) {
+  const int cap = 64;   // kMaxRecent; threads beyond the count exit early
+  apply_penalties_devn_kernel<<<1, cap, 0, s>>>(logits, recent_ids, n_recent,
+                                                params);
+}
 
 int argmax_f32(const float*, int, cudaStream_t) {
   // The session/verify path performs argmax on the host over the already-

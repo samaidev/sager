@@ -222,6 +222,7 @@ Status Session::alloc_scratch() {
   if (!ok(d_ids_.alloc(T), "d_ids_")) return Status::kOomVram;
   if (!ok(d_pos_ids_.alloc(3 * T), "d_pos_ids_")) return Status::kOomVram;
   if (!ok(d_recent_.alloc(kMaxRecent), "d_recent_")) return Status::kOomVram;
+  if (!ok(d_recent_n_.alloc(1), "d_recent_n_")) return Status::kOomVram;
 
   // v0.2 expert pump staging
   if (!ok(d_ptrs_pump_.alloc(3 * K), "d_ptrs_pump_")) return Status::kOomVram;
@@ -313,7 +314,7 @@ Status Session::alloc_scratch() {
     return Status::kOomVram;
   }
   if (!h_topk_v_.alloc(64) || !h_topk_i_.alloc(64) ||
-      !h_step_stage_.alloc(32) || !h_recent_stage_.alloc(kMaxRecent)) {
+      !h_step_stage_.alloc(32) || !h_recent_stage_.alloc(kMaxRecent + 1)) {
     return Status::kOomRam;
   }
   if (cudaEventCreateWithFlags(&ev_scan_, cudaEventDisableTiming) !=
@@ -361,6 +362,8 @@ Status Session::prepare() {
 
   // v0.2.3 prefill knobs (before alloc_scratch - they size the route slabs).
   if (const auto p = env_get("SAGER_PROF")) prof.on = (*p != "0");
+  if (const auto p = env_get("SAGER_STEP_GRAPH")) step_graph_on_ = (*p != "0");
+  if (const auto p = env_get("SAGER_FAST_SAMPLE")) fast_sample_ = (*p != "0");
   {
     const auto b = env_get("SAGER_PF_BATCHED");
     if (b) pf_batched_ = (*b != "0");
@@ -928,6 +931,124 @@ Status Session::capture_graphs() {
   // inference starts from clean recurrence state.
   zero_gdn_states();
   SLOG_I("session", "captured %d per-layer decode graphs", d.n_layer);
+
+  // v0.7: whole-step graph (embed + every layer) + head graph (head +
+  // penalties + top-k + mirrors). Two cudaGraphLaunch calls per decode step
+  // instead of ~40 layer-graph launches + eager calls; on this 2-vCPU host
+  // the launch storm left the GPU idle 68% of the step.
+  if (step_graph_on_ && graphs_.full_valid()) {
+    const Status ssg = capture_step_graph();
+    if (ssg != Status::kOk) {
+      SLOG_W("session", "step-graph capture failed - per-layer path stays");
+      step_graph_ok_ = false;
+    }
+  }
+  return Status::kOk;
+}
+
+Status Session::capture_step_graph() {
+  const EngineDims& d = mc_.dims;
+  cudaStream_t s = stream_.get();
+  int* st = h_step_stage_.get();
+
+  // (a) step graph: pinned-stage H2D + embedding + every layer (dense/GDN
+  // body + the graph-safe device-dispatch MoE with per-layer slots).
+  if (cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal) !=
+      cudaSuccess) {
+    cudaGetLastError();
+    return Status::kCudaError;
+  }
+  capturing_step_ = true;
+  cudaMemcpyAsync(d_ids_.get(), st, sizeof(int), cudaMemcpyHostToDevice, s);
+  cudaMemcpyAsync(d_pos_ids_.get(), st + 1,
+                  (mc_.use_mrope ? 3 : 1) * sizeof(int),
+                  cudaMemcpyHostToDevice, s);
+  cudaMemcpyAsync(d_params_.get(), st + 8, sizeof(SeqParams),
+                  cudaMemcpyHostToDevice, s);
+  cuda::gather_embed(x_.get(), w_.tok_embd, d_ids_.get(), 1, d.hidden, s);
+  for (int L = 0; L < d.n_layer; ++L) {
+    if (mc_.is_linear(L)) linear_layer_launch(L, 1);
+    else                  dense_layer_launch(L, 1);
+    moe_dispatch_device(L, 1);
+  }
+  // v0.7: TWO bulk D2H mirror nodes replace ~120 per-layer CE round trips.
+  cudaMemcpyAsync(h_mail_n_all_.get(), d_mail_n_all_.get(),
+                  static_cast<size_t>(d.n_moe_layer) * sizeof(int),
+                  cudaMemcpyDeviceToHost, s);
+  cudaMemcpyAsync(h_mail_all_.get(), d_mail_all_.get(),
+                  static_cast<size_t>(d.n_moe_layer) * d.n_expert *
+                      sizeof(int),
+                  cudaMemcpyDeviceToHost, s);
+  capturing_step_ = false;
+  cudaGraph_t g = nullptr;
+  if (cudaStreamEndCapture(s, &g) != cudaSuccess) {
+    SLOG_W("session", "step capture end failed: %s",
+           cudaGetErrorString(cudaGetLastError()));
+    return Status::kCudaError;
+  }
+  cudaGraphExec_t sg = nullptr;
+  if (cudaGraphInstantiate(&sg, g, nullptr, nullptr, 0) != cudaSuccess) {
+    SLOG_W("session", "step instantiate failed: %s",
+           cudaGetErrorString(cudaGetLastError()));
+    cudaGraphDestroy(g);
+    cudaGetLastError();
+    return Status::kCudaError;
+  }
+  cudaGraphDestroy(g);
+  step_graph_ = sg;
+
+  // (b) head graph: output head + penalties (device-driven count and (rep,
+  // pres) params) + two-phase top-k + pinned topk mirrors + MTP stash.
+  if (cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal) !=
+      cudaSuccess) {
+    cudaGetLastError();
+    return Status::kCudaError;
+  }
+  head_launch();
+  cudaMemcpyAsync(d_sample_logits_.get(), logits_.get(),
+                  d.n_vocab * sizeof(float), cudaMemcpyDeviceToDevice, s);
+  cudaMemcpyAsync(d_recent_.get(), h_recent_stage_.get(),
+                  kMaxRecent * sizeof(int), cudaMemcpyHostToDevice, s);
+  cudaMemcpyAsync(d_recent_n_.get(), h_recent_stage_.get() + kMaxRecent,
+                  sizeof(int), cudaMemcpyHostToDevice, s);
+  cuda::apply_penalties_f32_devn(d_sample_logits_.get(), d_recent_.get(),
+                                 d_recent_n_.get(),
+                                 reinterpret_cast<const float*>(st + 10), s);
+  const int ksel = 32;
+  cuda::topk_select_f32_2p(d_sample_logits_.get(), d_topk_seg_v_.get(),
+                           d_topk_seg_i_.get(), topk_seg_slots_,
+                           d_topk_v_.get(), d_topk_i_.get(), d.n_vocab, ksel,
+                           s);
+  cudaMemcpyAsync(h_topk_v_.get(), d_topk_v_.get(), ksel * sizeof(float),
+                  cudaMemcpyDeviceToHost, s);
+  cudaMemcpyAsync(h_topk_i_.get(), d_topk_i_.get(), ksel * sizeof(int),
+                  cudaMemcpyDeviceToHost, s);
+  // Full-logits D2H for the host-sampler route (SAGER_DEVICE_SAMPLER=0);
+  // harmless overhead in the device route (mirrors are used there).
+  cudaMemcpyAsync(logits_host_.get(), logits_.get(),
+                  d.n_vocab * sizeof(float), cudaMemcpyDeviceToHost, s);
+  cudaMemcpyAsync(xf_.get(), xn_.get(), d.hidden * sizeof(uint16_t),
+                  cudaMemcpyDeviceToDevice, s);
+  cudaGraph_t hg = nullptr;
+  if (cudaStreamEndCapture(s, &hg) != cudaSuccess) {
+    SLOG_W("session", "head capture end failed: %s",
+           cudaGetErrorString(cudaGetLastError()));
+    return Status::kCudaError;
+  }
+  cudaGraphExec_t he = nullptr;
+  if (cudaGraphInstantiate(&he, hg, nullptr, nullptr, 0) != cudaSuccess) {
+    SLOG_W("session", "head instantiate failed: %s",
+           cudaGetErrorString(cudaGetLastError()));
+    cudaGraphDestroy(hg);
+    cudaGetLastError();
+    return Status::kCudaError;
+  }
+  cudaGraphDestroy(hg);
+  head_graph_ = he;
+  stream_.sync();
+  step_graph_ok_ = true;
+  SLOG_I("session",
+         "captured whole-step decode graph (+head) - 2 launches/step");
   return Status::kOk;
 }
 
@@ -1630,15 +1751,15 @@ void Session::moe_dispatch_device(int layer, int n) {
                           meta_l, mail_l, mail_n_l,
                           n, K, E, tile_gu, s);
   MOE_DBG("scan");
-  if (capturing) {
+  if (capturing && !capturing_step_) {
     // Pinned mirrors as memcpy nodes; the host checks them after the step
     // sync and runs the CPU-pool patch for any absent experts (rare - the
     // decode residency covers ~99% of routed rows; see patch_graph_mailbox).
-    cudaMemcpyAsync(h_mail_n_all_.get() + layer, mail_n_l, sizeof(int),
-                    cudaMemcpyDeviceToHost, s);
-    cudaMemcpyAsync(h_mail_all_.get() + static_cast<size_t>(layer) * E,
-                    mail_l, E * sizeof(int), cudaMemcpyDeviceToHost, s);
-  } else {
+    // v0.7: SKIPPED while capturing the whole-step graph - 40 layers x 3
+    // tiny D2H nodes cost ~100 us of copy-engine round trip EACH on T4
+    // (~24 ms/step!). The whole-step graph copies both packed mirrors with
+    // TWO bulk D2H nodes at its end instead.
+  } else if (!capturing) {
     // mailbox count mirror (lands before ev_scan_ fires)
     cudaMemcpyAsync(h_mail_n_.get(), d_mail_n_.get(), sizeof(int),
                     cudaMemcpyDeviceToHost, s);
@@ -1648,10 +1769,14 @@ void Session::moe_dispatch_device(int layer, int n) {
   // chunk-level touch feed: async route-id mirror (consumed by
   // drain_expert_touch at the chunk boundary - no per-layer sync). Layer
   // index == MoE-layer index for this arch (every block is MoE).
-  cudaMemcpyAsync(
-      h_touch_idx_.get() + static_cast<size_t>(layer) * pf_rt_ * (K + 1),
-      route_idx_.get(), static_cast<size_t>(n) * (K + 1) * sizeof(int),
-      cudaMemcpyDeviceToHost, s);
+  // v0.7: not emitted during whole-step capture (CE round trips); the step
+  // path skips drain_expert_touch, cache decay via tick() still runs.
+  if (!capturing_step_) {
+    cudaMemcpyAsync(
+        h_touch_idx_.get() + static_cast<size_t>(layer) * pf_rt_ * (K + 1),
+        route_idx_.get(), static_cast<size_t>(n) * (K + 1) * sizeof(int),
+        cudaMemcpyDeviceToHost, s);
+  }
 
   // 3) compact routed rows expert-major (row count read on device).
   cuda::gather_rows_q8_n(d_xqg_.get(), d_xq_moe_.get(), grows_l,
@@ -2177,6 +2302,98 @@ const float* Session::decode_step(int last_id) {
   cudaStream_t s = stream_.get();
   const bool dev_path = dec_device_ && pf_device_ && pump_ != nullptr;
 
+  if (dev_path && step_graph_ok_) {
+    // ---- v0.7 whole-step decode: TWO cudaGraphLaunch calls carry the whole
+    // step (embedding + 40 layers, then head + penalties + top-k + mirrors).
+    // The pinned stage buffers are read by memcpy nodes at replay time, so
+    // the CPU only writes them, launches, and syncs once. Absent experts
+    // still zero + mail in-kernel; the step-end CPU patch re-runs the head
+    // graph (rare at ~99% row residency) to keep logits exact.
+    dev_sample_valid_ = false;
+    if (!dec_tbl_built_) build_decode_table();
+    const int p7 = pos_;
+    int* st7 = h_step_stage_.get();
+    st7[0] = last_id;
+    st7[1] = p7; st7[2] = p7; st7[3] = p7;
+    st7[8] = p7; st7[9] = 1;
+    {
+      float* sf7 = reinterpret_cast<float*>(st7 + 10);
+      sf7[0] = sam_rep_;
+      sf7[1] = sam_pres_;
+    }
+    const int nr7 = static_cast<int>(recent_ids_.size());
+    for (int i = 0; i < nr7 && i < kMaxRecent; ++i)
+      h_recent_stage_[i] = recent_ids_[i];
+    h_recent_stage_[kMaxRecent] = nr7;
+
+    const double t07 = now_ms();
+    if (prof.on) cudaEventRecord(prof_ev_[0], s);
+    pump_->begin_step(static_cast<uint64_t>(perf.steps) + 1);
+    dec_mail_ok_ = true;
+    cudaGraphLaunch(static_cast<cudaGraphExec_t>(step_graph_), s);
+    cudaGraphLaunch(static_cast<cudaGraphExec_t>(head_graph_), s);
+    if (prof.on) cudaEventRecord(prof_ev_[1], s);
+    stream_.sync();
+    dec_mail_ok_ = false;
+
+    // Rare absent-expert patch: recompute the missing rows from the CPU pool
+    // into x_, then replay the head graph so logits stay exact.
+    bool patched7 = false;
+    const int Lm7 = mc_.dims.n_moe_layer;
+    for (int L = 0; L < mc_.dims.n_layer &&
+                    L < static_cast<int>(h_mail_n_all_.count()); ++L) {
+      const int cnt7 = h_mail_n_all_.get()[L];
+      if (cnt7 > 0) {
+        patch_graph_mailbox(L, cnt7);
+        patched7 = true;
+      }
+    }
+    if (patched7) {
+      cudaGraphLaunch(static_cast<cudaGraphExec_t>(head_graph_), s);
+      stream_.sync();
+    }
+    dev_sample_k_ = dev_sample_ ? 32 : 0;
+    dev_sample_valid_ = dev_sample_;
+
+    pos_ = p7 + 1;
+    push_recent(last_id);
+
+    // Residency maintenance: decay + periodic rebalance (off the steady path).
+    cache_.tick(0.9995f);
+    if (perf.steps > 0 && perf.steps % 4096 == 0) {
+      if (cache_.rebalance() > 0) {
+        hot_->rebuild(cache_, w_, mc_.dims.n_moe_layer, mc_.dims.n_expert,
+                      mc_.expert_bytes());
+        dec_tbl_built_ = false;
+      }
+    }
+    // Arena promotion of mailed experts (GPU idle here - race-free).
+    if (!dec_promote_.empty()) {
+      for (const auto& le : dec_promote_) {
+        pump_->submit(le.first, le.second,
+                      static_cast<uint64_t>(perf.steps) + 1);
+      }
+      pump_->arm_wait(s);
+      dec_promote_.clear();
+      dec_tbl_built_ = false;
+    }
+    // v0.7: no touch feed on the whole-step path (CE mirrors removed); the
+    // decay via cache_.tick still runs, so residency stays stable.
+
+    if (prof.on) {
+      ++prof.dec_steps;
+      float ms7 = 0.f;
+      cudaEventElapsedTime(&ms7, prof_ev_[0], prof_ev_[1]);
+      prof.dec_dense += ms7;
+    }
+    const double ms7b = now_ms() - t07;
+    perf.decode_tps = perf.decode_tps > 0
+                          ? 0.9 * perf.decode_tps + 0.1 * (1000.0 / ms7b)
+                          : 1000.0 / ms7b;
+    ++perf.steps;
+    return logits_host_.get();
+  }
+
   if (dev_path) {
     // ---- v0.5 device-dispatch decode: the whole step is enqueued with NO
     // per-layer host sync. Layers replay their captured dense/GDN graphs;
@@ -2262,13 +2479,21 @@ const float* Session::decode_step(int last_id) {
       // ~1 MB full-logits D2H of the host-sampler path.
       cudaMemcpyAsync(d_sample_logits_.get(), logits_.get(),
                       d.n_vocab * sizeof(float), cudaMemcpyDeviceToDevice, s);
-      const int nr = static_cast<int>(recent_ids_.size());
-      if (nr > 0) {
-        for (int i = 0; i < nr; ++i) h_recent_stage_[i] = recent_ids_[i];
+      {
+        const int nr = static_cast<int>(recent_ids_.size());
+        for (int i = 0; i < kMaxRecent; ++i)
+          h_recent_stage_[i] = (i < nr) ? recent_ids_[i] : -1;
+        h_recent_stage_[kMaxRecent] = nr;
+        float* sf = reinterpret_cast<float*>(h_step_stage_.get() + 10);
+        sf[0] = sam_rep_;
+        sf[1] = sam_pres_;
         cudaMemcpyAsync(d_recent_.get(), h_recent_stage_.get(),
-                        nr * sizeof(int), cudaMemcpyHostToDevice, s);
-        cuda::apply_penalties_f32(d_sample_logits_.get(), d_recent_.get(), nr,
-                                  sam_rep_, sam_pres_, s);
+                        kMaxRecent * sizeof(int), cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(d_recent_n_.get(), h_recent_stage_.get() + kMaxRecent,
+                        sizeof(int), cudaMemcpyHostToDevice, s);
+        cuda::apply_penalties_f32_devn(
+            d_sample_logits_.get(), d_recent_.get(), d_recent_n_.get(),
+            reinterpret_cast<const float*>(h_step_stage_.get() + 10), s);
       }
       const int ksel = 32;
       if (topk2_) {
@@ -2383,6 +2608,44 @@ const float* Session::decode_step(int last_id) {
   // Stash the final hidden row for the MTP drafter (fixed buffer, D2D).
   cudaMemcpyAsync(xf_.get(), xn_.get(), d.hidden * sizeof(uint16_t),
                   cudaMemcpyDeviceToDevice, s);
+  if (fast_sample_) {
+    // v0.7: device top-k on the legacy path. Replaces the ~10 ms host
+    // softmax/argmax over the 248k vocab with a ~25 us two-phase top-k.
+    // Penalties run on device with the same order as sample_host (rep m
+    // times, then pres m times, per id); the full logits still land on the
+    // host as the finish_device_sample fallback.
+    cudaMemcpyAsync(d_sample_logits_.get(), logits_.get(),
+                    d.n_vocab * sizeof(float), cudaMemcpyDeviceToDevice, s);
+    {
+      const int nr = static_cast<int>(recent_ids_.size());
+      for (int i = 0; i < kMaxRecent; ++i)
+        h_recent_stage_[i] = (i < nr) ? recent_ids_[i] : -1;
+      h_recent_stage_[kMaxRecent] = nr;
+      float* sf = reinterpret_cast<float*>(h_step_stage_.get() + 10);
+      sf[0] = sam_rep_;
+      sf[1] = sam_pres_;
+      cudaMemcpyAsync(d_recent_.get(), h_recent_stage_.get(),
+                      kMaxRecent * sizeof(int), cudaMemcpyHostToDevice, s);
+      cudaMemcpyAsync(d_recent_n_.get(), h_recent_stage_.get() + kMaxRecent,
+                      sizeof(int), cudaMemcpyHostToDevice, s);
+      cuda::apply_penalties_f32_devn(d_sample_logits_.get(), d_recent_.get(),
+                                     d_recent_n_.get(),
+                                     reinterpret_cast<const float*>(
+                                         h_step_stage_.get() + 10), s);
+    }
+    cuda::topk_select_f32_2p(d_sample_logits_.get(), d_topk_seg_v_.get(),
+                             d_topk_seg_i_.get(), topk_seg_slots_,
+                             d_topk_v_.get(), d_topk_i_.get(), d.n_vocab, 32,
+                             s);
+    cudaMemcpyAsync(h_topk_v_.get(), d_topk_v_.get(), 32 * sizeof(float),
+                    cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(h_topk_i_.get(), d_topk_i_.get(), 32 * sizeof(int),
+                    cudaMemcpyDeviceToHost, s);
+    dev_sample_k_ = 32;
+    dev_sample_valid_ = true;
+  } else {
+    dev_sample_valid_ = false;
+  }
   cudaMemcpyAsync(logits_host_.get(), logits_.get(),
                   d.n_vocab * sizeof(float), cudaMemcpyDeviceToHost, s);
   stream_.sync();

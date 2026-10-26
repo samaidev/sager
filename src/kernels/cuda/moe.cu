@@ -37,24 +37,40 @@ __global__ void router_topk_kernel(const float* logits, int* idx,
   }
   __syncthreads();
 
-  if (tid == 0) {
+  // v0.7: warp-parallel selection. Same (value, lower-index) tie rule as the
+  // serial scan: a lane's local best keeps the lowest index on ties, and the
+  // shuffle reduce prefers the lower index on equal values, which reproduces
+  // the first-strict-max order of the serial walk bit-exactly.
+  if (tid < 32) {
+    const int lane = tid;
     float wsum = 0.f;
     for (int kk = 0; kk < k; ++kk) {
-      int best = -1;
-      float bp = -1.f;
-      for (int i = 0; i < n_expert; ++i) {
+      float bv = -1.f;
+      int bi = -1;
+      for (int i = lane; i < n_expert; i += 32) {
         const float p = prob[i];
-        // NaN-safe compare: a NaN prob (corrupt upstream logits) must never
-        // leave best = -1, which would become a host-side OOB in the cache.
-        if (p == p && p > bp) { bp = p; best = i; }
+        if (p == p && (p > bv || (p == bv && bi >= 0 && i < bi))) {
+          bv = p; bi = i;
+        }
       }
-      if (best < 0) best = kk % n_expert;   // degenerate logits: deterministic
-      prob[best] = -1.f;
-      idx[kk] = best;
-      weight[kk] = bp;
-      wsum += bp;
+      #pragma unroll
+      for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_down_sync(0xFFFFFFFFu, bv, off);
+        const int oi = __shfl_down_sync(0xFFFFFFFFu, bi, off);
+        if (ov > bv || (ov == bv && oi >= 0 && bi >= 0 && oi < bi)) {
+          bv = ov; bi = oi;
+        } else if (bi < 0 && oi >= 0) { bv = ov; bi = oi; }
+      }
+      if (lane == 0) {
+        if (bi < 0) bi = kk % n_expert;   // degenerate logits: deterministic
+        prob[bi] = -1.f;
+        idx[kk] = bi;
+        weight[kk] = bv;
+        wsum += bv;
+      }
+      __syncwarp();
     }
-    if (wsum > 0.f)
+    if (lane == 0 && wsum > 0.f)
       for (int kk = 0; kk < k; ++kk) weight[kk] /= wsum;  // renormalized top-k
   }
 }

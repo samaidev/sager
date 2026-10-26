@@ -99,7 +99,7 @@ class EngineProcess:
                 [self.binary],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, env=env,
-                text=True, buffering=1)
+                text=True, bufsize=1)
         except OSError as e:
             raise EngineError(f"cannot spawn {self.binary}: {e}") from e
         atexit.register(self.stop)

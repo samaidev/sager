@@ -342,6 +342,9 @@ void topk_select_f32_2p(const float* logits, float* seg_v, int* seg_i,
 
 // v0.5: repetition/presence penalty pass over the recent-id window (the
 // decode device sampler applies it before the top-k selection).
+void apply_penalties_f32_devn(float* logits, const int* recent_ids,
+                              const int* n_recent, const float* params,
+                              cudaStream_t s);
 void apply_penalties_f32(float* logits, const int* recent_ids, int n_recent,
                          float rep_penalty, float presence_penalty,
                          cudaStream_t stream);
