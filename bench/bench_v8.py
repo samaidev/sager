@@ -215,8 +215,11 @@ def main() -> None:
     if not a.skip_bench:
         arms = [("v08-default", {})]
         if os.environ.get("BENCH_ARMS", "1") != "0":
-            arms.append(("v07-legacy", {"SAGER_DECODE_FUSE": "0",
-                                        "SAGER_PF_MMQ": "0"}))
+            # exact v0.7 behavior: every v0.8 switch off, GDN norm fix off
+            arms.append(("v07-exact", {"SAGER_DECODE_FUSE": "0",
+                                       "SAGER_PF_MMQ": "0",
+                                       "SAGER_HEAD_SMX": "0",
+                                       "SAGER_GDN_FFN_NORM": "0"}))
         for label, env in arms:
             r = bench_arm(label, model, chunk, a.rounds, env)
             out["arms"].append(r)
