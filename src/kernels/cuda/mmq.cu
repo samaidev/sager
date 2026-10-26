@@ -657,27 +657,31 @@ __global__ void gemv_nm_q4_k_q8_f16out_kernel(
   q4k::BlockQ8K* x_sh = reinterpret_cast<q4k::BlockQ8K*>(
       smem + 8 * w_row_bytes);
 
-  const int rowss[3] = {rows1, rows2, rows3};
-  const q4k::BlockQ4K* ws[3] = {w1, w2, w3};
-  uint16_t* ys[3] = {y1, y2, y3};
-  const int total = rowss[NM - 1];
+  // scalar select: dynamically-indexed local arrays spill to local memory
+  // (measured +80 us/layer on the T4 step graph) - keep everything in scalars
+  const int r12 = rows1 + rows2;
+  const int total = (NM == 2) ? rows2 : rows3;
   const int row = blockIdx.x * 8 + warp;
   mmq_stage(reinterpret_cast<const unsigned char*>(xq),
             reinterpret_cast<unsigned char*>(x_sh), x_row_bytes,
             threadIdx.x, blockDim.x);
   int m = 0;
+  int rlocal = row;
+  if (NM == 2) {
+    if (row >= rows1) { m = 1; rlocal = row - rows1; }
+  } else {
+    if (row >= r12) { m = 2; rlocal = row - r12; }
+    else if (row >= rows1) { m = 1; rlocal = row - rows1; }
+  }
+  const q4k::BlockQ4K* wm = (m == 0) ? w1 : ((m == 1) ? w2 : w3);
+  uint16_t* ym = (m == 0) ? y1 : ((m == 1) ? y2 : y3);
   if (row < total) {
-    while (m + 1 < NM && row >= rowss[m]) ++m;
-    const int rlocal = (m == 0) ? row : row - rowss[m - 1];
     mmq_stage(reinterpret_cast<const unsigned char*>(
-                  ws[m] + static_cast<size_t>(rlocal) * nb),
+                  wm + static_cast<size_t>(rlocal) * nb),
               reinterpret_cast<unsigned char*>(w_sh), w_row_bytes, lane, 32);
   }
   __syncthreads();
   if (row >= total) return;
-  m = 0;
-  while (m + 1 < NM && row >= rowss[m]) ++m;
-  const int rlocal = (m == 0) ? row : row - rowss[m - 1];
 
   const int nsg = nb * 8;
   MmqGState st[NG];
@@ -703,7 +707,7 @@ __global__ void gemv_nm_q4_k_q8_f16out_kernel(
   }
   mmq_shfl_reduce(acc);
   if (lane == 0) {
-    *reinterpret_cast<__half*>(&ys[m][rlocal]) = __float2half(acc);
+    *reinterpret_cast<__half*>(&ym[rlocal]) = __float2half(acc);
   }
 }
 
@@ -768,6 +772,31 @@ void gemv3m_q4_k_q8_f16out(const q4k::BlockQ4K* w1, const q4k::BlockQ4K* w2,
   gemv_nm_dispatch<3>(ws, xq, ys, rowss, k, stream);
 }
 
+template <int NG>
+__device__ __forceinline__ float resadd_row_body(
+    const q4k::BlockQ4K* w_sh, const q4k::BlockQ8K* x_sh, int lane, int nb) {
+  const int nsg = nb * 8;
+  MmqGState st[NG];
+  int blk_of[NG], sb_of[NG];
+  #pragma unroll
+  for (int gi = 0; gi < NG; ++gi) {
+    const int g = lane + gi * 32;
+    blk_of[gi] = -1;
+    sb_of[gi] = 0;
+    if (g < nsg) {
+      blk_of[gi] = g >> 3;
+      sb_of[gi] = g & 7;
+      mmq_g_load(w_sh[blk_of[gi]], sb_of[gi], st[gi]);
+    }
+  }
+  float acc = 0.f;
+  #pragma unroll
+  for (int gi = 0; gi < NG; ++gi) {
+    if (blk_of[gi] >= 0) acc += mmq_g_dot(st[gi], x_sh[blk_of[gi]], sb_of[gi]);
+  }
+  return acc;
+}
+
 // ---------------------------------------------------------------------------
 // GEMV with fused residual-add epilogue (single token): y_row = f16(acc) is
 // produced exactly as gemv..f16out does, then the epilogue applies
@@ -802,22 +831,16 @@ __global__ void gemv_resadd_q4_k_q8_f16out_kernel(
   if (row >= n_rows) return;
 
   const int nsg = nb * 8;
-  MmqGState st[4];
-  int blk_of[4], sb_of[4];
   const int ng = (nsg + 31) / 32;
-  for (int gi = 0; gi < 4 && gi < ng; ++gi) {
-    const int g = lane + gi * 32;
-    blk_of[gi] = -1;
-    sb_of[gi] = 0;
-    if (g < nsg) {
-      blk_of[gi] = g >> 3;
-      sb_of[gi] = g & 7;
-      mmq_g_load(w_sh[blk_of[gi]], sb_of[gi], st[gi]);
-    }
-  }
   float acc = 0.f;
-  for (int gi = 0; gi < 4 && gi < ng; ++gi) {
-    if (blk_of[gi] >= 0) acc += mmq_g_dot(st[gi], x_sh[blk_of[gi]], sb_of[gi]);
+  // ng is a launch-time constant per shape; keep the hot loop in registers
+  // (a runtime-bounded st[4] array spills to local memory: 46 vs 23 us/step)
+  if (ng <= 1) {
+    acc = resadd_row_body<1>(w_sh, x_sh, lane, nb);
+  } else if (ng <= 2) {
+    acc = resadd_row_body<2>(w_sh, x_sh, lane, nb);
+  } else {
+    acc = resadd_row_body<4>(w_sh, x_sh, lane, nb);
   }
   #pragma unroll
   for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
