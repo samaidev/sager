@@ -657,9 +657,9 @@ __global__ void gemv_nm_q4_k_q8_f16out_kernel(
   q4k::BlockQ8K* x_sh = reinterpret_cast<q4k::BlockQ8K*>(
       smem + 8 * w_row_bytes);
 
-  const int rowss[NM] = {rows1, rows2, rows3};
-  const q4k::BlockQ4K* ws[NM] = {w1, w2, w3};
-  uint16_t* ys[NM] = {y1, y2, y3};
+  const int rowss[3] = {rows1, rows2, rows3};
+  const q4k::BlockQ4K* ws[3] = {w1, w2, w3};
+  uint16_t* ys[3] = {y1, y2, y3};
   const int total = rowss[NM - 1];
   const int row = blockIdx.x * 8 + warp;
   mmq_stage(reinterpret_cast<const unsigned char*>(xq),
