@@ -109,7 +109,16 @@ def rand_ids(n: int, seed: int = 2026) -> list:
 def bench_arm(label: str, model: str, chunk: int, rounds: int,
               extra_env: dict) -> dict:
     print(f"=== arm {label} (chunk {chunk}, env {extra_env}) ===", flush=True)
-    eng = Engine(model, chunk, extra_env)
+    env = dict(extra_env)
+    # equal-warmth A/B: each arm gets its OWN copy of the expert usage
+    # profile so load-time residency cannot favor the later arms
+    prof = os.environ.get("SAGER_PROFILE_PATH", "/content/sager_profile.json")
+    if os.path.isfile(prof):
+        import shutil
+        arm_prof = f"/content/sager_profile_{label}.json"
+        shutil.copyfile(prof, arm_prof)
+        env["SAGER_PROFILE_PATH"] = arm_prof
+    eng = Engine(model, chunk, env)
     ld = eng.load()
     keys = ("hot_experts", "hot_capacity", "pump", "graphs", "ctx")
     print("load:", json.dumps({k: ld.get(k) for k in keys if k in ld}),
@@ -240,7 +249,10 @@ def main() -> None:
                                   "SAGER_GDN_FFN_NORM": "0"}),
                     ("fuse-only", {"SAGER_PF_MMQ": "0",
                                    "SAGER_HEAD_SMX": "0",
-                                   "SAGER_GDN_FFN_NORM": "0"})]
+                                   "SAGER_GDN_FFN_NORM": "0"}),
+                    ("smx-only", {"SAGER_DECODE_FUSE": "0",
+                                  "SAGER_PF_MMQ": "0",
+                                  "SAGER_GDN_FFN_NORM": "0"})]
         for label, env in arms:
             r = bench_arm(label, model, chunk, a.rounds, env)
             out["arms"].append(r)
