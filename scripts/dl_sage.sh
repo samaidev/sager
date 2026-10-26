@@ -55,7 +55,7 @@ fetch() {  # fetch <repo> <file> <fallback_ms_repo>
   local rc=0
   case "$SOURCE" in
     hf) fetch_hf "$repo" "$file" || rc=$? ;;
-    ms) fetch_ms "$repo" "$file" || rc=$? ;;
+    ms) fetch_ms "${MS_ART_REPO:-$repo}" "$file" || rc=$? ;;
     *) echo "[dl] unknown SOURCE=$SOURCE (hf|ms)"; return 1 ;;
   esac
   if [ $rc -ne 0 ] && [ "$SOURCE" = "hf" ] && [ -n "${MS_TOKEN:-${MODELSCOPE_API_TOKEN:-}}" ]; then
