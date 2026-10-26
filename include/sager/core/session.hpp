@@ -299,7 +299,7 @@ class Session {
   PinnedBuffer<int>      h_job_off_, h_job_m_, h_job_tbase_, h_job_jot_;
   bool pf_mtok_ = true;      // SAGER_MTOK=0 -> v0.2.3 batched kernels
   // v0.8 knobs (all default on; each flips cleanly back to the v0.7 path)
-  bool pf_mmq_ = true;       // SAGER_PF_MMQ=0 -> mtok prefill GEMVs
+  bool pf_mmq_ = false;      // SAGER_PF_MMQ=1 -> experimental MMQ prefill GEMM
   bool dec_fuse_ = true;     // SAGER_DECODE_FUSE=0 -> v0.7 per-kernel decode
   bool head_smx_ = true;     // SAGER_HEAD_SMX=0 -> v0.6 Q6_K head kernel
   bool gdn_ffn_norm_ = false;  // SAGER_GDN_FFN_NORM=1 -> apply (quality; costs speed)

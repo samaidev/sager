@@ -635,46 +635,17 @@ void rmsnorm_quant_f16(uint16_t* out, const uint16_t* x, const uint16_t* w,
 // ---------------------------------------------------------------------------
 namespace {
 
-// Parameter block for the multi-matrix GEMV: one device copy per launch
-// (fixed addresses, graph-safe - the host writes the pinned mirror, an async
-// H2D lands the values ahead of the kernel on the same stream).
-struct GnmParams {
-  const q4k::BlockQ4K* ws[3];
-  uint16_t* ys[3];
-  int rowss[3];
-};
-
-// Per-slot parameter blocks. Slots are LAYERS: the values are written once at
-// capture time and never change (weights are fixed), so the async H2D copy
-// node replays the same bytes every step - no host interplay at replay.
-constexpr int kGnmSlots = 64;
-GnmParams* gnm_h_ = nullptr;      // pinned host mirrors
-GnmParams* gnm_d_ = nullptr;      // device copies
-const q4k::BlockQ4K* gnm_ws_fb_[kGnmSlots][3];
-uint16_t* gnm_ys_fb_[kGnmSlots][3];
-int gnm_rowss_fb_[kGnmSlots][3];
-
-bool gnm_init() {
-  if (gnm_d_) return true;
-  if (cudaMallocHost(&gnm_h_, sizeof(GnmParams) * kGnmSlots) != cudaSuccess) {
-    gnm_h_ = nullptr;
-    cudaGetLastError();
-    return false;
-  }
-  if (cudaMalloc(&gnm_d_, sizeof(GnmParams) * kGnmSlots) != cudaSuccess) {
-    gnm_d_ = nullptr;
-    cudaGetLastError();
-    cudaFreeHost(gnm_h_);
-    gnm_h_ = nullptr;
-    return false;
-  }
-  return true;
-}
-
+// v0.8 r4: the per-matrix pointers/row-counts ride as DIRECT kernel
+// arguments (60 B of the 4 KB param space) - the r3 design copied a param
+// block per layer, and 40 tiny H2D memcpy nodes cost ~100 us of
+// copy-engine round trip EACH on the T4 whole-step graph (the exact
+// failure mode v0.7 documented for per-layer D2H mirrors).
 template <int NG, int NM>
 __global__ void gemv_nm_q4_k_q8_f16out_kernel(
-    const GnmParams* __restrict__ p, const q4k::BlockQ8K* __restrict__ xq,
-    int k) {
+    const q4k::BlockQ4K* w1, const q4k::BlockQ4K* w2,
+    const q4k::BlockQ4K* w3, const q4k::BlockQ8K* __restrict__ xq,
+    uint16_t* y1, uint16_t* y2, uint16_t* y3, int rows1, int rows2,
+    int rows3, int k) {
   extern __shared__ __align__(16) unsigned char smem[];
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
@@ -686,25 +657,27 @@ __global__ void gemv_nm_q4_k_q8_f16out_kernel(
   q4k::BlockQ8K* x_sh = reinterpret_cast<q4k::BlockQ8K*>(
       smem + 8 * w_row_bytes);
 
-  const int total = p->rowss[NM - 1];
+  const int rowss[NM] = {rows1, rows2, rows3};
+  const q4k::BlockQ4K* ws[NM] = {w1, w2, w3};
+  uint16_t* ys[NM] = {y1, y2, y3};
+  const int total = rowss[NM - 1];
   const int row = blockIdx.x * 8 + warp;
   mmq_stage(reinterpret_cast<const unsigned char*>(xq),
             reinterpret_cast<unsigned char*>(x_sh), x_row_bytes,
             threadIdx.x, blockDim.x);
+  int m = 0;
   if (row < total) {
-    int m = 0;
-    while (m + 1 < NM && row >= p->rowss[m]) ++m;
-    const int rlocal = (m == 0) ? row : row - p->rowss[m - 1];
+    while (m + 1 < NM && row >= rowss[m]) ++m;
+    const int rlocal = (m == 0) ? row : row - rowss[m - 1];
     mmq_stage(reinterpret_cast<const unsigned char*>(
-                  p->ws[m] + static_cast<size_t>(rlocal) * nb),
+                  ws[m] + static_cast<size_t>(rlocal) * nb),
               reinterpret_cast<unsigned char*>(w_sh), w_row_bytes, lane, 32);
   }
   __syncthreads();
   if (row >= total) return;
-
-  int m = 0;
-  while (m + 1 < NM && row >= p->rowss[m]) ++m;
-  const int rlocal = (m == 0) ? row : row - p->rowss[m - 1];
+  m = 0;
+  while (m + 1 < NM && row >= rowss[m]) ++m;
+  const int rlocal = (m == 0) ? row : row - rowss[m - 1];
 
   const int nsg = nb * 8;
   MmqGState st[NG];
@@ -730,35 +703,44 @@ __global__ void gemv_nm_q4_k_q8_f16out_kernel(
   }
   mmq_shfl_reduce(acc);
   if (lane == 0) {
-    uint16_t* y = p->ys[m];
-    *reinterpret_cast<__half*>(&y[rlocal]) = __float2half(acc);
+    *reinterpret_cast<__half*>(&ys[m][rlocal]) = __float2half(acc);
   }
 }
 
 template <int NM>
-void gemv_nm_dispatch(const GnmParams* dp, int total_rows, int slot,
-                      const q4k::BlockQ8K* xq, int k, cudaStream_t stream) {
+void gemv_nm_dispatch(const q4k::BlockQ4K* const* ws, const q4k::BlockQ8K* xq,
+                      uint16_t* const* ys, const int* rowss, int k,
+                      cudaStream_t stream) {
   const int nb = k / 256;
   const size_t smem = mmq_smem(nb, 8, 1);
   const int nsg = nb * 8;
   const int ng = (nsg + 31) / 32;
-  if (ng <= 1) {
-    gemv_nm_q4_k_q8_f16out_kernel<1, NM><<<(total_rows + 7) / 8, 256, smem, stream>>>(
-        dp, xq, k);
-  } else if (ng <= 2) {
-    gemv_nm_q4_k_q8_f16out_kernel<2, NM><<<(total_rows + 7) / 8, 256, smem, stream>>>(
-        dp, xq, k);
-  } else if (ng <= 4) {
-    gemv_nm_q4_k_q8_f16out_kernel<4, NM><<<(total_rows + 7) / 8, 256, smem, stream>>>(
-        dp, xq, k);
-  } else {
+  const int rows = rowss[NM - 1];
+  #define GNM_LAUNCH(NGV)                                                  \
+    do {                                                                   \
+      if (NM == 2) {                                                       \
+        gemv_nm_q4_k_q8_f16out_kernel<NGV, 2>                              \
+            <<<(rows + 7) / 8, 256, smem, stream>>>(                       \
+                ws[0], ws[1], nullptr, xq, ys[0], ys[1], nullptr, rowss[0],\
+                rowss[1], 0, k);                                           \
+      } else {                                                             \
+        gemv_nm_q4_k_q8_f16out_kernel<NGV, 3>                              \
+            <<<(rows + 7) / 8, 256, smem, stream>>>(                       \
+                ws[0], ws[1], ws[2], xq, ys[0], ys[1], ys[2], rowss[0],    \
+                rowss[1], rowss[2], k);                                    \
+      }                                                                    \
+    } while (0)
+  if (ng <= 1)      GNM_LAUNCH(1);
+  else if (ng <= 2) GNM_LAUNCH(2);
+  else if (ng <= 4) GNM_LAUNCH(4);
+  else {
     // k > 4096: fall back to separate GEMVs (rare; dense k only)
     for (int m = 0; m < NM; ++m) {
-      const int r0 = (m == 0) ? 0 : gnm_rowss_fb_[slot][m - 1];
-      gemv_q4_k_q8_f16out(gnm_ws_fb_[slot][m], xq, gnm_ys_fb_[slot][m],
-                          gnm_rowss_fb_[slot][m] - r0, k, stream);
+      const int r0 = (m == 0) ? 0 : rowss[m - 1];
+      gemv_q4_k_q8_f16out(ws[m], xq, ys[m], rowss[m] - r0, k, stream);
     }
   }
+  #undef GNM_LAUNCH
 }
 
 }  // namespace
@@ -767,24 +749,11 @@ void gemv2m_q4_k_q8_f16out(const q4k::BlockQ4K* w1, const q4k::BlockQ4K* w2,
                            const q4k::BlockQ8K* xq, uint16_t* y1, uint16_t* y2,
                            int rows1, int rows2, int k, int slot,
                            cudaStream_t stream) {
-  if (slot < 0 || slot >= kGnmSlots || !gnm_init()) {
-    gemv_q4_k_q8_f16out(w1, xq, y1, rows1, k, stream);
-    gemv_q4_k_q8_f16out(w2, xq, y2, rows2, k, stream);
-    return;
-  }
-  GnmParams& hp = gnm_h_[slot];
-  hp.ws[0] = w1; hp.ws[1] = w2; hp.ws[2] = nullptr;
-  hp.ys[0] = y1; hp.ys[1] = y2; hp.ys[2] = nullptr;
-  hp.rowss[0] = rows1; hp.rowss[1] = rows1 + rows2; hp.rowss[2] = 0;
-  for (int m = 0; m < 2; ++m) {
-    gnm_ws_fb_[slot][m] = hp.ws[m];
-    gnm_ys_fb_[slot][m] = hp.ys[m];
-    gnm_rowss_fb_[slot][m] = hp.rowss[m];
-  }
-  const int total = hp.rowss[1];
-  cudaMemcpyAsync(gnm_d_ + slot, &hp, sizeof(GnmParams),
-                  cudaMemcpyHostToDevice, stream);
-  gemv_nm_dispatch<2>(gnm_d_ + slot, total, slot, xq, k, stream);
+  (void)slot;
+  const q4k::BlockQ4K* ws[2] = {w1, w2};
+  uint16_t* ys[2] = {y1, y2};
+  const int rowss[2] = {rows1, rows1 + rows2};
+  gemv_nm_dispatch<2>(ws, xq, ys, rowss, k, stream);
 }
 
 void gemv3m_q4_k_q8_f16out(const q4k::BlockQ4K* w1, const q4k::BlockQ4K* w2,
@@ -792,27 +761,11 @@ void gemv3m_q4_k_q8_f16out(const q4k::BlockQ4K* w1, const q4k::BlockQ4K* w2,
                            uint16_t* y1, uint16_t* y2, uint16_t* y3, int rows1,
                            int rows2, int rows3, int k, int slot,
                            cudaStream_t stream) {
-  if (slot < 0 || slot >= kGnmSlots || !gnm_init()) {
-    gemv_q4_k_q8_f16out(w1, xq, y1, rows1, k, stream);
-    gemv_q4_k_q8_f16out(w2, xq, y2, rows2, k, stream);
-    gemv_q4_k_q8_f16out(w3, xq, y3, rows3, k, stream);
-    return;
-  }
-  GnmParams& hp = gnm_h_[slot];
-  hp.ws[0] = w1; hp.ws[1] = w2; hp.ws[2] = w3;
-  hp.ys[0] = y1; hp.ys[1] = y2; hp.ys[2] = y3;
-  hp.rowss[0] = rows1;
-  hp.rowss[1] = rows1 + rows2;
-  hp.rowss[2] = rows1 + rows2 + rows3;
-  for (int m = 0; m < 3; ++m) {
-    gnm_ws_fb_[slot][m] = hp.ws[m];
-    gnm_ys_fb_[slot][m] = hp.ys[m];
-    gnm_rowss_fb_[slot][m] = hp.rowss[m];
-  }
-  const int total = hp.rowss[2];
-  cudaMemcpyAsync(gnm_d_ + slot, &hp, sizeof(GnmParams),
-                  cudaMemcpyHostToDevice, stream);
-  gemv_nm_dispatch<3>(gnm_d_ + slot, total, slot, xq, k, stream);
+  (void)slot;
+  const q4k::BlockQ4K* ws[3] = {w1, w2, w3};
+  uint16_t* ys[3] = {y1, y2, y3};
+  const int rowss[3] = {rows1, rows1 + rows2, rows1 + rows2 + rows3};
+  gemv_nm_dispatch<3>(ws, xq, ys, rowss, k, stream);
 }
 
 // ---------------------------------------------------------------------------
