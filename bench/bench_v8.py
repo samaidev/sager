@@ -30,7 +30,7 @@ def base_env(extra: dict) -> dict:
     env = dict(os.environ)
     # benchmark knobs only; feature flags come from `extra`
     for k in ("SAGER_DECODE_FUSE", "SAGER_PF_MMQ", "SAGER_GDN_FFN_NORM",
-              "SAGER_HEAD_SMX", "SAGER_PF_TC"):
+              "SAGER_HEAD_SMX", "SAGER_PF_TC", "SAGER_MOE_TC"):
         env.pop(k, None)
     env.setdefault("SAGER_EXPERT_POOL_REUSE", "1")
     # v0.7 benchmark protocol: device decode + device sampler enabled
@@ -217,10 +217,13 @@ def main() -> None:
         # v0.9: the TC prefill path ALSO changes numerics by design (fp16
         # weight rounding + fp16 activations) - pinned OFF on both arms here,
         # measured separately in the perf arms.
+        # v0.10: same for the MoE TC path (SAGER_MOE_TC).
         base = parity_arm({"SAGER_DECODE_FUSE": "0", "SAGER_PF_MMQ": "0",
-                           "SAGER_GDN_FFN_NORM": "0", "SAGER_PF_TC": "0"},
+                           "SAGER_GDN_FFN_NORM": "0", "SAGER_PF_TC": "0",
+                           "SAGER_MOE_TC": "0"},
                           model, chunk, prompt)
-        new = parity_arm({"SAGER_GDN_FFN_NORM": "0", "SAGER_PF_TC": "0"},
+        new = parity_arm({"SAGER_GDN_FFN_NORM": "0", "SAGER_PF_TC": "0",
+                          "SAGER_MOE_TC": "0"},
                          model, chunk, prompt)
         ok = base == new and len(base) == 64
         out["parity"] = {"gdn_ffn_norm": "off", "v07_len": len(base), "v08_len": len(new),
@@ -237,32 +240,31 @@ def main() -> None:
             sys.exit(1)
 
     if not a.skip_bench:
-        arms = [("v08-default", {})]
+        arms = [("v10-default", {})]
         if os.environ.get("BENCH_ARMS", "1") != "0":
-            # exact v0.7 behavior: every v0.8/v0.9 switch off, GDN norm fix off
+            # exact v0.7 behavior: every v0.8/v0.9/v0.10 switch off
             arms.append(("v07-exact", {"SAGER_DECODE_FUSE": "0",
                                        "SAGER_PF_MMQ": "0",
                                        "SAGER_HEAD_SMX": "0",
                                        "SAGER_GDN_FFN_NORM": "0",
-                                       "SAGER_PF_TC": "0"}))
+                                       "SAGER_PF_TC": "0",
+                                       "SAGER_MOE_TC": "0"}))
+            # isolate the MoE TC contribution (dense TC off)
+            arms.append(("moe-tc-only", {"SAGER_PF_TC": "0",
+                                         "SAGER_GDN_FFN_NORM": "0"}))
         if os.environ.get("BENCH_ISOLATE", "0") != "0":
             arms = [("v07-exact", {"SAGER_DECODE_FUSE": "0",
                                    "SAGER_PF_MMQ": "0",
                                    "SAGER_HEAD_SMX": "0",
                                    "SAGER_GDN_FFN_NORM": "0",
                                    "SAGER_PF_TC": "0"}),
-                    ("v09-tc", {"SAGER_GDN_FFN_NORM": "0"}),
-                    ("mmq-only", {"SAGER_DECODE_FUSE": "0",
-                                  "SAGER_GDN_FFN_NORM": "0",
-                                  "SAGER_PF_TC": "0"}),
-                    ("fuse-only", {"SAGER_PF_MMQ": "0",
-                                   "SAGER_HEAD_SMX": "0",
-                                   "SAGER_GDN_FFN_NORM": "0",
-                                   "SAGER_PF_TC": "0"}),
-                    ("smx-only", {"SAGER_DECODE_FUSE": "0",
-                                  "SAGER_PF_MMQ": "0",
-                                  "SAGER_GDN_FFN_NORM": "0",
-                                  "SAGER_PF_TC": "0"})]
+                    ("v10-full", {"SAGER_GDN_FFN_NORM": "0"}),
+                    ("dense-tc-only", {"SAGER_MOE_TC": "0",
+                                       "SAGER_GDN_FFN_NORM": "0"}),
+                    ("moe-tc-only", {"SAGER_PF_TC": "0",
+                                     "SAGER_GDN_FFN_NORM": "0"}),
+                    ("no-tc", {"SAGER_PF_TC": "0", "SAGER_MOE_TC": "0",
+                               "SAGER_GDN_FFN_NORM": "0"})]
         for label, env in arms:
             r = bench_arm(label, model, chunk, a.rounds, env)
             out["arms"].append(r)

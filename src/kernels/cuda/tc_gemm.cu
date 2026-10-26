@@ -44,29 +44,19 @@ __device__ __forceinline__ void unpack_scales6_tc(const uint8_t* sc, int s,
   *sm = dmin * static_cast<float>(m6);
 }
 
-// One thread dequantizes one 16 B output slab (8 weights) with a perfectly
-// LINEAR store stream: thread L writes uint4[L]. Probe9/probe10 on sm_75
-// showed the write pattern is everything here: 512 B-per-thread chunked
-// stores run at 18-50 GB/s while linear 16 B-per-thread stores hit 166 GB/s
-// (reads were never the issue: 218 GB/s). The 144 B Q4_K header and the 4
-// nibble bytes are re-read per thread but stay hot in L1 (32 threads share
-// each header). k must be a power of two (2048/4096 in this engine) so the
-// index math is all shifts; verified bit-identical to the sub-block kernel
-// (probe10: 0 / 25165824 mismatches) and 3.4x faster (1.06 -> 0.31 ms for
-// the 12288x2048 qkvz projection).
-__global__ void dequant_q4_k_f16_kernel(const q4k::BlockQ4K* __restrict__ w,
-                                        __half* __restrict__ out,
-                                        long long n_u4, int sl2) {
-  const long long L = static_cast<long long>(blockIdx.x) * blockDim.x +
-                      threadIdx.x;
-  if (L >= n_u4) return;
-  const int k = 1 << sl2;
-  const long long row = L >> (sl2 - 3);
-  const int u4r = static_cast<int>(L & ((1 << (sl2 - 3)) - 1));
-  const long long bi = row * (k >> 8) + (u4r >> 5);
-  const int sb = (u4r >> 2) & 7;         // 32-weight sub-block within the row
-  const int q = u4r & 3;                 // quarter of it: 8 weights
-  const uint8_t* base = reinterpret_cast<const uint8_t*>(w + bi);
+// Per-uint4 dequant body shared by the dense and the grouped-expert kernels.
+// base points at the row's first Q4_K block, u4r selects the 8-weight group
+// within the row (k must be a power of two, >= 256). One thread dequantizes
+// one 16 B output slab (8 weights) with a perfectly LINEAR store stream:
+// thread L writes uint4[L]. Probe9/probe10 on sm_75 showed the write pattern
+// is everything here: 512 B-per-thread chunked stores run at 18-50 GB/s
+// while linear 16 B-per-thread stores hit 166 GB/s (reads were never the
+// issue: 218 GB/s). The 144 B Q4_K header and the 4 nibble bytes are re-read
+// per thread but stay hot in L1 (32 threads share each header). Verified
+// bit-identical to the sub-block kernel (probe10: 0 / 25165824 mismatches)
+// and 3.4x faster (1.06 -> 0.31 ms for the 12288x2048 qkvz projection).
+__device__ __forceinline__ void dequant_q4k_u4(const uint8_t* base, int u4r,
+                                               __half* out) {
   const uint4 hdr = *reinterpret_cast<const uint4*>(base);
   const float d = __half2float(
       __ushort_as_half(static_cast<unsigned short>(hdr.x & 0xFFFFu)));
@@ -78,6 +68,8 @@ __global__ void dequant_q4_k_f16_kernel(const q4k::BlockQ4K* __restrict__ w,
     const unsigned word = b < 4 ? hdr.y : (b < 8 ? hdr.z : hdr.w);
     sc[b] = static_cast<uint8_t>((word >> (8 * (b & 3))) & 0xFFu);
   }
+  const int sb = (u4r >> 2) & 7;         // 32-weight sub-block within the row
+  const int q = u4r & 3;                 // quarter of it: 8 weights
   float sd, sm;
   unpack_scales6_tc(sc, sb, d, dmin, &sd, &sm);
   const int qi = sb * (q4k::kQK / 2) + q * 4;
@@ -95,12 +87,65 @@ __global__ void dequant_q4_k_f16_kernel(const q4k::BlockQ4K* __restrict__ w,
         __float2half(sd * static_cast<float>(byte >> 4) - sm));
     return c.u;
   };
-  const unsigned u0 = pk_half(n0);
-  const unsigned u1 = pk_half(n1);
-  const unsigned u2 = pk_half(n2);
-  const unsigned u3 = pk_half(n3);
-  uint4* o4 = reinterpret_cast<uint4*>(out) + L;
-  *o4 = make_uint4(u0, u1, u2, u3);
+  reinterpret_cast<uint4*>(out)[0] =
+      make_uint4(pk_half(n0), pk_half(n1), pk_half(n2), pk_half(n3));
+}
+
+__global__ void dequant_q4_k_f16_kernel(const q4k::BlockQ4K* __restrict__ w,
+                                        __half* __restrict__ out,
+                                        long long n_u4, int sl2) {
+  const long long L = static_cast<long long>(blockIdx.x) * blockDim.x +
+                      threadIdx.x;
+  if (L >= n_u4) return;
+  const int k = 1 << sl2;
+  const long long row = L >> (sl2 - 3);
+  const int u4r = static_cast<int>(L & ((1 << (sl2 - 3)) - 1));
+  const long long bi = row * (k >> 8) + (u4r >> 5);
+  dequant_q4k_u4(reinterpret_cast<const uint8_t*>(w + bi), u4r,
+                 reinterpret_cast<__half*>(out) + L * 8);
+}
+
+// ---------------------------------------------------------------------------
+// v0.10 grouped-expert dequant (SAGER_MOE_TC): the routed experts of a MoE
+// layer, whose Q4_K weights live behind per-expert pointer tables (hot slab /
+// pump ring), are dequantized into a small ring of fp16 slots that the
+// cublasGemmEx grouped loop then consumes. Only experts with routed rows
+// (off[e+1] > off[e]) and non-null table entries are written. Thread mapping
+// keeps the linear-store property: L -> (expert, row, 8-weight group), all
+// shifts (rows per expert and k are powers of two).
+//   gu mode  (rows_sl2 = log2(rows_per_exp) = 10, k = H): rows [0, 512) of a
+//            slot read tab_a[e] (gate), rows [512, 1024) read tab_b[e] (up).
+//   down mode(rows_sl2 = 11, k = FFX, tab_b = nullptr): every row reads
+//            tab_a[e]; the slot region starts at element dst_row0.
+// ---------------------------------------------------------------------------
+__global__ void dequant_experts_q4_k_f16_kernel(
+    const q4k::BlockQ4K* const* __restrict__ tab_a,
+    const q4k::BlockQ4K* const* __restrict__ tab_b,
+    const int* __restrict__ off, __half* __restrict__ slots,
+    long long dst_row0, int rows_sl2, int sl2k, int ring,
+    long long slot_elems, long long n_u4) {
+  const long long L = static_cast<long long>(blockIdx.x) * blockDim.x +
+                      threadIdx.x;
+  if (L >= n_u4) return;
+  const int row_sh = sl2k - 3;
+  const long long e = L >> (rows_sl2 + row_sh);
+  if (off[e + 1] <= off[e]) return;              // expert has no routed rows
+  const int rloc = static_cast<int>((L >> row_sh) & ((1 << rows_sl2) - 1));
+  const q4k::BlockQ4K* const* tab = tab_a;
+  int r = rloc;
+  if (tab_b) {
+    const int half = 1 << (rows_sl2 - 1);        // 512 gate rows then 512 up
+    if (rloc >= half) { tab = tab_b; r = rloc - half; }
+  }
+  if (!tab[e]) return;                           // absent expert: skip
+  const int k = 1 << sl2k;
+  const unsigned u4r = static_cast<unsigned>(L) & ((1u << row_sh) - 1u);
+  const long long bi = static_cast<long long>(r) * (k >> 8) + (u4r >> 5);
+  __half* dst = slots + (e & (ring - 1)) * slot_elems + dst_row0 +
+                static_cast<long long>(rloc) * k +
+                (static_cast<long long>(u4r) << 3);
+  dequant_q4k_u4(reinterpret_cast<const uint8_t*>(tab[e] + bi),
+                 static_cast<int>(u4r), dst);
 }
 
 cublasHandle_t g_tc_handle = nullptr;
@@ -150,6 +195,45 @@ bool tc_gemm_q4_k_f16(const q4k::BlockQ4K* w, const uint16_t* x, uint16_t* y,
       &zero, y, CUDA_R_16F, n_rows,
       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
   return st == CUBLAS_STATUS_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// v0.10 grouped-expert primitives for the MoE tensor-core path (SAGER_MOE_TC).
+// ---------------------------------------------------------------------------
+
+// C_row[n_tokens x n_rows] = X_row[n_tokens x k] * W_row[n_rows x k]^T on
+// pre-dequantized fp16 weights (same layout contract as tc_gemm_q4_k_f16).
+bool tc_gemm_f16_raw(const void* w16, const void* x16, void* y16,
+                     int n_rows, int k, int n_tokens, cudaStream_t stream) {
+  if (!g_tc_handle && !tc_handle()) return false;
+  if (cublasSetStream(g_tc_handle, stream) != CUBLAS_STATUS_SUCCESS)
+    return false;
+  const float one = 1.0f, zero = 0.0f;
+  return cublasGemmEx(
+      g_tc_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+      n_rows, n_tokens, k,
+      &one, w16, CUDA_R_16F, k,
+      x16, CUDA_R_16F, k,
+      &zero, y16, CUDA_R_16F, n_rows,
+      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
+}
+
+// Dequantize the layer's routed experts into a ring of fp16 slots (see the
+// kernel comment for the layout). tab_a/tab_b are SUB-tables covering
+// n_experts entries; off is the routed-row prefix at the same group offset.
+void dequant_experts_q4_k_f16(const q4k::BlockQ4K* const* tab_a,
+                              const q4k::BlockQ4K* const* tab_b,
+                              const int* off, void* slots, long long dst_row0,
+                              int rows_sl2, int k, int n_experts, int ring,
+                              long long slot_elems, cudaStream_t stream) {
+  int sl2k = 0;
+  while ((1 << sl2k) < k) ++sl2k;
+  const long long n_u4 = static_cast<long long>(n_experts) <<
+                         (rows_sl2 + sl2k - 3);
+  const int blocks = static_cast<int>((n_u4 + 255) / 256);
+  dequant_experts_q4_k_f16_kernel<<<blocks, 256, 0, stream>>>(
+      tab_a, tab_b, off, static_cast<__half*>(slots), dst_row0, rows_sl2,
+      sl2k, ring, slot_elems, n_u4);
 }
 
 }  // namespace sager::cuda

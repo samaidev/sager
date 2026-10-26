@@ -115,6 +115,21 @@ bool tc_gemm_q4_k_f16(const q4k::BlockQ4K* w, const uint16_t* x, uint16_t* y,
 void* tc_handle();
 size_t tc_scratch_elems(int max_rows, int max_k);
 
+// ---- v0.10 MoE tensor-core path (SAGER_MOE_TC; 0 reverts to the grouped
+// dp4a GEMV family) ----------------------------------------------------------
+// Routed experts' Q4_K weights dequantize into a small ring of fp16 slots,
+// then one cublasGemmEx per (expert, matrix) runs the grouped GEMM with the
+// same layout contract as tc_gemm_q4_k_f16. Not bit-identical to the dp4a
+// grouped GEMV (same reasons as the dense TC path); runs for prefill chunks
+// of >= 256 tokens only.
+bool tc_gemm_f16_raw(const void* w16, const void* x16, void* y16,
+                     int n_rows, int k, int n_tokens, cudaStream_t stream);
+void dequant_experts_q4_k_f16(const q4k::BlockQ4K* const* tab_a,
+                              const q4k::BlockQ4K* const* tab_b,
+                              const int* off, void* slots, long long dst_row0,
+                              int rows_sl2, int k, int n_experts, int ring,
+                              long long slot_elems, cudaStream_t stream);
+
 // ---- v0.8 decode fusion kernels (all bit-identical to what they replace) ----
 
 // rmsnorm + Q8_K quantization in one launch (n_rows blocks of one row each).
@@ -199,6 +214,9 @@ void moe_dispatch_scan(const int* idx, float* weight, int* gslot, int* grows,
 void gather_rows_q8_n(q4k::BlockQ8K* dst, const q4k::BlockQ8K* src,
                       const int* src_rows, const int* meta, int r_max,
                       int row_blocks, cudaStream_t stream);
+void gather_rows_f16_n(uint16_t* dst, const uint16_t* src,
+                       const int* src_rows, const int* meta, int r_max,
+                       int hidden, cudaStream_t stream);
 void silu_mul_f16_n(uint16_t* out, const uint16_t* g, const uint16_t* u,
                     const int* d_rows, int rows_max, int n_ff,
                     cudaStream_t stream);

@@ -156,15 +156,25 @@ Status Session::alloc_scratch() {
   // v0.9: fp16 dequant scratch for the TC prefill GEMM path - ONE reuse
   // buffer sized for the largest dense projection (GDN qkvz proj_rows x H
   // dominates; lin_out is H x y_rows, smaller in elements).
-  if (pf_tc_) {
+  // v0.10: the MoE TC ring lives here too (two disjoint regions of G slots
+  // each) - allocate it whenever either TC path is on.
+  {
     const auto g = mc_.gdn();
     size_t need = static_cast<size_t>(std::max(g.proj_rows(), g.y_rows())) *
                   static_cast<size_t>(H);
     need = std::max(need, static_cast<size_t>(Q) * H);
     need = std::max(need, static_cast<size_t>(H) * g.y_rows());
-    if (!ok(d_wtc_.alloc(need), "d_wtc_")) return Status::kOomVram;
-  } else {
-    d_wtc_.alloc(0);
+    if (pf_moe_tc_) {
+      // ring: moe_grp_ x (gate+up slot + down slot) fp16 elems
+      const size_t ring_need =
+          static_cast<size_t>(8) * 3 * static_cast<size_t>(FFX) * H;
+      need = std::max(need, ring_need);
+    }
+    if (pf_tc_ || pf_moe_tc_) {
+      if (!ok(d_wtc_.alloc(need), "d_wtc_")) return Status::kOomVram;
+    } else {
+      d_wtc_.alloc(0);
+    }
   }
 
   // Activation slabs sized for the prefill chunk (fixed addresses: the same
@@ -209,6 +219,21 @@ Status Session::alloc_scratch() {
   if (!ok(d_sgate_.alloc(RT), "d_sgate_")) return Status::kOomVram;
   if (!ok(d_grows_.alloc(Rmax), "d_grows_")) return Status::kOomVram;
   if (!ok(d_gslot_.alloc(static_cast<size_t>(RT) * K), "d_gslot_")) return Status::kOomVram;
+  // v0.10 MoE TC path: zero new VRAM - the fp16 routed-row slab reuses
+  // expert_y_ and the fp16 expert ring reuses d_wtc_ (see session.hpp).
+  // h_moe_meta_ is 16 B of pinned host memory.
+  if (pf_moe_tc_) {
+    moe_slot_elems_ = static_cast<size_t>(3) * FFX * H;  // gate+up rows then down
+    // ring capacity from the dense TC scratch: floor to a power of two
+    int g = static_cast<int>(d_wtc_.count() / moe_slot_elems_);
+    while (g > 1 && (g & (g - 1)) != 0) --g;
+    moe_grp_ = g < 1 ? 1 : (g > 8 ? 8 : g);
+    if (!h_moe_meta_.alloc(4)) return Status::kOomRam;
+  } else {
+    moe_slot_elems_ = 0;
+    moe_grp_ = 0;
+    h_moe_meta_.alloc(0);
+  }
   if (!ok(d_cflat_.alloc(pf_cpu_cap_), "d_cflat_")) return Status::kOomVram;
   if (!ok(shared_y_.alloc(static_cast<size_t>(H) + 2 * FFX), "shared_y_")) return Status::kOomVram;
   if (!ok(route_logits_.alloc(static_cast<size_t>(RT) * E), "route_logits_")) return Status::kOomVram;
@@ -336,6 +361,12 @@ Status Session::alloc_scratch() {
     ev_scan_ = nullptr;
     cudaGetLastError();
   }
+  if (pf_moe_tc_ &&
+      cudaEventCreateWithFlags(&ev_moe_plan_, cudaEventDisableTiming) !=
+          cudaSuccess) {
+    ev_moe_plan_ = nullptr;
+    cudaGetLastError();
+  }
   // v0.6 profiler: event rings (2 records per layer + 4 markers per pass).
   if (prof.on) {
     prof_ev_n_ = 2 * d.n_layer + 5;
@@ -420,6 +451,10 @@ Status Session::prepare() {
       // v0.9 knob (default on; SAGER_PF_TC=0 reverts to the v0.8 dp4a GEMVs)
       const auto tc = env_get("SAGER_PF_TC");
       if (tc) pf_tc_ = (*tc != "0");
+      // v0.10 knob (default on; SAGER_MOE_TC=0 reverts to the grouped dp4a
+      // GEMV family for the MoE experts)
+      const auto mtc = env_get("SAGER_MOE_TC");
+      if (mtc) pf_moe_tc_ = (*mtc != "0");
     }
     const EngineDims& dd0 = mc_.dims;
     if (pf_batched_ &&
@@ -2013,8 +2048,23 @@ void Session::moe_dispatch_device(int layer, int n) {
   }
 
   // 3) compact routed rows expert-major (row count read on device).
-  cuda::gather_rows_q8_n(d_xqg_.get(), xq_moe, grows_l,
-                         meta_l, static_cast<int>(Rmax), h_blocks, s);
+  //    v0.10: the MoE tensor-core path compacts straight from the fp16 input
+  //    (GemmEx consumes fp16 activations - no Q8 detour, no requant).
+  //    Large chunks only (m_e ~ n*K/E makes the GemmEx loop pay off; small
+  //    verify/decode windows stay on the dp4a grouped GEMV).
+  const size_t lstride = static_cast<size_t>(d.n_moe_layer) * E;
+  const bool moe_tc = pf_moe_tc_ && ev_moe_plan_ && n >= 256 && !capturing &&
+                      moe_grp_ >= 2 && moe_slot_elems_ > 0 &&
+                      d_wtc_.count() >=
+                          static_cast<size_t>(moe_grp_) * moe_slot_elems_ &&
+                      cuda::tc_handle() != nullptr;
+  if (moe_tc) {
+    cuda::gather_rows_f16_n(expert_y_.get(), xn_.get(), grows_l,
+                            meta_l, static_cast<int>(Rmax), H, s);
+  } else {
+    cuda::gather_rows_q8_n(d_xqg_.get(), xq_moe, grows_l,
+                           meta_l, static_cast<int>(Rmax), h_blocks, s);
+  }
 
   // 4) device-side wait: this layer's planned pairs must have landed (their
   //    loaders patch the pointer table before firing the publish events).
@@ -2022,13 +2072,144 @@ void Session::moe_dispatch_device(int layer, int n) {
   //    the decode-built residency table, nothing ever patches it mid-step.
   if (pump_->stream_active()) pump_->stream_wait_layer(layer, s);
 
+  if (moe_tc) {
+    // 5t) plan + residency mirrors, one host sync per layer (the grouped
+    //     GemmEx loop needs per-expert m and table residency on the host;
+    //     the D2H lands after the pump publishes this layer's pairs - the
+    //     stream only has to drain through the gather at this point).
+    const int Lm = d.n_moe_layer;
+    cudaMemcpyAsync(h_off_.get(), off_l, (E + 1) * sizeof(int),
+                    cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(h_moe_meta_.get(), meta_l, 2 * sizeof(int),
+                    cudaMemcpyDeviceToHost, s);
+    for (int t = 0; t < 3; ++t) {
+      cudaMemcpyAsync(
+          h_ptr_table_.get() + (static_cast<size_t>(t) * Lm + layer) * E,
+          d_ptr_table_.get() + (static_cast<size_t>(t) * Lm + layer) * E,
+          E * sizeof(q4k::BlockQ4K*), cudaMemcpyDeviceToHost, s);
+    }
+    cudaEventRecord(ev_moe_plan_, s);
+    cudaEventSynchronize(ev_moe_plan_);
+    MOE_DBG("moe_tc_plan");
+
+    uint16_t* xg = expert_y_.get();   // fp16 routed rows (life-disjoint)
+    uint16_t* yg2 = expert_g2_.get();
+    uint16_t* yu2 = expert_u2_.get();
+    uint16_t* yd = y_grouped_.get();
+    const size_t ls = static_cast<size_t>(Lm) * E;
+    const q4k::BlockQ4K* const* hg =
+        h_ptr_table_.get() + static_cast<size_t>(layer) * E;
+    moe_absent_.clear();
+    // 5u) grouped two-phase pipeline. The fp16 ring inside d_wtc_ has two
+    //     regions: [G slots of gate+up][G slots of down]. Phase 1 walks the
+    //     experts in groups of G, dequantizing gate+up into region 0 and
+    //     immediately enqueueing the group's GemmEx pairs - the next group's
+    //     dequant reuses the slots only after those GEMMs are enqueued
+    //     (in-order stream keeps the ring coherent). Phase 2 repeats the
+    //     pattern for the down matrix in region 1, after the silu.
+    const int G = moe_grp_;   // power of two
+    const size_t gu_slot = 2ull * FFX * H;              // fp16 elems / slot
+    const size_t dn_slot = static_cast<size_t>(H) * FFX;
+    uint16_t* ring_gu = d_wtc_.get();
+    uint16_t* ring_dn = d_wtc_.get() + G * gu_slot;
+    for (int e = 0; e < E; ++e) {
+      const int o = h_off_.get()[e];
+      if (h_off_.get()[e + 1] > o &&
+          (!hg[e] || !hg[ls + e] || !hg[2 * ls + e])) {
+        moe_absent_.push_back(e);
+      }
+    }
+    if (!moe_absent_.empty()) {
+      // absent experts: zero their down-output rows so the combine adds 0
+      // (the AVX2 CPU-pool patch re-adds them at the next layer boundary).
+      SLOG_W("moe", "layer %d: %zu absent expert(s) - TC mailbox patch",
+             layer, moe_absent_.size());
+      for (int e : moe_absent_) {
+        const int o = h_off_.get()[e];
+        const int m_e = h_off_.get()[e + 1] - o;
+        if (m_e > 0) {
+          cudaMemsetAsync(y_grouped_.get() + static_cast<size_t>(o) * H, 0,
+                          static_cast<size_t>(m_e) * H * sizeof(uint16_t), s);
+        }
+      }
+    }
+    // gate + up: C_row[m_e x FFX] = X_row[m_e x H] * W_row[FFX x H]^T
+    for (int g0 = 0; g0 < E; g0 += G) {
+      const int ge = std::min(G, E - g0);
+      cuda::dequant_experts_q4_k_f16(
+          d_ptr_table_.get() + 0 * lstride + g0,
+          d_ptr_table_.get() + 1 * lstride + g0, off_l + g0,
+          ring_gu, 0, 10, H, ge, G,
+          static_cast<long long>(gu_slot), s);
+      for (int e = g0; e < g0 + ge; ++e) {
+        const int o = h_off_.get()[e];
+        const int m_e = h_off_.get()[e + 1] - o;
+        if (m_e <= 0 || !hg[e] || !hg[ls + e] || !hg[2 * ls + e]) continue;
+        const uint16_t* A =
+            ring_gu + static_cast<size_t>(e & (G - 1)) * gu_slot;
+        const uint16_t* B = xg + static_cast<size_t>(o) * H;
+        if (!cuda::tc_gemm_f16_raw(A, B, yg2 + static_cast<size_t>(o) * FFX,
+                                   FFX, H, m_e, s) ||
+            !cuda::tc_gemm_f16_raw(A + FFX * H, B,
+                                   yu2 + static_cast<size_t>(o) * FFX,
+                                   FFX, H, m_e, s)) {
+          SLOG_E("moe", "layer %d: MoE TC gate/up GemmEx failed (e=%d)",
+                 layer, e);
+        }
+      }
+    }
+    // SiLU(g)*U over the compacted slab (device row count, unchanged math).
+    cuda::silu_mul_f16_n(expert_g2_.get(), expert_g2_.get(),
+                         expert_u2_.get(), meta_l, static_cast<int>(Rmax),
+                         FFX, s);
+    MOE_DBG("silu_n");
+    // down: C_row[m_e x H] = Hsilu_row[m_e x FFX] * W_row[H x FFX]^T
+    for (int g0 = 0; g0 < E; g0 += G) {
+      const int ge = std::min(G, E - g0);
+      cuda::dequant_experts_q4_k_f16(
+          d_ptr_table_.get() + 2 * lstride + g0, nullptr, off_l + g0,
+          ring_dn, 0, 11, FFX, ge, G,
+          static_cast<long long>(dn_slot), s);
+      for (int e = g0; e < g0 + ge; ++e) {
+        const int o = h_off_.get()[e];
+        const int m_e = h_off_.get()[e + 1] - o;
+        if (m_e <= 0 || !hg[e] || !hg[ls + e] || !hg[2 * ls + e]) continue;
+        const uint16_t* A =
+            ring_dn + static_cast<size_t>(e & (G - 1)) * dn_slot;
+        const uint16_t* B = yg2 + static_cast<size_t>(o) * FFX;
+        if (!cuda::tc_gemm_f16_raw(A, B, yd + static_cast<size_t>(o) * H,
+                                   H, FFX, m_e, s)) {
+          SLOG_E("moe", "layer %d: MoE TC down GemmEx failed (e=%d)",
+                 layer, e);
+        }
+      }
+    }
+    // the Q4_K pump ring slots were last read by the down dequant above
+    if (pump_->stream_active()) pump_->stream_consume_layer(layer, s);
+    if (!moe_absent_.empty()) {
+      // Feed the standard mailbox: resolve_cpu_mailbox(layer) fires at the
+      // next layer boundary - the combine is already enqueued, this layer's
+      // plan state (d_off_/d_gslot_/d_grows_) is still intact and xn_ has
+      // not been overwritten yet - and runs the AVX2 CPU-pool patch with the
+      // exact v0.4 semantics (combine saw zeros; the patch adds the rows).
+      const int cnt = static_cast<int>(moe_absent_.size());
+      cudaMemcpyAsync(d_mail_.get(), moe_absent_.data(),
+                      static_cast<size_t>(cnt) * sizeof(int),
+                      cudaMemcpyHostToDevice, s);
+      cudaMemcpyAsync(d_mail_n_.get(), &cnt, sizeof(int),
+                      cudaMemcpyHostToDevice, s);
+      cudaMemcpyAsync(h_mail_n_.get(), d_mail_n_.get(), sizeof(int),
+                      cudaMemcpyDeviceToHost, s);
+      cudaEventRecord(ev_scan_, s);
+      mail_pending_ = layer;
+    }
+  } else {
   // 5) gate+up for EVERY routed expert of the layer in ONE launch.
   //    tiles <= total routed rows (each tile covers >= 1 row) - for the 1-row
   //    decode step this caps the grid at Rmax (=K) tiles instead of the
   //    residency-worst-case K/tile + E + 16, which is 94% empty blocks.
   const int tiles_max = std::min(static_cast<int>(Rmax) / tile_gu + E + 16,
                                  static_cast<int>(Rmax));
-  const size_t lstride = static_cast<size_t>(d.n_moe_layer) * E;
   cuda::gemv_grouped2_tab_q4_k_q8_f16out_mtok(
       d_ptr_table_.get() + 0 * lstride,
       d_ptr_table_.get() + 1 * lstride,
@@ -2055,6 +2236,7 @@ void Session::moe_dispatch_device(int layer, int n) {
 
   // 8) ring slots of this layer's planned pairs free after the down GEMM.
   if (pump_->stream_active()) pump_->stream_consume_layer(layer, s);
+  }
 
   // 9) compact outputs into the combine slab (gslot built on device).
   cuda::scatter_routed_f16(expert_y_.get(), y_grouped_.get(), gslot_l,
@@ -2149,8 +2331,6 @@ void Session::resolve_cpu_mailbox(int layer, int n) {
   const int H = d.hidden;
   const int E = d.n_expert;
   const int K = d.n_expert_used;
-  const int FFX = d.n_ff_exp;
-  cudaStream_t s = stream_.get();
   SLOG_W("moe", "layer %d: %d absent expert(s) mailed - CPU-pool patch",
          layer, cnt);
 
@@ -2183,13 +2363,33 @@ void Session::resolve_cpu_mailbox(int layer, int n) {
   if (dec_mail_ok_) {
     for (int e : uniq) dec_promote_.emplace_back(layer, e);
   }
+  cpu_pool_patch_rows(layer, n, uniq.data(), static_cast<int>(uniq.size()));
+}
 
+// ---------------------------------------------------------------------------
+// v0.10: shared CPU-pool patch core (mailbox path + MoE-TC absent path).
+// The pinned mirrors h_off_ / h_grows_ / h_gslot_ / h_x16_ must already hold
+// the layer's plan and fp16 input; runs the AVX2 pool for the given absent
+// experts and adds their contributions (the combine must already have run
+// with the absent experts at zero).
+// ---------------------------------------------------------------------------
+void Session::cpu_pool_patch_rows(int layer, int n, const int* uniq,
+                                  int n_uniq) {
+  (void)n;
+  const EngineDims& d = mc_.dims;
+  const int H = d.hidden;
+  const int E = d.n_expert;
+  const int K = d.n_expert_used;
+  const int FFX = d.n_ff_exp;
+  cudaStream_t s = stream_.get();
   // Rebuild (row, kk) for the absent experts and run the AVX2 pool.
   const size_t gu = hot_->per_expert_bytes / 3;
   int n_patch = 0;
   struct Patch { int r, kk, e; };
   std::vector<Patch> patches;
-  for (int e : uniq) {
+  for (int i = 0; i < n_uniq; ++i) {
+    const int e = uniq[i];
+    if (e < 0 || e >= E) continue;
     for (int pos = h_off_.get()[e]; pos < h_off_.get()[e + 1]; ++pos) {
       const int r = h_grows_.get()[pos];
       for (int kk = 0; kk < K; ++kk) {

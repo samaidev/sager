@@ -452,6 +452,31 @@ void gather_rows_q8_n(q4k::BlockQ8K* dst, const q4k::BlockQ8K* src,
                                                       row_blocks);
 }
 
+// v0.10 fp16 variant for the MoE tensor-core path: compact routed rows
+// (expert-major, row count from the device meta block) straight from the fp16
+// layer input, skipping the Q8 detour - the TC GEMM consumes fp16 activations.
+__global__ void gather_rows_f16_n_kernel(uint16_t* __restrict__ dst,
+                                         const uint16_t* __restrict__ src,
+                                         const int* __restrict__ src_rows,
+                                         const int* __restrict__ meta,
+                                         int hidden) {
+  const int r = blockIdx.y;
+  if (r >= *meta) return;
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= hidden) return;
+  const int s = src_rows[r];
+  dst[static_cast<size_t>(r) * hidden + i] =
+      src[static_cast<size_t>(s) * hidden + i];
+}
+
+void gather_rows_f16_n(uint16_t* dst, const uint16_t* src,
+                       const int* src_rows, const int* meta, int r_max,
+                       int hidden, cudaStream_t stream) {
+  dim3 block(256), grid((hidden + 255) / 256, r_max);
+  gather_rows_f16_n_kernel<<<grid, block, 0, stream>>>(dst, src, src_rows,
+                                                       meta, hidden);
+}
+
 // CPU-pool patch: after the batched combine already ran (absent experts
 // contributed 0), add the late CPU results for the patched (row, slot) list.
 // rk[i] packs r * (n_used + 1) + kk.

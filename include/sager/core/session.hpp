@@ -207,6 +207,7 @@ class Session {
   void   moe_dispatch_batched(int layer, int n);        // v0.2.3 whole-chunk MoE
   void   moe_dispatch_device(int layer, int n);         // v0.4 device-side dispatch
   void   resolve_cpu_mailbox(int layer, int n);         // v0.4 CPU-pool patch
+  void   cpu_pool_patch_rows(int layer, int n, const int* uniq, int n_uniq);
   void   patch_graph_mailbox(int layer, int cnt);       // v0.6 step-end patch
   void   drain_expert_touch(int n_rows);                // v0.4 chunk-level touch feed
   void   prof_accum_fw();                               // v0.6 fold fw events
@@ -307,6 +308,19 @@ class Session {
   // SAGER_PF_BATCHED=0 also reverts - same slab contract as the mtok path)
   bool pf_tc_ = true;
   DeviceBuffer<uint16_t> d_wtc_;   // fp16 dequant scratch [max_rows * k]
+  // v0.10 MoE tensor-core path (SAGER_MOE_TC=0 reverts to the grouped dp4a
+  // GEMV family): routed rows compact in fp16, routed experts dequantize into
+  // a small ring of fp16 slots, one GemmEx per (expert, matrix).
+  bool pf_moe_tc_ = true;
+  int  moe_grp_ = 8;               // experts per dequant/GEMM group (pow2)
+  size_t moe_slot_elems_ = 0;      // fp16 elems per expert slot (3*FFX*H)
+  // Zero new VRAM: the fp16 routed-row slab reuses expert_y_ (life ranges
+  // are disjoint - X16 dies at the down GEMM, expert_y_ is written later by
+  // the scatter), and the fp16 expert ring reuses d_wtc_ (the dense TC
+  // dequant scratch is free between the layer body and the next layer).
+  PinnedBuffer<int>      h_moe_meta_; // plan mirror for the host GEMM loop
+  std::vector<int>       moe_absent_; // absent-expert scratch (TC path)
+  cudaEvent_t            ev_moe_plan_ = nullptr;  // plan-mirror completion
   const q4k::BlockQ8K* moe_xq_in_ = nullptr;  // fused-norm xq reuse (n=1)
   // v0.4 device-side expert dispatch (P1): chunk pointer table + device plan
   DeviceBuffer<q4k::BlockQ4K*> d_ptr_table_;   // [3][n_moe_layer][E] weights
