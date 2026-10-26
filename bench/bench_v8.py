@@ -33,6 +33,10 @@ def base_env(extra: dict) -> dict:
               "SAGER_HEAD_SMX"):
         env.pop(k, None)
     env.setdefault("SAGER_EXPERT_POOL_REUSE", "1")
+    # v0.7 benchmark protocol: device decode + device sampler enabled
+    env.setdefault("SAGER_DECODE_DEVICE", "1")
+    env.setdefault("SAGER_DEVICE_SAMPLER", "1")
+    env.setdefault("SAGER_PROFILE_PATH", "/content/sager_profile.json")
     if os.environ.get("BENCH_POOL"):
         env["SAGER_EXPERT_POOL_FILE"] = os.environ["BENCH_POOL"]
     env.update(extra)
@@ -62,7 +66,8 @@ class Engine:
             v = json.loads(line)
             if v.get("type") == "error":
                 raise RuntimeError("engine error: " + v.get("message", "?"))
-            if v.get("type") in ("done", "loaded", "stats", "reset"):
+            if v.get("type") in ("done", "loaded", "stats", "reset", "ok",
+                                 "bye"):
                 return v
             # token lines stream past; ignored in the timing arms
 
@@ -157,12 +162,14 @@ def parity_arm(extra_env: dict, model: str, chunk: int, prompt: list) -> list:
                 raise RuntimeError("parity error: " + v.get("message", "?"))
             elif v.get("type") == want_done:
                 return v
+            elif v.get("type") in ("ok", "bye") and want_done == "reset":
+                return v
 
     send({"cmd": "load", "model": model, "ctx": 8192,
           "vram_mb": int(os.environ.get("BENCH_VRAM", "9984")),
           "threads": 2, "graphs": True, "mtp": False, "chunk": chunk,
           "kv_q8": True}, "loaded")
-    send({"cmd": "reset"}, "reset")
+    send({"cmd": "reset"}, "ok")
     send({"cmd": "generate", "ids": prompt, "max_tokens": 64,
           "temperature": 0.0, "top_k": 20, "top_p": 0.95, "greedy": True,
           "seed": 7}, "done")
