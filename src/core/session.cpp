@@ -153,6 +153,20 @@ Status Session::alloc_scratch() {
   const int T = cp_.chunk_prefill > 0 ? cp_.chunk_prefill : 1;
   const int V = d.n_vocab;
 
+  // v0.9: fp16 dequant scratch for the TC prefill GEMM path - ONE reuse
+  // buffer sized for the largest dense projection (GDN qkvz proj_rows x H
+  // dominates; lin_out is H x y_rows, smaller in elements).
+  if (pf_tc_) {
+    const auto g = mc_.gdn();
+    size_t need = static_cast<size_t>(std::max(g.proj_rows(), g.y_rows())) *
+                  static_cast<size_t>(H);
+    need = std::max(need, static_cast<size_t>(Q) * H);
+    need = std::max(need, static_cast<size_t>(H) * g.y_rows());
+    if (!ok(d_wtc_.alloc(need), "d_wtc_")) return Status::kOomVram;
+  } else {
+    d_wtc_.alloc(0);
+  }
+
   // Activation slabs sized for the prefill chunk (fixed addresses: the same
   // buffers serve the 1-row decode path).
   if (!ok(x_.alloc(static_cast<size_t>(T) * H), "x_")) return Status::kOomVram;
@@ -403,6 +417,9 @@ Status Session::prepare() {
       if (hs) head_smx_ = (*hs != "0");
       const auto gf = env_get("SAGER_GDN_FFN_NORM");
       if (gf) gdn_ffn_norm_ = (*gf != "0");
+      // v0.9 knob (default on; SAGER_PF_TC=0 reverts to the v0.8 dp4a GEMVs)
+      const auto tc = env_get("SAGER_PF_TC");
+      if (tc) pf_tc_ = (*tc != "0");
     }
     const EngineDims& dd0 = mc_.dims;
     if (pf_batched_ &&
@@ -411,11 +428,12 @@ Status Session::prepare() {
              "(%d/%d) - per-row walk stays", dd0.hidden, dd0.n_ff_exp);
       pf_batched_ = false;
     }
-    SLOG_I("session", "prefill v0.2.3: batched=%d mtok=%d mmq=%d stream_min=%d "
-           "chunk_cap=%d cpu_rows=%d device=%d fuse=%d head_smx=%d",
-           (int)pf_batched_, (int)pf_mtok_, (int)pf_mmq_, pf_stream_min_,
-           pf_chunk_cap_, pf_cpu_cap_, (int)pf_device_, (int)dec_fuse_,
-           (int)head_smx_);
+    SLOG_I("session", "prefill v0.9: batched=%d mtok=%d mmq=%d tc=%d "
+           "stream_min=%d chunk_cap=%d cpu_rows=%d device=%d fuse=%d "
+           "head_smx=%d",
+           (int)pf_batched_, (int)pf_mtok_, (int)pf_mmq_, (int)pf_tc_,
+           pf_stream_min_, pf_chunk_cap_, pf_cpu_cap_, (int)pf_device_,
+           (int)dec_fuse_, (int)head_smx_);
   }
 
   if (w_.head_type_ != 12 && w_.head_type_ != 1 && w_.head_type_ != 14) {
@@ -551,7 +569,13 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
                                          static_cast<float>(d.head_dim));
   cudaStream_t s = stream_.get();
 
-  if (dec_fuse_ && n_tokens == 1) {
+  if (n_tokens > 1 && pf_tc_ && pf_batched_) {
+    // v0.9 TC path: activations stay fp16 - no Q8_K requant needed here; the
+    // MoE half quantizes xn itself (moe_xq_in_ stays nullptr; d_xq_ is only
+    // filled by the fallback below or the n==1 decode path).
+    cuda::rmsnorm_batched_f16(xn_.get(), x_.get(), lw.attn_norm, H,
+                              mc_.norm_eps, n_tokens, s);
+  } else if (dec_fuse_ && n_tokens == 1) {
     // v0.8: rmsnorm + Q8_K quant in one launch (bit-identical to the pair);
     // decode-only - at n>1 the two-kernel sequence's spread-out quantize
     // grid wins (the fused kernel is barrier-heavy per row)
@@ -577,6 +601,24 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
       cuda::gemv_q4_k_q8_f16out(Q4W(lw.wq), d_xq_.get(), q_.get(), Q, H, s);
       cuda::gemv_q4_k_q8_f16out(Q4W(lw.wk), d_xq_.get(), k_.get(), KVd, H, s);
       cuda::gemv_q4_k_q8_f16out(Q4W(lw.wv), d_xq_.get(), v_.get(), KVd, H, s);
+    }
+  } else if (pf_tc_ && pf_batched_) {
+    // v0.9: real GEMM via cuBLAS tensor cores - weights dequantize once per
+    // chunk into d_wtc_ (fp16), activations stay fp16, fp32 accumulate.
+    if (!cuda::tc_gemm_q4_k_f16(Q4W(lw.wq), xn_.get(), q_.get(),
+                                d_wtc_.get(), Q, H, n_tokens, s) ||
+        !cuda::tc_gemm_q4_k_f16(Q4W(lw.wk), xn_.get(), k_.get(),
+                                d_wtc_.get(), KVd, H, n_tokens, s) ||
+        !cuda::tc_gemm_q4_k_f16(Q4W(lw.wv), xn_.get(), v_.get(),
+                                d_wtc_.get(), KVd, H, n_tokens, s)) {
+      SLOG_E("session", "TC prefill qkv GEMM failed - dp4a fallback");
+      cuda::quantize_q8_k(xn_.get(), d_xq_.get(), n_tokens * H, s);
+      cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.wq), d_xq_.get(), q_.get(), Q, H,
+                                     n_tokens, s);
+      cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.wk), d_xq_.get(), k_.get(), KVd, H,
+                                     n_tokens, s);
+      cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.wv), d_xq_.get(), v_.get(), KVd, H,
+                                     n_tokens, s);
     }
   } else if (pf_mtok_ && pf_batched_ && pf_mmq_) {
     // v0.8: MMQ prefill GEMM - weights staged once per token tile, the
@@ -610,6 +652,16 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
     if (n_tokens == 1) {
       cuda::gemv_q4_k_q8_f16out(Q4W(lw.attn_gate), d_xq_.get(), d_gate_.get(),
                                 Q, H, s);
+    } else if (pf_tc_ && pf_batched_) {
+      // v0.9: TC path (fp16 activations; same numerics contract as qkv).
+      if (!cuda::tc_gemm_q4_k_f16(Q4W(lw.attn_gate), xn_.get(),
+                                  d_gate_.get(), d_wtc_.get(), Q, H,
+                                  n_tokens, s)) {
+        SLOG_E("session", "TC prefill attn_gate GEMM failed - dp4a fallback");
+        cuda::quantize_q8_k(xn_.get(), d_xq_.get(), n_tokens * H, s);
+        cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.attn_gate), d_xq_.get(),
+                                       d_gate_.get(), Q, H, n_tokens, s);
+      }
     } else if (pf_mtok_ && pf_batched_ && pf_mmq_) {
       cuda::mmq_q4_k_q8_f16out(Q4W(lw.attn_gate), d_xq_.get(),
                                d_gate_.get(), Q, H, n_tokens, s);
@@ -672,6 +724,16 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
                                        o_proj_.get(), x_.get(), H, Q, s);
     } else {
       cuda::gemv_q4_k_q8_f16out(Q4W(lw.wo), d_hq_.get(), o_proj_.get(), H, Q, s);
+    }
+  } else if (pf_tc_ && pf_batched_) {
+    // v0.9: TC path - attn_out stays fp16 (no requant); the residual add
+    // stays a separate add_f16 (epilogue fusion is a later micro-opt).
+    if (!cuda::tc_gemm_q4_k_f16(Q4W(lw.wo), attn_out_.get(), o_proj_.get(),
+                                d_wtc_.get(), H, Q, n_tokens, s)) {
+      SLOG_E("session", "TC prefill o_proj GEMM failed - dp4a fallback");
+      cuda::quantize_q8_k(attn_out_.get(), d_hq_.get(), n_tokens * Q, s);
+      cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.wo), d_hq_.get(), o_proj_.get(),
+                                     H, Q, n_tokens, s);
     }
   } else if (pf_mtok_ && pf_batched_ && pf_mmq_) {
     cuda::quantize_q8_k(attn_out_.get(), d_hq_.get(), n_tokens * Q, s);
@@ -847,7 +909,12 @@ void Session::linear_layer_chunk(int layer, int n) {
   float* delta_st = lin_delta_state_.get() +
       static_cast<size_t>(slab) * g.state_elems();
 
-  if (dec_fuse_) {
+  if (pf_tc_) {
+    // v0.9 TC path: xn stays fp16 for the TC GEMMs; the MoE half quantizes
+    // xn itself (moe_xq_in_ is nullptr on the n>1 path).
+    cuda::rmsnorm_batched_f16(xn_.get(), x_.get(), lw.attn_norm, H,
+                              mc_.norm_eps, n, s);
+  } else if (dec_fuse_) {
     cuda::rmsnorm_quant_f16(xn_.get(), x_.get(), lw.attn_norm, d_xq_.get(),
                             H, mc_.norm_eps, n, s);
   } else {
@@ -856,7 +923,21 @@ void Session::linear_layer_chunk(int layer, int n) {
     cuda::quantize_q8_k(xn_.get(), d_xq_.get(), n * H, s);
   }
   // fused projections for the whole window
-  if (pf_mmq_ && pf_mtok_) {
+  if (pf_tc_) {
+    if (!cuda::tc_gemm_q4_k_f16(Q4W(lw.lin_in_qkvz), xn_.get(),
+                                lin_proj_b_.get(), d_wtc_.get(),
+                                g.proj_rows(), H, n, s) ||
+        !cuda::tc_gemm_q4_k_f16(Q4W(lw.lin_in_ba), xn_.get(),
+                                lin_ba_b_.get(), d_wtc_.get(),
+                                g.ba_rows(), H, n, s)) {
+      SLOG_E("session", "TC prefill qkvz/ba GEMM failed - dp4a fallback");
+      cuda::quantize_q8_k(xn_.get(), d_xq_.get(), n * H, s);
+      cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.lin_in_qkvz), d_xq_.get(),
+                                     lin_proj_b_.get(), g.proj_rows(), H, n, s);
+      cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.lin_in_ba), d_xq_.get(),
+                                     lin_ba_b_.get(), g.ba_rows(), H, n, s);
+    }
+  } else if (pf_mmq_ && pf_mtok_) {
     cuda::mmq_q4_k_q8_f16out(Q4W(lw.lin_in_qkvz), d_xq_.get(),
                              lin_proj_b_.get(), g.proj_rows(), H, n, s);
     cuda::mmq_q4_k_q8_f16out(Q4W(lw.lin_in_ba), d_xq_.get(),
@@ -896,13 +977,25 @@ void Session::linear_layer_chunk(int layer, int n) {
                                lin_proj_b_.get(), g.proj_rows(), g.conv_dim(),
                                lw.lin_o_norm, g.n_v_heads, g.value_dim,
                                mc_.norm_eps, n, s);
-  cuda::quantize_q8_k(lin_on_b_.get(), d_hq_.get(), n * g.y_rows(), s);
-  if (pf_mmq_ && pf_mtok_) {
-    cuda::mmq_q4_k_q8_f16out(Q4W(lw.lin_out), d_hq_.get(), o_proj_.get(),
-                             H, g.y_rows(), n, s);
+  if (pf_tc_) {
+    // v0.9: lin_on stays fp16 into the TC GEMM (no requant).
+    if (!cuda::tc_gemm_q4_k_f16(Q4W(lw.lin_out), lin_on_b_.get(),
+                                o_proj_.get(), d_wtc_.get(), H, g.y_rows(),
+                                n, s)) {
+      SLOG_E("session", "TC prefill lin_out GEMM failed - dp4a fallback");
+      cuda::quantize_q8_k(lin_on_b_.get(), d_hq_.get(), n * g.y_rows(), s);
+      cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.lin_out), d_hq_.get(),
+                                     o_proj_.get(), H, g.y_rows(), n, s);
+    }
   } else {
-    cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.lin_out), d_hq_.get(), o_proj_.get(),
-                                   H, g.y_rows(), n, s);
+    cuda::quantize_q8_k(lin_on_b_.get(), d_hq_.get(), n * g.y_rows(), s);
+    if (pf_mmq_ && pf_mtok_) {
+      cuda::mmq_q4_k_q8_f16out(Q4W(lw.lin_out), d_hq_.get(), o_proj_.get(),
+                               H, g.y_rows(), n, s);
+    } else {
+      cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.lin_out), d_hq_.get(), o_proj_.get(),
+                                     H, g.y_rows(), n, s);
+    }
   }
   cuda::add_f16(x_.get(), o_proj_.get(), n * H, s);
   // v0.8 FIX: the MoE half consumes ffn_norm(x) - never applied on GDN

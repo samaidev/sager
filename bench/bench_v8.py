@@ -30,7 +30,7 @@ def base_env(extra: dict) -> dict:
     env = dict(os.environ)
     # benchmark knobs only; feature flags come from `extra`
     for k in ("SAGER_DECODE_FUSE", "SAGER_PF_MMQ", "SAGER_GDN_FFN_NORM",
-              "SAGER_HEAD_SMX"):
+              "SAGER_HEAD_SMX", "SAGER_PF_TC"):
         env.pop(k, None)
     env.setdefault("SAGER_EXPERT_POOL_REUSE", "1")
     # v0.7 benchmark protocol: device decode + device sampler enabled
@@ -210,13 +210,18 @@ def main() -> None:
            "chunk": chunk, "parity": None, "arms": []}
 
     if not a.skip_parity:
-        print("=== parity: v0.7 path (fuse=0 mmq=0) vs v0.8 defaults ===",
+        print("=== parity: v0.7 path (fuse=0 mmq=0 tc=0) vs v0.8/v0.9 defaults minus TC ===",
               flush=True)
         # the GDN ffn-norm fix changes outputs; keep it OUT of the equality
         # gate by fixing it identically on both sides
+        # v0.9: the TC prefill path ALSO changes numerics by design (fp16
+        # weight rounding + fp16 activations) - pinned OFF on both arms here,
+        # measured separately in the perf arms.
         base = parity_arm({"SAGER_DECODE_FUSE": "0", "SAGER_PF_MMQ": "0",
-                           "SAGER_GDN_FFN_NORM": "0"}, model, chunk, prompt)
-        new = parity_arm({"SAGER_GDN_FFN_NORM": "0"}, model, chunk, prompt)
+                           "SAGER_GDN_FFN_NORM": "0", "SAGER_PF_TC": "0"},
+                          model, chunk, prompt)
+        new = parity_arm({"SAGER_GDN_FFN_NORM": "0", "SAGER_PF_TC": "0"},
+                         model, chunk, prompt)
         ok = base == new and len(base) == 64
         out["parity"] = {"gdn_ffn_norm": "off", "v07_len": len(base), "v08_len": len(new),
                          "identical": ok,
@@ -234,25 +239,30 @@ def main() -> None:
     if not a.skip_bench:
         arms = [("v08-default", {})]
         if os.environ.get("BENCH_ARMS", "1") != "0":
-            # exact v0.7 behavior: every v0.8 switch off, GDN norm fix off
+            # exact v0.7 behavior: every v0.8/v0.9 switch off, GDN norm fix off
             arms.append(("v07-exact", {"SAGER_DECODE_FUSE": "0",
                                        "SAGER_PF_MMQ": "0",
                                        "SAGER_HEAD_SMX": "0",
-                                       "SAGER_GDN_FFN_NORM": "0"}))
+                                       "SAGER_GDN_FFN_NORM": "0",
+                                       "SAGER_PF_TC": "0"}))
         if os.environ.get("BENCH_ISOLATE", "0") != "0":
             arms = [("v07-exact", {"SAGER_DECODE_FUSE": "0",
                                    "SAGER_PF_MMQ": "0",
                                    "SAGER_HEAD_SMX": "0",
-                                   "SAGER_GDN_FFN_NORM": "0"}),
-                    ("v08-all", {"SAGER_GDN_FFN_NORM": "0"}),
+                                   "SAGER_GDN_FFN_NORM": "0",
+                                   "SAGER_PF_TC": "0"}),
+                    ("v09-tc", {"SAGER_GDN_FFN_NORM": "0"}),
                     ("mmq-only", {"SAGER_DECODE_FUSE": "0",
-                                  "SAGER_GDN_FFN_NORM": "0"}),
+                                  "SAGER_GDN_FFN_NORM": "0",
+                                  "SAGER_PF_TC": "0"}),
                     ("fuse-only", {"SAGER_PF_MMQ": "0",
                                    "SAGER_HEAD_SMX": "0",
-                                   "SAGER_GDN_FFN_NORM": "0"}),
+                                   "SAGER_GDN_FFN_NORM": "0",
+                                   "SAGER_PF_TC": "0"}),
                     ("smx-only", {"SAGER_DECODE_FUSE": "0",
                                   "SAGER_PF_MMQ": "0",
-                                  "SAGER_GDN_FFN_NORM": "0"})]
+                                  "SAGER_GDN_FFN_NORM": "0",
+                                  "SAGER_PF_TC": "0"})]
         for label, env in arms:
             r = bench_arm(label, model, chunk, a.rounds, env)
             out["arms"].append(r)

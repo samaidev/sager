@@ -101,6 +101,20 @@ void mmq2_q4_k_q8_f16out(const q4k::BlockQ4K* wg, const q4k::BlockQ4K* wu,
                          const q4k::BlockQ8K* xq, uint16_t* yg, uint16_t* yu,
                          int n_rows, int k, int n_tokens, cudaStream_t stream);
 
+// ---- v0.9 prefill tensor-core path (SAGER_PF_TC; 0 reverts to the dp4a
+// GEMV family) -------------------------------------------------------------
+// Q4_K weights dequantize into a fp16 scratch ONCE per chunk, then cuBLAS
+// GemmEx (fp16 in / fp32 accumulate, sm_75 HMMA) runs the projection as a
+// real GEMM: out[t * n_rows + row] = sum_k x[t * k + kk] * w[row * k + kk].
+// NOT bit-identical to the dp4a path (fp16 weight rounding, fp16 activations
+// instead of Q8_K requant, different accumulation order); decode never takes
+// it. Returns false on cuBLAS failure - callers fall back to the GEMV path.
+bool tc_gemm_q4_k_f16(const q4k::BlockQ4K* w, const uint16_t* x, uint16_t* y,
+                      uint16_t* scratch, int n_rows, int k, int n_tokens,
+                      cudaStream_t stream);
+void* tc_handle();
+size_t tc_scratch_elems(int max_rows, int max_k);
+
 // ---- v0.8 decode fusion kernels (all bit-identical to what they replace) ----
 
 // rmsnorm + Q8_K quantization in one launch (n_rows blocks of one row each).

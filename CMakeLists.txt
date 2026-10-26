@@ -101,6 +101,7 @@ if(SAGER_ENABLE_CUDA)
     src/kernels/cuda/norm_rotary.cu
     src/kernels/cuda/sampling.cu
     src/kernels/cuda/gdn.cu
+    src/kernels/cuda/tc_gemm.cu
   )
   target_include_directories(sager_cuda PUBLIC include)
   target_compile_definitions(sager_cuda PUBLIC SAGER_HAVE_CUDA=1)
@@ -108,7 +109,7 @@ if(SAGER_ENABLE_CUDA)
   # symbols, and skipping the device-link step avoids the RDC registration
   # pitfall when the final executable is CXX-only.
   set_property(TARGET sager_cuda PROPERTY CUDA_SEPARABLE_COMPILATION OFF)
-  target_link_libraries(sager_core PUBLIC sager_cuda CUDA::cudart)
+  target_link_libraries(sager_core PUBLIC sager_cuda CUDA::cudart CUDA::cublas)
 endif()
 
 # ---------------------------------------------------------------------------
