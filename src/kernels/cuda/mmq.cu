@@ -640,6 +640,33 @@ struct GnmParams {
   int rowss[3];
 };
 
+// Per-slot parameter blocks. Slots are LAYERS: the values are written once at
+// capture time and never change (weights are fixed), so the async H2D copy
+// node replays the same bytes every step - no host interplay at replay.
+constexpr int kGnmSlots = 64;
+GnmParams* gnm_h_ = nullptr;      // pinned host mirrors
+GnmParams* gnm_d_ = nullptr;      // device copies
+const q4k::BlockQ4K* gnm_ws_fb_[kGnmSlots][3];
+uint16_t* gnm_ys_fb_[kGnmSlots][3];
+int gnm_rowss_fb_[kGnmSlots][3];
+
+bool gnm_init() {
+  if (gnm_d_) return true;
+  if (cudaMallocHost(&gnm_h_, sizeof(GnmParams) * kGnmSlots) != cudaSuccess) {
+    gnm_h_ = nullptr;
+    cudaGetLastError();
+    return false;
+  }
+  if (cudaMalloc(&gnm_d_, sizeof(GnmParams) * kGnmSlots) != cudaSuccess) {
+    gnm_d_ = nullptr;
+    cudaGetLastError();
+    cudaFreeHost(gnm_h_);
+    gnm_h_ = nullptr;
+    return false;
+  }
+  return true;
+}
+
 template <int NG, int NM>
 __global__ void gemv_nm_q4_k_q8_f16out_kernel(
     const GnmParams* __restrict__ p, const q4k::BlockQ8K* __restrict__ xq,
@@ -728,33 +755,6 @@ void gemv_nm_dispatch(const GnmParams* dp, int total_rows, int slot,
                           gnm_rowss_fb_[slot][m] - r0, k, stream);
     }
   }
-}
-
-// Per-slot parameter blocks. Slots are LAYERS: the values are written once at
-// capture time and never change (weights are fixed), so the async H2D copy
-// node replays the same bytes every step - no host interplay at replay.
-constexpr int kGnmSlots = 64;
-GnmParams* gnm_h_ = nullptr;      // pinned host mirrors
-GnmParams* gnm_d_ = nullptr;      // device copies
-const q4k::BlockQ4K* gnm_ws_fb_[kGnmSlots][3];
-uint16_t* gnm_ys_fb_[kGnmSlots][3];
-int gnm_rowss_fb_[kGnmSlots][3];
-
-bool gnm_init() {
-  if (gnm_d_) return true;
-  if (cudaMallocHost(&gnm_h_, sizeof(GnmParams) * kGnmSlots) != cudaSuccess) {
-    gnm_h_ = nullptr;
-    cudaGetLastError();
-    return false;
-  }
-  if (cudaMalloc(&gnm_d_, sizeof(GnmParams) * kGnmSlots) != cudaSuccess) {
-    gnm_d_ = nullptr;
-    cudaGetLastError();
-    cudaFreeHost(gnm_h_);
-    gnm_h_ = nullptr;
-    return false;
-  }
-  return true;
 }
 
 }  // namespace
