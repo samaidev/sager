@@ -11,7 +11,7 @@ REPO=/content/sager
 POOL=/content/Sage-A1.5-Q4_K_M-expert-pool.bin
 MODEL=/content/Sage-A1.5-Q4_K_M.gguf
 
-echo "== $(date -u +%F_%T) v0.8 remote run start =="
+echo "== $(date -u +%F_%T) v0.8 remote run start =="\npip install -q huggingface_hub hf_transfer 2>/dev/null | tail -1 || true\nexport HF_HUB_ENABLE_HF_TRANSFER=1
 nvidia-smi | head -4 || true
 
 if [ ! -d "$REPO/.git" ]; then
@@ -76,7 +76,7 @@ tar czf /content/sager_v08_t4_cuda.tar.gz \
     libsager_core.a libsager_cuda.a \
   -C /content BUILD_INFO_v8.txt v8_c512.json v8_c2048.json v8_c2048_r3.json \
     bench_c512.log bench_c2048.log bench_c2048_r3.log \
-  -C "$REPO" BENCH_RESULTS_v08.md 2>/dev/null || \
+  2>/dev/null || \
 tar czf /content/sager_v08_t4_cuda.tar.gz \
   -C "$REPO/build" sager_engine sager_test_q4 sager_test_gdn sager_test_pump \
     libsager_core.a libsager_cuda.a \

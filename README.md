@@ -39,7 +39,40 @@ Sage-A1.5 is a HYBRID (config.json: `full_attention_interval=4`, 40 blocks → *
 
 KV is now allocated only for the 10 full-attention layers (GDN layers keep fixed-size recurrence state — ~60 MB total instead of hundreds of MB of KV).
 
-## v0.6: full-layer decode graphs + native Q6_K head (NEWEST)
+## v0.8: prefill MMQ GEMM + decode fusions + GDN ffn-norm fix (NEWEST)
+
+Measured on the same T4 (Sage-A1.5-Q4_K_M, branch v0.8-opt, warm pool):
+
+| metric | v0.7 | v0.8 | delta |
+|---|---|---|---|
+| prefill pp512 | 248.1 tok/s | TBD | TBD |
+| prefill pp2048 | 218.5 tok/s | TBD | TBD |
+| decode tg128 | 30.65 tok/s | TBD | TBD |
+
+13. **Prefill MMQ GEMM** (`SAGER_PF_MMQ=0` reverts) - the mtok GEMVs serialize
+    the token tile through one dp4a chain per lane; the MMQ kernel interleaves
+    TOK independent token accumulators while keeping the exact mtok
+    accumulation order (bit-identical outputs, gate-verified).
+14. **Decode fusions** (`SAGER_DECODE_FUSE=0` reverts) - fused rmsnorm+quant
+    (2/layer), multi-matrix projection GEMVs (q|k|v and qkvz|ba in one
+    launch), GEMV residual-add epilogues, fused router GEMV+warp-top-k, and
+    the shared row written straight into the combine slab. The whole-step
+    graph shrinks from 643 nodes toward ~300, cutting the T4 front-end wall
+    (~30 us/node) that dominated the v0.7 step time.
+15. **smem-x Q6_K head GEMV** (`SAGER_HEAD_SMX=0` reverts) - x blocks staged
+    once per 8-row block; bit-identical logits, less L2/DRAM re-read traffic
+    on the 248k-row head.
+16. **FIX: GDN layers never applied `ffn_norm` before the MoE half**
+    (`SAGER_GDN_FFN_NORM=0` restores the v0.2-0.7 behavior) - the router and
+    experts read the stale `attn_norm` row from before the recurrence update.
+    Every block carries `post_attention_layernorm`; it is applied here exactly
+    as dense layers apply it. This changes outputs (for the better) and is
+    excluded from the bit-parity gate.
+
+Gates: ctest 3/3; greedy token-stream parity v0.7-kernels vs v0.8 (norm fix
+pinned on both arms) IDENTICAL. Full report: [BENCH_RESULTS_v08.md](BENCH_RESULTS_v08.md).
+
+## v0.6: full-layer decode graphs + native Q6_K head
 
 Measured on the same T4 (Sage-A1.5-Q4_K_M, commit 16f2f59, warm pool):
 
