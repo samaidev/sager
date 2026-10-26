@@ -308,7 +308,7 @@ void mmq_dispatch(const q4k::BlockQ4K* w1, const q4k::BlockQ4K* w2,
   const int wrows = w2 ? 2 * WROWS : WROWS;
   // pick the largest token tile whose shared-memory footprint still fits the
   // default 48 KB budget (the sm_75 opt-in maximum is 64 KB)
-  int tok = 8;
+  int tok = 16;
   while (tok > 1 && mmq_smem(nb, wrows, tok) > 48 * 1024) tok >>= 1;
   dim3 grid((n_rows + 7) / 8, (n_tokens + tok - 1) / tok);
   const size_t smem = mmq_smem(nb, wrows, tok);
@@ -337,7 +337,11 @@ void mmq_dispatch(const q4k::BlockQ4K* w1, const q4k::BlockQ4K* w2,
                                           n_tokens);                        \
       }                                                                    \
     } while (0)
-  if (tok >= 8) {
+  if (tok >= 16) {
+    if (ng <= 1)      MMQ_LAUNCH(1, 16);
+    else if (ng <= 2) MMQ_LAUNCH(2, 16);
+    else              MMQ_LAUNCH(4, 16);
+  } else if (tok >= 8) {
     if (ng <= 1)      MMQ_LAUNCH(1, 8);
     else if (ng <= 2) MMQ_LAUNCH(2, 8);
     else              MMQ_LAUNCH(4, 8);

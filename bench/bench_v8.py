@@ -206,10 +206,10 @@ def main() -> None:
         # the GDN ffn-norm fix changes outputs; keep it OUT of the equality
         # gate by fixing it identically on both sides
         base = parity_arm({"SAGER_DECODE_FUSE": "0", "SAGER_PF_MMQ": "0",
-                           "SAGER_GDN_FFN_NORM": "1"}, model, chunk, prompt)
-        new = parity_arm({"SAGER_GDN_FFN_NORM": "1"}, model, chunk, prompt)
+                           "SAGER_GDN_FFN_NORM": "0"}, model, chunk, prompt)
+        new = parity_arm({"SAGER_GDN_FFN_NORM": "0"}, model, chunk, prompt)
         ok = base == new and len(base) == 64
-        out["parity"] = {"v07_len": len(base), "v08_len": len(new),
+        out["parity"] = {"gdn_ffn_norm": "off", "v07_len": len(base), "v08_len": len(new),
                          "identical": ok,
                          "v07_head": base[:16], "v08_head": new[:16]}
         print(f"  streams: {'IDENTICAL' if ok else 'DIVERGED'} "
@@ -230,6 +230,17 @@ def main() -> None:
                                        "SAGER_PF_MMQ": "0",
                                        "SAGER_HEAD_SMX": "0",
                                        "SAGER_GDN_FFN_NORM": "0"}))
+        if os.environ.get("BENCH_ISOLATE", "0") != "0":
+            arms = [("v07-exact", {"SAGER_DECODE_FUSE": "0",
+                                   "SAGER_PF_MMQ": "0",
+                                   "SAGER_HEAD_SMX": "0",
+                                   "SAGER_GDN_FFN_NORM": "0"}),
+                    ("v08-all", {"SAGER_GDN_FFN_NORM": "0"}),
+                    ("mmq-only", {"SAGER_DECODE_FUSE": "0",
+                                  "SAGER_GDN_FFN_NORM": "0"}),
+                    ("fuse-only", {"SAGER_PF_MMQ": "0",
+                                   "SAGER_HEAD_SMX": "0",
+                                   "SAGER_GDN_FFN_NORM": "0"})]
         for label, env in arms:
             r = bench_arm(label, model, chunk, a.rounds, env)
             out["arms"].append(r)

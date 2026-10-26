@@ -302,7 +302,7 @@ class Session {
   bool pf_mmq_ = true;       // SAGER_PF_MMQ=0 -> mtok prefill GEMVs
   bool dec_fuse_ = true;     // SAGER_DECODE_FUSE=0 -> v0.7 per-kernel decode
   bool head_smx_ = true;     // SAGER_HEAD_SMX=0 -> v0.6 Q6_K head kernel
-  bool gdn_ffn_norm_ = true; // SAGER_GDN_FFN_NORM=0 -> v0.7 (missing) norm
+  bool gdn_ffn_norm_ = false;  // SAGER_GDN_FFN_NORM=1 -> apply (quality; costs speed)
   const q4k::BlockQ8K* moe_xq_in_ = nullptr;  // fused-norm xq reuse (n=1)
   // v0.4 device-side expert dispatch (P1): chunk pointer table + device plan
   DeviceBuffer<q4k::BlockQ4K*> d_ptr_table_;   // [3][n_moe_layer][E] weights
