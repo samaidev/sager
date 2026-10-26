@@ -394,6 +394,15 @@ Status Session::prepare() {
       if (gw) gdn_ws_ = (*gw != "0");
       const auto mdb = env_get("SAGER_MOE_DEBUG");
       if (mdb) moe_dbg_ = (*mdb != "0");
+      // v0.8 knobs (all default on; each flips cleanly back to the v0.7 path)
+      const auto mq = env_get("SAGER_PF_MMQ");
+      if (mq) pf_mmq_ = (*mq != "0");
+      const auto df = env_get("SAGER_DECODE_FUSE");
+      if (df) dec_fuse_ = (*df != "0");
+      const auto hs = env_get("SAGER_HEAD_SMX");
+      if (hs) head_smx_ = (*hs != "0");
+      const auto gf = env_get("SAGER_GDN_FFN_NORM");
+      if (gf) gdn_ffn_norm_ = (*gf != "0");
     }
     const EngineDims& dd0 = mc_.dims;
     if (pf_batched_ &&
@@ -402,9 +411,11 @@ Status Session::prepare() {
              "(%d/%d) - per-row walk stays", dd0.hidden, dd0.n_ff_exp);
       pf_batched_ = false;
     }
-    SLOG_I("session", "prefill v0.2.3: batched=%d mtok=%d stream_min=%d chunk_cap=%d "
-           "cpu_rows=%d device=%d", (int)pf_batched_, (int)pf_mtok_, pf_stream_min_, pf_chunk_cap_,
-           pf_cpu_cap_, (int)pf_device_);
+    SLOG_I("session", "prefill v0.2.3: batched=%d mtok=%d mmq=%d stream_min=%d "
+           "chunk_cap=%d cpu_rows=%d device=%d fuse=%d head_smx=%d",
+           (int)pf_batched_, (int)pf_mtok_, (int)pf_mmq_, pf_stream_min_,
+           pf_chunk_cap_, pf_cpu_cap_, (int)pf_device_, (int)dec_fuse_,
+           (int)head_smx_);
   }
 
   if (w_.head_type_ != 12 && w_.head_type_ != 1 && w_.head_type_ != 14) {
@@ -540,18 +551,40 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
                                          static_cast<float>(d.head_dim));
   cudaStream_t s = stream_.get();
 
-  if (n_tokens == 1) {
-    cuda::rmsnorm_f16(xn_.get(), x_.get(), lw.attn_norm, H, mc_.norm_eps, s);
+  if (dec_fuse_) {
+    // v0.8: rmsnorm + Q8_K quant in one launch (bit-identical to the pair)
+    cuda::rmsnorm_quant_f16(xn_.get(), x_.get(), lw.attn_norm, d_xq_.get(),
+                            H, mc_.norm_eps, n_tokens, s);
   } else {
-    cuda::rmsnorm_batched_f16(xn_.get(), x_.get(), lw.attn_norm, H,
-                              mc_.norm_eps, n_tokens, s);
+    if (n_tokens == 1) {
+      cuda::rmsnorm_f16(xn_.get(), x_.get(), lw.attn_norm, H, mc_.norm_eps, s);
+    } else {
+      cuda::rmsnorm_batched_f16(xn_.get(), x_.get(), lw.attn_norm, H,
+                                mc_.norm_eps, n_tokens, s);
+    }
+    cuda::quantize_q8_k(xn_.get(), d_xq_.get(), n_tokens * H, s);
   }
-  cuda::quantize_q8_k(xn_.get(), d_xq_.get(), n_tokens * H, s);
 
   if (n_tokens == 1) {
-    cuda::gemv_q4_k_q8_f16out(Q4W(lw.wq), d_xq_.get(), q_.get(), Q, H, s);
-    cuda::gemv_q4_k_q8_f16out(Q4W(lw.wk), d_xq_.get(), k_.get(), KVd, H, s);
-    cuda::gemv_q4_k_q8_f16out(Q4W(lw.wv), d_xq_.get(), v_.get(), KVd, H, s);
+    if (dec_fuse_) {
+      // v0.8: q|k|v projections in ONE launch (per-row math unchanged)
+      cuda::gemv3m_q4_k_q8_f16out(Q4W(lw.wq), Q4W(lw.wk), Q4W(lw.wv),
+                                  d_xq_.get(), q_.get(), k_.get(), v_.get(),
+                                  Q, KVd, KVd, H, layer, s);
+    } else {
+      cuda::gemv_q4_k_q8_f16out(Q4W(lw.wq), d_xq_.get(), q_.get(), Q, H, s);
+      cuda::gemv_q4_k_q8_f16out(Q4W(lw.wk), d_xq_.get(), k_.get(), KVd, H, s);
+      cuda::gemv_q4_k_q8_f16out(Q4W(lw.wv), d_xq_.get(), v_.get(), KVd, H, s);
+    }
+  } else if (pf_mtok_ && pf_batched_ && pf_mmq_) {
+    // v0.8: MMQ prefill GEMM - weights staged once per token tile, the
+    // per-token dp4a chains interleave (bit-identical to the mtok path).
+    cuda::mmq_q4_k_q8_f16out(Q4W(lw.wq), d_xq_.get(), q_.get(), Q, H,
+                             n_tokens, s);
+    cuda::mmq_q4_k_q8_f16out(Q4W(lw.wk), d_xq_.get(), k_.get(), KVd, H,
+                             n_tokens, s);
+    cuda::mmq_q4_k_q8_f16out(Q4W(lw.wv), d_xq_.get(), v_.get(), KVd, H,
+                             n_tokens, s);
   } else if (pf_mtok_ && pf_batched_) {
     // v0.3: tiled multi-token GEMMs - weights are staged in shared memory
     // per token-tile instead of re-read per token (bit-identical outputs).
@@ -575,6 +608,9 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
     if (n_tokens == 1) {
       cuda::gemv_q4_k_q8_f16out(Q4W(lw.attn_gate), d_xq_.get(), d_gate_.get(),
                                 Q, H, s);
+    } else if (pf_mtok_ && pf_batched_ && pf_mmq_) {
+      cuda::mmq_q4_k_q8_f16out(Q4W(lw.attn_gate), d_xq_.get(),
+                               d_gate_.get(), Q, H, n_tokens, s);
     } else if (pf_mtok_ && pf_batched_) {
       cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.attn_gate), d_xq_.get(),
                                      d_gate_.get(), Q, H, n_tokens, s);
@@ -627,7 +663,18 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
   }
   if (n_tokens == 1) {
     cuda::quantize_q8_k(attn_out_.get(), d_hq_.get(), Q, s);
-    cuda::gemv_q4_k_q8_f16out(Q4W(lw.wo), d_hq_.get(), o_proj_.get(), H, Q, s);
+    if (dec_fuse_) {
+      // v0.8: o_proj with the residual add as epilogue (one launch less the
+      // o_proj buffer round trip; add_kernel semantics preserved)
+      cuda::gemv_q4_k_q8_f16out_resadd(Q4W(lw.wo), d_hq_.get(),
+                                       o_proj_.get(), x_.get(), H, Q, s);
+    } else {
+      cuda::gemv_q4_k_q8_f16out(Q4W(lw.wo), d_hq_.get(), o_proj_.get(), H, Q, s);
+    }
+  } else if (pf_mtok_ && pf_batched_ && pf_mmq_) {
+    cuda::quantize_q8_k(attn_out_.get(), d_hq_.get(), n_tokens * Q, s);
+    cuda::mmq_q4_k_q8_f16out(Q4W(lw.wo), d_hq_.get(), o_proj_.get(), H, Q,
+                             n_tokens, s);
   } else if (pf_mtok_ && pf_batched_) {
     cuda::quantize_q8_k(attn_out_.get(), d_hq_.get(), n_tokens * Q, s);
     cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.wo), d_hq_.get(), o_proj_.get(), H, Q,
@@ -637,12 +684,21 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
     cuda::gemv_q4_k_q8_f16out_batched(Q4W(lw.wo), d_hq_.get(), o_proj_.get(), H, Q,
                                       n_tokens, s);
   }
-  cuda::add_f16(x_.get(), o_proj_.get(), n_tokens * H, s);
-  if (n_tokens == 1) {
-    cuda::rmsnorm_f16(xn_.get(), x_.get(), lw.ffn_norm, H, mc_.norm_eps, s);
+  if (!(n_tokens == 1 && dec_fuse_)) {
+    cuda::add_f16(x_.get(), o_proj_.get(), n_tokens * H, s);
+  }
+  if (dec_fuse_) {
+    cuda::rmsnorm_quant_f16(xn_.get(), x_.get(), lw.ffn_norm, d_xq_.get(),
+                            H, mc_.norm_eps, n_tokens, s);
+    moe_xq_in_ = d_xq_.get();   // the MoE quantizes xn - reuse the fused q8
   } else {
-    cuda::rmsnorm_batched_f16(xn_.get(), x_.get(), lw.ffn_norm, H,
-                              mc_.norm_eps, n_tokens, s);
+    if (n_tokens == 1) {
+      cuda::rmsnorm_f16(xn_.get(), x_.get(), lw.ffn_norm, H, mc_.norm_eps, s);
+    } else {
+      cuda::rmsnorm_batched_f16(xn_.get(), x_.get(), lw.ffn_norm, H,
+                                mc_.norm_eps, n_tokens, s);
+    }
+    moe_xq_in_ = nullptr;
   }
 }
 
@@ -680,13 +736,26 @@ void Session::linear_layer_launch(int layer, int n_tokens) {
     uint16_t* x_row = x_.get() + static_cast<size_t>(t) * H;
     uint16_t* xn_row = xn_.get() + static_cast<size_t>(t) * H;
     uint16_t* op_row = o_proj_.get() + static_cast<size_t>(t) * H;
-    cuda::rmsnorm_f16(xn_row, x_row, lw.attn_norm, H, mc_.norm_eps, s);
-    cuda::quantize_q8_k(xn_row, d_xq_.get(), H, s);
+    if (dec_fuse_) {
+      // v0.8: rmsnorm + Q8_K quant in one launch (bit-identical to the pair)
+      cuda::rmsnorm_quant_f16(xn_row, x_row, lw.attn_norm, d_xq_.get(), H,
+                              mc_.norm_eps, 1, s);
+    } else {
+      cuda::rmsnorm_f16(xn_row, x_row, lw.attn_norm, H, mc_.norm_eps, s);
+      cuda::quantize_q8_k(xn_row, d_xq_.get(), H, s);
+    }
     // fused projections: qkvz -> [q|k|v|z], ba -> [b|a]
-    cuda::gemv_q4_k_q8_f16out(Q4W(lw.lin_in_qkvz), d_xq_.get(),
-                              lin_proj_.get(), g.proj_rows(), H, s);
-    cuda::gemv_q4_k_q8_f16out(Q4W(lw.lin_in_ba), d_xq_.get(),
-                              lin_ba_.get(), g.ba_rows(), H, s);
+    if (n_tokens == 1 && dec_fuse_) {
+      // v0.8: qkvz|ba projections in ONE launch (per-row math unchanged)
+      cuda::gemv2m_q4_k_q8_f16out(Q4W(lw.lin_in_qkvz), Q4W(lw.lin_in_ba),
+                                  d_xq_.get(), lin_proj_.get(), lin_ba_.get(),
+                                  g.proj_rows(), g.ba_rows(), H, layer, s);
+    } else {
+      cuda::gemv_q4_k_q8_f16out(Q4W(lw.lin_in_qkvz), d_xq_.get(),
+                                lin_proj_.get(), g.proj_rows(), H, s);
+      cuda::gemv_q4_k_q8_f16out(Q4W(lw.lin_in_ba), d_xq_.get(),
+                                lin_ba_.get(), g.ba_rows(), H, s);
+    }
     // conv (first conv_dim rows of proj: q|k|v; z bypasses) + SiLU
     cuda::gdn_conv_step_f16(lin_conv_.get(), conv_st, lin_proj_.get(),
                             lw.lin_conv_w, lw.lin_conv_b, g.conv_dim(),
@@ -709,9 +778,40 @@ void Session::linear_layer_launch(int layer, int n_tokens) {
                            g.n_v_heads, g.value_dim, mc_.norm_eps, s);
     // out_proj -> residual
     cuda::quantize_q8_k(lin_on_.get(), d_hq_.get(), g.y_rows(), s);
-    cuda::gemv_q4_k_q8_f16out(Q4W(lw.lin_out), d_hq_.get(), op_row, H,
-                              g.y_rows(), s);
-    cuda::add_f16(x_row, op_row, H, s);
+    if (n_tokens == 1 && dec_fuse_) {
+      // v0.8: out_proj with the residual add as epilogue
+      cuda::gemv_q4_k_q8_f16out_resadd(Q4W(lw.lin_out), d_hq_.get(), op_row,
+                                       x_row, H, g.y_rows(), s);
+    } else {
+      cuda::gemv_q4_k_q8_f16out(Q4W(lw.lin_out), d_hq_.get(), op_row, H,
+                                g.y_rows(), s);
+      cuda::add_f16(x_row, op_row, H, s);
+    }
+  }
+  // v0.8 FIX (SAGER_GDN_FFN_NORM=0 restores the v0.2-0.7 behavior): the MoE
+  // half consumes ffn_norm(x) - on GDN layers this norm was never applied,
+  // so the router/experts read the STALE attn_norm row from before the
+  // recurrence update. The converter writes blk.L.ffn_norm for every block
+  // (post_attention_layernorm), so the norm belongs here exactly as it is
+  // applied at the end of dense_layer_launch.
+  if (gdn_ffn_norm_) {
+    if (dec_fuse_) {
+      cuda::rmsnorm_quant_f16(xn_.get(), x_.get(), lw.ffn_norm, d_xq_.get(),
+                              H, mc_.norm_eps, n_tokens, s);
+      moe_xq_in_ = d_xq_.get();
+    } else {
+      cuda::rmsnorm_batched_f16(xn_.get(), x_.get(), lw.ffn_norm, H,
+                                mc_.norm_eps, n_tokens, s);
+      cuda::quantize_q8_k(xn_.get(), d_xq_.get(),
+                          static_cast<size_t>(n_tokens) * H, s);
+      moe_xq_in_ = nullptr;
+    }
+  } else if (dec_fuse_ && n_tokens == 1) {
+    // bug-compatible: the fused attn-norm quant produced q8 of the same
+    // stale xn row the v0.7 path re-quantized in moe_dispatch
+    moe_xq_in_ = d_xq_.get();
+  } else {
+    moe_xq_in_ = nullptr;
   }
   (void)rows;
 }
@@ -745,14 +845,26 @@ void Session::linear_layer_chunk(int layer, int n) {
   float* delta_st = lin_delta_state_.get() +
       static_cast<size_t>(slab) * g.state_elems();
 
-  cuda::rmsnorm_batched_f16(xn_.get(), x_.get(), lw.attn_norm, H,
-                            mc_.norm_eps, n, s);
-  cuda::quantize_q8_k(xn_.get(), d_xq_.get(), n * H, s);
+  if (dec_fuse_) {
+    cuda::rmsnorm_quant_f16(xn_.get(), x_.get(), lw.attn_norm, d_xq_.get(),
+                            H, mc_.norm_eps, n, s);
+  } else {
+    cuda::rmsnorm_batched_f16(xn_.get(), x_.get(), lw.attn_norm, H,
+                              mc_.norm_eps, n, s);
+    cuda::quantize_q8_k(xn_.get(), d_xq_.get(), n * H, s);
+  }
   // fused projections for the whole window
-  cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.lin_in_qkvz), d_xq_.get(),
-                                 lin_proj_b_.get(), g.proj_rows(), H, n, s);
-  cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.lin_in_ba), d_xq_.get(),
-                                 lin_ba_b_.get(), g.ba_rows(), H, n, s);
+  if (pf_mmq_ && pf_mtok_) {
+    cuda::mmq_q4_k_q8_f16out(Q4W(lw.lin_in_qkvz), d_xq_.get(),
+                             lin_proj_b_.get(), g.proj_rows(), H, n, s);
+    cuda::mmq_q4_k_q8_f16out(Q4W(lw.lin_in_ba), d_xq_.get(),
+                             lin_ba_b_.get(), g.ba_rows(), H, n, s);
+  } else {
+    cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.lin_in_qkvz), d_xq_.get(),
+                                   lin_proj_b_.get(), g.proj_rows(), H, n, s);
+    cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.lin_in_ba), d_xq_.get(),
+                                   lin_ba_b_.get(), g.ba_rows(), H, n, s);
+  }
   // causal conv over the chunk, then commit the state tail
   cuda::gdn_conv_chunk_f16(lin_conv_b_.get(), lin_proj_b_.get(), conv_st,
                            lw.lin_conv_w, lw.lin_conv_b, g.conv_dim(),
@@ -783,9 +895,26 @@ void Session::linear_layer_chunk(int layer, int n) {
                                lw.lin_o_norm, g.n_v_heads, g.value_dim,
                                mc_.norm_eps, n, s);
   cuda::quantize_q8_k(lin_on_b_.get(), d_hq_.get(), n * g.y_rows(), s);
-  cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.lin_out), d_hq_.get(), o_proj_.get(),
-                                 H, g.y_rows(), n, s);
+  if (pf_mmq_ && pf_mtok_) {
+    cuda::mmq_q4_k_q8_f16out(Q4W(lw.lin_out), d_hq_.get(), o_proj_.get(),
+                             H, g.y_rows(), n, s);
+  } else {
+    cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.lin_out), d_hq_.get(), o_proj_.get(),
+                                   H, g.y_rows(), n, s);
+  }
   cuda::add_f16(x_.get(), o_proj_.get(), n * H, s);
+  // v0.8 FIX: the MoE half consumes ffn_norm(x) - never applied on GDN
+  // layers before v0.8 (see linear_layer_launch for the full note).
+  if (gdn_ffn_norm_) {
+    if (dec_fuse_) {
+      cuda::rmsnorm_quant_f16(xn_.get(), x_.get(), lw.ffn_norm, d_xq_.get(),
+                              H, mc_.norm_eps, n, s);
+    } else {
+      cuda::rmsnorm_batched_f16(xn_.get(), x_.get(), lw.ffn_norm, H,
+                                mc_.norm_eps, n, s);
+      cuda::quantize_q8_k(xn_.get(), d_xq_.get(), static_cast<size_t>(n) * H, s);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1719,8 +1848,13 @@ void Session::moe_dispatch_device(int layer, int n) {
       ? d_meta_all_.get() + static_cast<size_t>(layer) * 4 : d_meta_.get();
 
   // 1) quantize + route (same kernels as the host path - bit-identical).
-  cuda::quantize_q8_k(xn_.get(), d_xq_moe_.get(),
-                      static_cast<size_t>(n) * H, s);
+  // v0.8: the layer body's fused norm+quant already produced q8(xn) in
+  // d_xq_ - reuse it instead of re-quantizing (bit-identical values).
+  if (!moe_xq_in_) {
+    cuda::quantize_q8_k(xn_.get(), d_xq_moe_.get(),
+                        static_cast<size_t>(n) * H, s);
+  }
+  const q4k::BlockQ8K* xq_moe = moe_xq_in_ ? moe_xq_in_ : d_xq_moe_.get();
   if (capturing) {
     // preserve this layer's input row for the step-end CPU patch (the next
     // layer's rmsnorm overwrites xn_ inside the same graph)
@@ -1728,10 +1862,17 @@ void Session::moe_dispatch_device(int layer, int n) {
                     xn_.get(), H * sizeof(uint16_t), cudaMemcpyDeviceToDevice,
                     s);
   }
-  cuda::gemv_f32_out_f16x_mtok(lw.router, xn_.get(), route_logits_.get(),
-                               E, H, n, s);
-  cuda::router_topk_batched(route_logits_.get(), route_idx_.get(),
-                            route_w_.get(), E, K, K + 1, n, s);
+  if (n == 1 && dec_fuse_) {
+    // v0.8: router logits + warp-parallel top-k in ONE launch (the v0.7
+    // batched kernel selects serially in thread 0 - ~20-40 us per layer).
+    cuda::router_topk_fused(lw.router, xn_.get(), route_idx_.get(),
+                            route_w_.get(), E, K, H, s);
+  } else {
+    cuda::gemv_f32_out_f16x_mtok(lw.router, xn_.get(), route_logits_.get(),
+                                 E, H, n, s);
+    cuda::router_topk_batched(route_logits_.get(), route_idx_.get(),
+                              route_w_.get(), E, K, K + 1, n, s);
+  }
   if (capturing) {
     cudaMemcpyAsync(d_route_w_all_.get() +
                         static_cast<size_t>(layer) * (K + 1),
@@ -1779,7 +1920,7 @@ void Session::moe_dispatch_device(int layer, int n) {
   }
 
   // 3) compact routed rows expert-major (row count read on device).
-  cuda::gather_rows_q8_n(d_xqg_.get(), d_xq_moe_.get(), grows_l,
+  cuda::gather_rows_q8_n(d_xqg_.get(), xq_moe, grows_l,
                          meta_l, static_cast<int>(Rmax), h_blocks, s);
 
   // 4) device-side wait: this layer's planned pairs must have landed (their
@@ -1831,24 +1972,31 @@ void Session::moe_dispatch_device(int layer, int n) {
     cuda::gemv2_q4_k_q8_f16out_mtok(
         reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_gate),
         reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_up),
-        d_xq_moe_.get(), sh_g_.get(), sh_u_.get(), FFX, H, n, s);
+        xq_moe, sh_g_.get(), sh_u_.get(), FFX, H, n, s);
     cuda::silu_mul_f16(sh_g_.get(), sh_g_.get(), sh_u_.get(), 1, n * FFX, s);
     cuda::quantize_q8_k(sh_g_.get(), d_hqg_.get(),
                         static_cast<size_t>(n) * FFX, s);
+    // v0.8 (n=1): write the shared row straight into the combine slab's
+    // reserved slot K instead of a separate buffer + 2D memcpy node.
+    uint16_t* sh_out = (n == 1)
+        ? expert_y_.get() + static_cast<size_t>(K) * H
+        : shared_yb_.get();
     cuda::gemv_q4_k_q8_f16out_mtok(
         reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_out), d_hqg_.get(),
-        shared_yb_.get(), H, FFX, n, s);
+        sh_out, H, FFX, n, s);
     if (lw.shared_gate_w) {
       cuda::gemv_f32_out_f16x_batched(lw.shared_gate_w, xn_.get(),
                                       d_sgate_.get(), 1, H, n, s);
-      cuda::sigmoid_gate_scalar_batched_f16(shared_yb_.get(), d_sgate_.get(),
+      cuda::sigmoid_gate_scalar_batched_f16(sh_out, d_sgate_.get(),
                                             n, H, s);
     }
-    cudaMemcpy2DAsync(
-        expert_y_.get() + static_cast<size_t>(K) * H,
-        static_cast<size_t>(K + 1) * H * sizeof(uint16_t),
-        shared_yb_.get(), H * sizeof(uint16_t),
-        H * sizeof(uint16_t), n, cudaMemcpyDeviceToDevice, s);
+    if (n > 1) {
+      cudaMemcpy2DAsync(
+          expert_y_.get() + static_cast<size_t>(K) * H,
+          static_cast<size_t>(K + 1) * H * sizeof(uint16_t),
+          shared_yb_.get(), H * sizeof(uint16_t),
+          H * sizeof(uint16_t), n, cudaMemcpyDeviceToDevice, s);
+    }
   }
 
   // 11) combine: x_ = residual + sum_k w * expert_y (absent experts add 0).
@@ -2138,8 +2286,13 @@ void Session::head_launch() {
     // v0.6: native Q6_K head - 401 MB of weight traffic per step instead of
     // the 1017 MB fp16 copy, no separate convert launch.
     cuda::quantize_q8_k(xn_.get(), d_xq_.get(), d.hidden, s);
-    cuda::gemv_q6_k_q8(w_.output, d_xq_.get(), logits_.get(), d.n_vocab,
-                       d.hidden, s);
+    if (head_smx_) {
+      cuda::gemv_q6_k_q8_smx(w_.output, d_xq_.get(), logits_.get(), d.n_vocab,
+                             d.hidden, s);
+    } else {
+      cuda::gemv_q6_k_q8(w_.output, d_xq_.get(), logits_.get(), d.n_vocab,
+                         d.hidden, s);
+    }
   } else {
     cuda::quantize_q8_k(xn_.get(), d_xq_.get(), d.hidden, s);
     cuda::gemv_q4_k_q8(Q4W(w_.output), d_xq_.get(), logits_.get(), d.n_vocab,
@@ -2161,8 +2314,13 @@ void Session::head_launch_row(int row) {
     cuda::convert_f16_to_f32(d_logits16_.get(), logits_.get(), d.n_vocab, s);
   } else if (w_.head_type_ == 14 && head_q6k_) {
     cuda::quantize_q8_k(xn_.get(), d_xq_.get(), d.hidden, s);
-    cuda::gemv_q6_k_q8(w_.output, d_xq_.get(), logits_.get(), d.n_vocab,
-                       d.hidden, s);
+    if (head_smx_) {
+      cuda::gemv_q6_k_q8_smx(w_.output, d_xq_.get(), logits_.get(), d.n_vocab,
+                             d.hidden, s);
+    } else {
+      cuda::gemv_q6_k_q8(w_.output, d_xq_.get(), logits_.get(), d.n_vocab,
+                         d.hidden, s);
+    }
   } else {
     cuda::quantize_q8_k(xn_.get(), d_xq_.get(), d.hidden, s);
     cuda::gemv_q4_k_q8(Q4W(w_.output), d_xq_.get(), logits_.get(), d.n_vocab,

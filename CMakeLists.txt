@@ -95,6 +95,7 @@ endif()
 if(SAGER_ENABLE_CUDA)
   add_library(sager_cuda STATIC
     src/kernels/cuda/q4_k.cu
+    src/kernels/cuda/mmq.cu
     src/kernels/cuda/moe.cu
     src/kernels/cuda/attention.cu
     src/kernels/cuda/norm_rotary.cu

@@ -89,6 +89,57 @@ void gemv_q4_k_q8_f16out_mtok(const q4k::BlockQ4K* w, const q4k::BlockQ8K* xq,
                               uint16_t* y, int n_rows, int k, int n_tokens,
                               cudaStream_t stream);
 
+// ---- v0.8 MMQ prefill kernels (bit-identical to the mtok kernels above;
+// the per-token dp4a chains are interleaved for ILP instead of serialized).
+// y layout: y[tok * n_rows + row].
+void mmq_q4_k_q8_f16out(const q4k::BlockQ4K* w, const q4k::BlockQ8K* xq,
+                        uint16_t* y, int n_rows, int k, int n_tokens,
+                        cudaStream_t stream);
+
+// Fused gate+up MMQ (two matrices, same n_rows): one launch.
+void mmq2_q4_k_q8_f16out(const q4k::BlockQ4K* wg, const q4k::BlockQ4K* wu,
+                         const q4k::BlockQ8K* xq, uint16_t* yg, uint16_t* yu,
+                         int n_rows, int k, int n_tokens, cudaStream_t stream);
+
+// ---- v0.8 decode fusion kernels (all bit-identical to what they replace) ----
+
+// rmsnorm + Q8_K quantization in one launch (n_rows blocks of one row each).
+// Falls back to the two-kernel sequence for unsupported geometries.
+void rmsnorm_quant_f16(uint16_t* out, const uint16_t* x, const uint16_t* w,
+                       q4k::BlockQ8K* xq, int n, float eps, int n_rows,
+                       cudaStream_t stream);
+
+// The layer's 2 (GDN qkvz|ba) or 3 (GQA q|k|v) projections in ONE launch.
+// `slot` identifies the layer (0..63): the parameter block is written once
+// per layer at capture time, so graph replay needs no host interplay.
+void gemv2m_q4_k_q8_f16out(const q4k::BlockQ4K* w1, const q4k::BlockQ4K* w2,
+                           const q4k::BlockQ8K* xq, uint16_t* y1, uint16_t* y2,
+                           int rows1, int rows2, int k, int slot,
+                           cudaStream_t stream);
+void gemv3m_q4_k_q8_f16out(const q4k::BlockQ4K* w1, const q4k::BlockQ4K* w2,
+                           const q4k::BlockQ4K* w3, const q4k::BlockQ8K* xq,
+                           uint16_t* y1, uint16_t* y2, uint16_t* y3, int rows1,
+                           int rows2, int rows3, int k, int slot,
+                           cudaStream_t stream);
+
+// GEMV with the residual add fused as an epilogue (single token):
+// y = W @ x (fp16, same as gemv_q4_k_q8_f16out), then
+// res_inout[i] = f16(f32(res_inout[i]) + f32(y[i])) - add_kernel semantics.
+void gemv_q4_k_q8_f16out_resadd(const q4k::BlockQ4K* w, const q4k::BlockQ8K* xq,
+                                uint16_t* y, uint16_t* res_inout, int n_rows,
+                                int k, cudaStream_t stream);
+
+// Router GEMV (fp32 W, fp16 x) + warp-parallel top-k in ONE launch (n=1).
+// Selection/softmax semantics match router_topk_batched_kernel row 0.
+void router_topk_fused(const float* w_f32, const uint16_t* x_f16, int* idx,
+                       float* weight, int n_expert, int n_expert_used,
+                       int hidden, cudaStream_t stream);
+
+// Q6_K head GEMV with x staged in shared memory (bit-identical to
+// gemv_q6_k_q8; lower DRAM/L2 traffic on the 248k-row head).
+void gemv_q6_k_q8_smx(const void* w_q6, const q4k::BlockQ8K* x_q8, float* y,
+                      int n_rows, int k, cudaStream_t stream);
+
 // Fused gate+up: two matrices share the staged X rows (one launch, x read
 // once). yg/yu are [n_tokens x n_rows] each.
 void gemv2_q4_k_q8_f16out_mtok(const q4k::BlockQ4K* wg, const q4k::BlockQ4K* wu,
