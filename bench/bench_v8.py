@@ -75,7 +75,9 @@ class Engine:
         return self.cmd({"cmd": "load", "model": self.model, "ctx": 8192,
                          "vram_mb": int(os.environ.get("BENCH_VRAM", "9984")),
                          "threads": int(os.environ.get("BENCH_THREADS", "2")),
-                         "graphs": True, "mtp": False, "chunk": self.chunk,
+                         "graphs": True,
+                         "mtp": os.environ.get("BENCH_MTP", "1") != "0",
+                         "chunk": self.chunk,
                          "kv_q8": True}, timeout=3600)
 
     def reset(self) -> None:
@@ -167,7 +169,8 @@ def parity_arm(extra_env: dict, model: str, chunk: int, prompt: list) -> list:
 
     send({"cmd": "load", "model": model, "ctx": 8192,
           "vram_mb": int(os.environ.get("BENCH_VRAM", "9984")),
-          "threads": 2, "graphs": True, "mtp": False, "chunk": chunk,
+          "threads": 2, "graphs": True,
+          "mtp": os.environ.get("BENCH_MTP", "1") != "0", "chunk": chunk,
           "kv_q8": True}, "loaded")
     send({"cmd": "reset"}, "ok")
     send({"cmd": "generate", "ids": prompt, "max_tokens": 64,
