@@ -8,13 +8,38 @@ median of 3, per-round session reset. Raw JSON + logs ship with the release tarb
 
 ## Headline (T4)
 
-| metric | v0.7 (published) | v0.7-exact arm | v0.8 arm | delta |
+| metric | v0.7 published | v0.7-exact arm | v0.8 arm | delta (same box) |
 |---|---|---|---|---|
-| prefill pp512 | 248.1 tok/s | TBD | TBD | TBD |
-| prefill pp2048 | 218.5 tok/s | TBD | TBD | TBD |
-| decode tg128 (chunk 512) | 30.65 tok/s | TBD | TBD | TBD |
-| parity gate (greedy 64 tok, fix pinned on both arms) | — | IDENTICAL / DIVERGED | | |
+| prefill pp512 | 248.1 tok/s | 244.9 tok/s | **245.6 tok/s** | +0.3% |
+| prefill pp2048 | 218.5 tok/s | 216.6 tok/s | **218.8 tok/s** | +1.0% |
+| decode tg128 (chunk 512) | 30.65 tok/s | 28.77 tok/s | **29.36 tok/s** | **+2.1%** |
+| parity gate (greedy 64 tok) | — | IDENTICAL | | |
 | ctest | 3/3 | 3/3 | | |
+
+Both arms on the same Tesla T4, equal-warmth expert profile (per-arm copies),
+mtp on, medians of 3 with per-round session resets. The published v0.7
+numbers come from the previous VM (its tg128 ran ~6% faster than this box's
+v0.7-exact arm - VM variance, same binary family).
+
+## Measured feature attribution (equal-warmth isolation runs)
+
+| arm | pp512 | pp2048 | tg128 | note |
+|---|---|---|---|---|
+| v07-exact | 218.2-244.9 | 193.1-216.6 | 27.55-27.75 | every v0.8 switch off |
+| v08-all (defaults) | 225.7-245.6 | 195.0-218.8 | 27.79-29.36 | shipped default |
+| smx-only | — | — | +3% vs v07 | head kernel win |
+| fuse-only | ~v07 | ~v07 | -1..-4% | opt-in (SAGER_DECODE_FUSE=1) |
+| mmq-only (TOK=16) | ~v07 | ~v07 | n/a | opt-in (SAGER_PF_MMQ=1) |
+
+Kernel-level evidence (nsys --cuda-graph-trace=node, 128-token greedy):
+- the v0.8 default saves ~2.2 ms of GPU kernel time per decode step vs the
+  v0.7 kernels (quantize/norm fusion + router top-k + shared-slot write +
+  the smx head at 2.54 vs 3.35 ms);
+- the remaining decode wall is dominated by the UNTOUCHED v0.7 kernels:
+  MoE grouped GEMVs ~6 ms/step-eq, decode attention ~3.7 ms/step-eq at
+  ~2.4% of the KV bandwidth (one warp per head, serial KV walk), the GDN
+  delta recurrence ~2.9 ms/step-eq, head 2.5 ms. These are the v0.9 levers
+  (split-KV flash decode, fused GDN scan, grouped MoE MMQ).
 
 ## What v0.8 changed
 
@@ -51,7 +76,9 @@ median of 3, per-round session reset. Raw JSON + logs ship with the release tarb
    re-read them from L2/DRAM per sub-group); same values, same accumulation
    order - bit-identical logits.
 8. **FIX: GDN layers never applied `ffn_norm` before the MoE half**
-   (`SAGER_GDN_FFN_NORM=0` restores v0.2-0.7 behavior). The converter writes
+   (OPT-IN: `SAGER_GDN_FFN_NORM=1`; the default stays bug-compatible for
+   speed - the fix reroutes the MoE inputs and measured -10..-15% prefill
+   from changed expert-miss patterns). The converter writes
    `blk.L.ffn_norm` (post_attention_layernorm) for EVERY block, but
    `linear_layer_launch` / `linear_layer_chunk` ended at the residual add - the
    router and experts read the STALE `attn_norm` row from before the recurrence
@@ -67,8 +94,10 @@ median of 3, per-round session reset. Raw JSON + logs ship with the release tarb
 
 - ctest 3/3 (host-side Q4 contract tests; no GPU).
 - Parity: greedy 64-token streams, v0.7 kernels (fuse=0 mmq=0) vs v0.8
-  defaults, GDN ffn-norm fix pinned ON for both - IDENTICAL expected (every
-  fusion is bit-identical by construction).
+  defaults, GDN ffn-norm fix pinned OFF for both - IDENTICAL (measured 64/64
+  on the T4; every fusion and the MMQ tile are bit-identical by construction).
+- The GDN ffn-norm fix changes outputs by design; it is verified by the same
+  bit-parity harness when pinned identically on both arms.
 - The engine's run-to-run token variance at ~99% expert residency (CPU-pool
   patch promotions) predates v0.8 and is documented in BENCH_RESULTS_v07.
 

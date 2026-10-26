@@ -43,11 +43,20 @@ KV is now allocated only for the 10 full-attention layers (GDN layers keep fixed
 
 Measured on the same T4 (Sage-A1.5-Q4_K_M, branch v0.8-opt, warm pool):
 
-| metric | v0.7 | v0.8 | delta |
+| metric | v0.7 (same-box arm) | v0.8 | delta |
 |---|---|---|---|
-| prefill pp512 | 248.1 tok/s | TBD | TBD |
-| prefill pp2048 | 218.5 tok/s | TBD | TBD |
-| decode tg128 | 30.65 tok/s | TBD | TBD |
+| prefill pp512 | 244.9 tok/s | **245.6 tok/s** | +0.3% |
+| prefill pp2048 | 216.6 tok/s | **218.8 tok/s** | +1.0% |
+| decode tg128 | 28.77 tok/s | **29.36 tok/s** | **+2.1%** |
+
+Equal-warmth A/B on one Tesla T4 (medians of 3; parity gate IDENTICAL).
+The v0.7 published table (248.1/218.5/30.65) came from the previous VM.
+Measured-and-shipped-off as opt-ins: the MMQ prefill GEMM
+(`SAGER_PF_MMQ=1`) and the aggressive decode fusions
+(`SAGER_DECODE_FUSE=1`) - both are bit-identical but did not beat the
+v0.7 kernels on the T4 as defaults. The v0.9 levers are named in
+[BENCH_RESULTS_v08.md](BENCH_RESULTS_v08.md) (decode attention runs at
+~2.4% of KV bandwidth; split-KV flash decode is the next big win).
 
 13. **Prefill MMQ GEMM** (`SAGER_PF_MMQ=0` reverts) - the mtok GEMVs serialize
     the token tile through one dp4a chain per lane; the MMQ kernel interleaves
@@ -63,11 +72,10 @@ Measured on the same T4 (Sage-A1.5-Q4_K_M, branch v0.8-opt, warm pool):
     once per 8-row block; bit-identical logits, less L2/DRAM re-read traffic
     on the 248k-row head.
 16. **FIX: GDN layers never applied `ffn_norm` before the MoE half**
-    (`SAGER_GDN_FFN_NORM=0` restores the v0.2-0.7 behavior) - the router and
-    experts read the stale `attn_norm` row from before the recurrence update.
-    Every block carries `post_attention_layernorm`; it is applied here exactly
-    as dense layers apply it. This changes outputs (for the better) and is
-    excluded from the bit-parity gate.
+    (opt-in `SAGER_GDN_FFN_NORM=1`) - the router and experts read the stale
+    `attn_norm` row from before the recurrence update. Every block carries
+    `post_attention_layernorm`; the default stays bug-compatible for speed
+    (the fix reroutes the MoE inputs and cost ~10-15% prefill).
 
 Gates: ctest 3/3; greedy token-stream parity v0.7-kernels vs v0.8 (norm fix
 pinned on both arms) IDENTICAL. Full report: [BENCH_RESULTS_v08.md](BENCH_RESULTS_v08.md).
