@@ -1144,6 +1144,13 @@ void Session::linear_layer_chunk(int layer, int n) {
                                 mc_.norm_eps, n, s);
       cuda::quantize_q8_k(xn_.get(), d_xq_.get(), static_cast<size_t>(n) * H, s);
     }
+    if (dbg_layers_ && layer == 0) {
+      dbg_dump_f16("ffn_norm_w", lw.ffn_norm, 0, 16, s);
+      dbg_dump_f16("x_last_row", x_.get(),
+                   static_cast<size_t>(n - 1) * H, 16, s);
+      dbg_dump_f16("xn_ffn_out", xn_.get(),
+                   static_cast<size_t>(n - 1) * H, 16, s);
+    }
   }
 }
 
