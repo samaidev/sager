@@ -144,6 +144,15 @@ if(SAGER_BUILD_TESTS)
   )
   target_link_libraries(sager_test_pump PRIVATE sager_core)
   add_test(NAME expert_pump_policy COMMAND sager_test_pump)
+
+  # v0.12: CUDA-vs-host numeric validation of the Q4/Q6 matmul stack.
+  if(SAGER_ENABLE_CUDA)
+    add_executable(sager_test_cuda_q4
+      tests/test_cuda_q4.cu
+    )
+    target_link_libraries(sager_test_cuda_q4 PRIVATE sager_core)
+    add_test(NAME cuda_q4_stack COMMAND sager_test_cuda_q4)
+  endif()
 endif()
 
 install(TARGETS sager_engine RUNTIME DESTINATION bin)
