@@ -165,7 +165,11 @@ void dequant_row_q6(const uint8_t* src, float* out, int cols) {
     const uint8_t* ql = src + static_cast<size_t>(b) * 210;
     const uint8_t* qh = ql + 128;
     const int8_t*  sc = reinterpret_cast<const int8_t*>(qh + 64);
-    uint16_t dh; std::memcpy(&dh, qh + 64, 2);
+    // v0.12 fix #2: d lives at bytes 208-209 (after the 16 scale bytes),
+    // not at qh+64 (=192, the first two scale bytes - reading those as an
+    // fp16 produced garbage block scales up to ~2400 and every requant
+    // tensor was scaled by ~1e6, NaN-ing the whole forward).
+    uint16_t dh; std::memcpy(&dh, sc + 16, 2);
     const float dd = q4k::half_to_float(dh);
     // v0.12 fix: ql/qh must advance per 128-weight half (llama.cpp
     // dequantize_row_q6_K: ql += 64, qh += 32). The old loop reused the
