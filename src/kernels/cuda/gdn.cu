@@ -255,10 +255,13 @@ __global__ void gdn_conv_chunk_kernel(uint16_t* conv_out,
   float acc = ldh(b + d);
   for (int j = 0; j < ck; ++j) {
     const int src_t = t + j - nm1;
-    const uint16_t v =
+    // v0.12 fix: convert the tap through ldh - a raw uint16_t here multiplies
+    // the fp16 BIT PATTERN as an integer (value 25.0 = bits 16847), which
+    // amplified the conv output ~650x and NaN'd the scan at layer 1.
+    const float v =
         (src_t < 0)
-            ? state_old[static_cast<size_t>(d) * nm1 + (src_t + nm1)]
-            : proj[static_cast<size_t>(src_t) * conv_dim + d];
+            ? ldh(&state_old[static_cast<size_t>(d) * nm1 + (src_t + nm1)])
+            : ldh(&proj[static_cast<size_t>(src_t) * conv_dim + d]);
     acc += ldh(w + static_cast<size_t>(d) * ck + j) * v;
   }
   sth(conv_out + static_cast<size_t>(t) * conv_dim + d, siluf(acc));
