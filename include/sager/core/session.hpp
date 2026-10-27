@@ -303,7 +303,12 @@ class Session {
   bool pf_mmq_ = false;      // SAGER_PF_MMQ=1 -> experimental MMQ prefill GEMM
   bool dec_fuse_ = true;     // SAGER_DECODE_FUSE=0 -> v0.7 per-kernel decode
   bool head_smx_ = true;     // SAGER_HEAD_SMX=0 -> v0.6 Q6_K head kernel
-  bool gdn_ffn_norm_ = false;  // SAGER_GDN_FFN_NORM=1 -> apply (quality; costs speed)
+  // v0.12 FIX: default ON. The qwen35moe GDN blocks carry a real
+  // post_attention_norm between the GDN body and the MoE half - skipping it
+  // (the v0.2-0.7 bug-compatible default) feeds the MoE a stale pre-GDN
+  // activation, which garbles routing and poisoning every generation.
+  // SAGER_GDN_FFN_NORM=0 restores the old (broken) behavior for A/B.
+  bool gdn_ffn_norm_ = true;
   // v0.9 prefill tensor-core path (SAGER_PF_TC=0 reverts to the dp4a GEMVs;
   // SAGER_PF_BATCHED=0 also reverts - same slab contract as the mtok path)
   bool pf_tc_ = true;
