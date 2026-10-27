@@ -2437,6 +2437,13 @@ void Session::moe_dispatch_device(int layer, int n) {
   // 11) combine: x_ = residual + sum_k w * expert_y (absent experts add 0).
   cuda::moe_combine_batched_f16(x_.get(), expert_y_.get(), route_w_.get(),
                                 K, H, n, s);
+  // v0.12 debug: combine health on the first MoE layer (SAGER_DUMP_LOGITS=2)
+  if (dbg_layers_ && layer == 0 && !capturing) {
+    dbg_dump_f32("router_W0", lw.router, 0, 16, s);
+    dbg_dump_f16("expert_y_slot0", expert_y_.get(), 0, 16, s);
+    dbg_dump_f16("expert_y_shared", expert_y_.get(),
+                 static_cast<size_t>(K) * H, 16, s);
+  }
   MOE_DBG("combine");
 }
 
