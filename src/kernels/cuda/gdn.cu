@@ -589,6 +589,127 @@ void gdn_scan_chunk_f16_warp(float* state, uint16_t* y, const uint16_t* qn,
       state, y, qn, kn, conv_out, conv_dim, ab, nk, K, ratio, V, n);
 }
 
+// ---------------------------------------------------------------------------
+// v0.12: 4-rows-per-warp warp scan (SAGER_GDN_R4, default on). The v0.6 warp
+// kernel runs one warp per (head, row) = nk*rows warps (4096 here) while a
+// T4 resident-fits only ~2040-2560 one-warp blocks - the grid oscillates
+// between two waves and every warp re-reads the same k/q row per token.
+// Packing R=4 rows per warp (same lane layout: 4 state dims at lane*4, same
+// 32-lane shuffle tree per row) quarters the grid to a single wave and
+// amortizes the k/q loads across the packed rows; a one-token-deep k/q
+// register prefetch breaks the load->use stall in the serial token chain.
+// probe13 (nk=16 K=128 ratio=2 V=128 n=512): 4.37 -> 2.59 ms (1.69x).
+// The final state is bit-identical to the v0.6 warp kernel (identical
+// per-row lane-summation order); a handful of y values (~0.017%) differ by
+// one fp16 ulp because the compiler may contract the y = S*q expression
+// differently in the interleaved body - the same rounding-level trade the
+// v0.6 scalar->warp switch made (docs/DETAILS.md).
+// ---------------------------------------------------------------------------
+template <int R>
+__global__ void gdn_scan_chunk_warp_r_kernel(float* __restrict__ state,
+                                             uint16_t* __restrict__ y,
+                                             const uint16_t* __restrict__ qn,
+                                             const uint16_t* __restrict__ kn,
+                                             const uint16_t* __restrict__ conv_out,
+                                             int conv_dim,
+                                             const float* __restrict__ ab,
+                                             int nk, int K, int ratio, int V,
+                                             int n) {
+  const int h = blockIdx.x;
+  const int jbase = blockIdx.y * R;
+  const int lane = threadIdx.x & 31;
+  const int rows = ratio * V;
+  const int nv = nk * ratio;
+
+  float s[R][4];
+  int jrow[R];
+  unsigned active = 0;
+#pragma unroll
+  for (int r = 0; r < R; ++r) {
+    const int j = jbase + r;
+    jrow[r] = j;
+    if (j < rows) {
+      const float4 sv = *reinterpret_cast<const float4*>(
+          state + (static_cast<size_t>(h) * rows + j) * K + lane * 4);
+      s[r][0] = sv.x; s[r][1] = sv.y; s[r][2] = sv.z; s[r][3] = sv.w;
+      active |= (1u << r);
+    }
+  }
+  const uint16_t* khead = kn + static_cast<size_t>(h) * K;
+  const uint16_t* qhead = qn + static_cast<size_t>(h) * K;
+  const uint16_t* vrow0 =
+      conv_out + 2 * nk * K + static_cast<size_t>(h) * rows + jbase;
+
+  uint2 kp = *reinterpret_cast<const uint2*>(khead + lane * 4);
+  uint2 qp = *reinterpret_cast<const uint2*>(qhead + lane * 4);
+  for (int t = 0; t < n; ++t) {
+    uint2 kpn, qpn;
+    if (t + 1 < n) {
+      kpn = *reinterpret_cast<const uint2*>(
+          khead + static_cast<size_t>(t + 1) * nk * K + lane * 4);
+      qpn = *reinterpret_cast<const uint2*>(
+          qhead + static_cast<size_t>(t + 1) * nk * K + lane * 4);
+    }
+    const float k0 = gdn_h16f(kp.x), k1 = gdn_h16f(kp.x >> 16);
+    const float k2 = gdn_h16f(kp.y), k3 = gdn_h16f(kp.y >> 16);
+    const float q0 = gdn_h16f(qp.x), q1 = gdn_h16f(qp.x >> 16);
+    const float q2 = gdn_h16f(qp.y), q3 = gdn_h16f(qp.y >> 16);
+    const size_t abrow = static_cast<size_t>(t) * 2 * nv;
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+      if (!(active & (1u << r))) continue;
+      const int vh = h * ratio + jrow[r] / V;
+      const float alpha = ab[abrow + vh];
+      const float beta = ab[abrow + nv + vh];
+      const float vj = gdn_h16f(vrow0[static_cast<size_t>(t) * conv_dim + r]);
+      float u = s[r][0] * k0 + s[r][1] * k1 + s[r][2] * k2 + s[r][3] * k3;
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) {
+        u += __shfl_down_sync(0xFFFFFFFFu, u, off);
+      }
+      u = __shfl_sync(0xFFFFFFFFu, u, 0);
+      const float ku = -alpha * beta * u + beta * vj;
+      s[r][0] = alpha * s[r][0] + ku * k0;
+      s[r][1] = alpha * s[r][1] + ku * k1;
+      s[r][2] = alpha * s[r][2] + ku * k2;
+      s[r][3] = alpha * s[r][3] + ku * k3;
+      float yj = s[r][0] * q0 + s[r][1] * q1 + s[r][2] * q2 + s[r][3] * q3;
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) {
+        yj += __shfl_down_sync(0xFFFFFFFFu, yj, off);
+      }
+      if (lane == 0) {
+        *reinterpret_cast<__half*>(
+            y + static_cast<size_t>(t) * (nv * V) +
+            static_cast<size_t>(h) * rows + jrow[r]) = __float2half(yj);
+      }
+    }
+    if (t + 1 < n) { kp = kpn; qp = qpn; }
+  }
+#pragma unroll
+  for (int r = 0; r < R; ++r) {
+    if (!(active & (1u << r))) continue;
+    *reinterpret_cast<float4*>(
+        state + (static_cast<size_t>(h) * rows + jrow[r]) * K + lane * 4) =
+        make_float4(s[r][0], s[r][1], s[r][2], s[r][3]);
+  }
+}
+
+void gdn_scan_chunk_f16_warp4(float* state, uint16_t* y, const uint16_t* qn,
+                              const uint16_t* kn, const uint16_t* conv_out,
+                              int conv_dim, const float* ab, int nk, int K,
+                              int ratio, int V, int n, cudaStream_t stream) {
+  const int rows = ratio * V;
+  if (K % 32 != 0 || (K * 2) % 16 != 0 || (rows * K) % 4 != 0 || rows < 4) {
+    gdn_scan_chunk_f16_warp(state, y, qn, kn, conv_out, conv_dim, ab, nk, K,
+                            ratio, V, n, stream);
+    return;
+  }
+  dim3 grid(nk, (rows + 3) / 4);
+  gdn_scan_chunk_warp_r_kernel<4><<<grid, 32, 0, stream>>>(
+      state, y, qn, kn, conv_out, conv_dim, ab, nk, K, ratio, V, n);
+}
+
 void gdn_out_norm_chunk_f16(uint16_t* out, const uint16_t* y,
                             const uint16_t* proj, int proj_rows, int conv_dim,
                             const uint16_t* w_on, int nv, int V, float eps,

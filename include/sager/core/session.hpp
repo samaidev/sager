@@ -322,6 +322,13 @@ class Session {
   std::vector<int>       moe_absent_; // absent-expert scratch (TC path)
   cudaEvent_t            ev_moe_plan_ = nullptr;  // plan-mirror completion
   const q4k::BlockQ8K* moe_xq_in_ = nullptr;  // fused-norm xq reuse (n=1)
+  // v0.12: shared-expert + router on tensor cores (SAGER_SH_TC=0 /
+  // SAGER_ROUTER_TC=0 -> the dp4a GEMV family; the parity bench arms pin
+  // both off). Scratch = the front of d_wtc_ (the MoE fp16 ring is dead by
+  // the time the shared expert runs; the router runs before the ring).
+  bool pf_sh_tc_ = true;
+  bool pf_router_tc_ = true;
+  bool dbg_layers_ = false;        // SAGER_DUMP_LOGITS=2 -> per-layer dump
   // v0.4 device-side expert dispatch (P1): chunk pointer table + device plan
   DeviceBuffer<q4k::BlockQ4K*> d_ptr_table_;   // [3][n_moe_layer][E] weights
   PinnedBuffer<q4k::BlockQ4K*> h_ptr_table_;   // chunk-start staging
@@ -352,6 +359,7 @@ class Session {
   bool                   head_q6k_ = true;     // SAGER_HEAD_Q6K native head
   bool                   topk2_ = true;        // SAGER_TOPK2=0 -> single-block
   bool                   gdn_ws_ = true;       // SAGER_GDN_WS=0 -> scalar scan
+  bool                   gdn_r4_ = true;       // SAGER_GDN_R4=0 -> v0.11 warp scan
   int                    topk_seg_slots_ = 0;  // two-phase topk scratch slots
   bool                   moe_dbg_ = false;     // SAGER_MOE_DEBUG=1 step probes
   // CPU-pool patch staging (anomaly path only)

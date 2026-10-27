@@ -167,18 +167,25 @@ void dequant_row_q6(const uint8_t* src, float* out, int cols) {
     const int8_t*  sc = reinterpret_cast<const int8_t*>(qh + 64);
     uint16_t dh; std::memcpy(&dh, qh + 64, 2);
     const float dd = q4k::half_to_float(dh);
+    // v0.12 fix: ql/qh must advance per 128-weight half (llama.cpp
+    // dequantize_row_q6_K: ql += 64, qh += 32). The old loop reused the
+    // first half's ql/qh bytes for the second half - half of every Q6_K
+    // row dequantized to wrong weights (attn_qkv, shared down, and any
+    // other Q6_K tensor requantized at load).
     for (int n = 0; n < 2; ++n) {          // two 128-weight halves
       float* y = out + static_cast<size_t>(b) * 256 + n * 128;
+      const uint8_t* qlh = ql + n * 64;
+      const uint8_t* qhh = qh + n * 32;
       for (int l = 0; l < 32; ++l) {
         const int is = l / 16;
-        const int q1 = static_cast<int>((ql[l +  0] & 0xF) |
-                                        (((qh[l] >> 0) & 3) << 4)) - 32;
-        const int q2 = static_cast<int>((ql[l + 32] & 0xF) |
-                                        (((qh[l] >> 2) & 3) << 4)) - 32;
-        const int q3 = static_cast<int>((ql[l +  0] >> 4) |
-                                        (((qh[l] >> 4) & 3) << 4)) - 32;
-        const int q4 = static_cast<int>((ql[l + 32] >> 4) |
-                                        (((qh[l] >> 6) & 3) << 4)) - 32;
+        const int q1 = static_cast<int>((qlh[l +  0] & 0xF) |
+                                        (((qhh[l] >> 0) & 3) << 4)) - 32;
+        const int q2 = static_cast<int>((qlh[l + 32] & 0xF) |
+                                        (((qhh[l] >> 2) & 3) << 4)) - 32;
+        const int q3 = static_cast<int>((qlh[l +  0] >> 4) |
+                                        (((qhh[l] >> 4) & 3) << 4)) - 32;
+        const int q4 = static_cast<int>((qlh[l + 32] >> 4) |
+                                        (((qhh[l] >> 6) & 3) << 4)) - 32;
         y[l +  0] = dd * sc[n * 8 + is + 0] * q1;
         y[l + 32] = dd * sc[n * 8 + is + 2] * q2;
         y[l + 64] = dd * sc[n * 8 + is + 4] * q3;
@@ -226,6 +233,24 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
       auto blocks = q4k::quantize_row(row.data(), cols);
       std::memcpy(out.data() + static_cast<size_t>(r) * blocks_per_row,
                   blocks.data(), blocks_per_row * q4k::kBlockBytes);
+      if (r == 0) {
+        // v0.12 debug: requant sanity of block 0 (SAGER_DUMP_LOGITS=1/2)
+        if (const char* dl = std::getenv("SAGER_DUMP_LOGITS")) {
+          if (*dl && *dl != '0') {
+            float wmax = 0.f;
+            for (int i = 0; i < cols; ++i) {
+              wmax = std::fmax(wmax, std::fabs(row[i]));
+            }
+            SLOG_I("weights",
+                   "requant dbg %s: row0 |w|max=%.5f blk0 d=0x%04x "
+                   "(%.6g) dmin=0x%04x (%.6g) sc0=%d sc1=%d q0=%u",
+                   what, wmax, blocks[0].d,
+                   q4k::half_to_float(blocks[0].d), blocks[0].dmin,
+                   q4k::half_to_float(blocks[0].dmin), (int)blocks[0].scales[0],
+                   (int)blocks[0].scales[1], (unsigned)(blocks[0].qs[0] & 0xF));
+          }
+        }
+      }
       if ((r & 1023) == 0)
         SLOG_I("weights", "requant Q6_K->Q4_K %s: %d/%d rows", what, r, rows);
     }
@@ -297,9 +322,14 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
           static_cast<int>(gate->dims[1]) == nv * V) {
         s = copymat(lw.lin_in_qkvz, qkv, "attn_qkv");
         if (s != Status::kOk) return s;
-        // row offset of the z slice inside the fused carve (uint16 units)
+        // row offset of the z slice inside the fused [q|k|v|z] carve
+        // (uint16 units). The qkv tensor covers q|k|v = 2*nk*K + nv*V rows;
+        // the z slice starts AFTER v - at conv_dim rows. (v0.12 fix: the
+        // old offset 2*nk*K landed the gate copy on top of the v rows and
+        // left the real z slice unwritten - uninitialised VRAM fed the
+        // output gate, zeroing/NaN-ing every GDN layer's contribution.)
         auto* zdst = reinterpret_cast<uint16_t*>(lw.lin_in_qkvz) +
-                     static_cast<size_t>(2 * nk * K) *
+                     static_cast<size_t>(2 * nk * K + nv * V) *
                          (static_cast<size_t>(H) / q4k::kQK_K) *
                          (q4k::kBlockBytes / sizeof(uint16_t));
         s = copymat(zdst, gate, "attn_gate");

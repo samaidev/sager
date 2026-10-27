@@ -130,6 +130,18 @@ void dequant_experts_q4_k_f16(const q4k::BlockQ4K* const* tab_a,
                               int rows_sl2, int k, int n_experts, int ring,
                               long long slot_elems, cudaStream_t stream);
 
+// ---- v0.12 shared-expert / router TC (SAGER_SH_TC / SAGER_ROUTER_TC; 0
+// reverts to the dp4a GEMV family) ------------------------------------------
+// fp32-out GemmEx primitive (router logits keep the fp32 output dtype).
+bool tc_gemm_f16_f32out_raw(const void* w16, const void* x16, float* y32,
+                            int n_rows, int k, int n_tokens,
+                            cudaStream_t stream);
+// MoE router: cast the fp32 [n_rows x k] weight to fp16 in `scratch` once,
+// then tc_gemm_f16_f32out_raw. Logits differ at the fp16-rounding level.
+void tc_router_f32(const float* w_f32, const uint16_t* x, float* y,
+                   uint16_t* scratch, int n_rows, int k, int n_tokens,
+                   cudaStream_t stream);
+
 // ---- v0.8 decode fusion kernels (all bit-identical to what they replace) ----
 
 // rmsnorm + Q8_K quantization in one launch (n_rows blocks of one row each).

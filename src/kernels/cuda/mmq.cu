@@ -903,8 +903,11 @@ __global__ void gemv_q6_k_q8_smx_kernel(const uint8_t* __restrict__ w6,
     const int qslot = (t & 7) >> 1;
     const int is = t & 1;
     const uint8_t* blk6 = roww + static_cast<size_t>(blk) * 210;
-    const uint8_t* ql = blk6 + (qslot & 1) * 32 + is * 16;
-    const uint8_t* qh = blk6 + 128 + is * 16;
+    // v0.12 fix: advance ql/qh per 128-weight half (n = t >> 3) - llama.cpp
+    // dequantize_row_q6_K semantics (matches the q4_k.cu head kernel fix).
+    const int n_half = t >> 3;
+    const uint8_t* ql = blk6 + n_half * 64 + (qslot & 1) * 32 + is * 16;
+    const uint8_t* qh = blk6 + 128 + n_half * 32 + is * 16;
     const int8_t* sc = reinterpret_cast<const int8_t*>(blk6 + 192);
     const float d = __half2float(*reinterpret_cast<const __half*>(blk6 + 208));
     const q4k::BlockQ8K& xb = x_sh[blk];

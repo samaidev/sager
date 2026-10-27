@@ -183,6 +183,15 @@ void gdn_scan_chunk_f16_warp(float* state, uint16_t* y, const uint16_t* qn,
                              int conv_dim, const float* ab, int nk, int K,
                              int ratio, int V, int n, cudaStream_t stream);
 
+// v0.12 4-rows-per-warp variant (SAGER_GDN_R4): single-wave grid + k/q
+// register prefetch. Final state bit-identical to gdn_scan_chunk_f16_warp;
+// y differs by <= 1 fp16 ulp on ~0.017% of values (FMA contraction).
+// Falls back to gdn_scan_chunk_f16_warp for shapes it cannot register-map.
+void gdn_scan_chunk_f16_warp4(float* state, uint16_t* y, const uint16_t* qn,
+                              const uint16_t* kn, const uint16_t* conv_out,
+                              int conv_dim, const float* ab, int nk, int K,
+                              int ratio, int V, int n, cudaStream_t stream);
+
 // Output gating for every token: out [n x nv*V] = rmsnorm(y) * silu(z),
 // where z is the [nv*V] tail of each proj row.
 void gdn_out_norm_chunk_f16(uint16_t* out, const uint16_t* y,

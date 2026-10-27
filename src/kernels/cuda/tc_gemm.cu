@@ -236,4 +236,48 @@ void dequant_experts_q4_k_f16(const q4k::BlockQ4K* const* tab_a,
       sl2k, ring, slot_elems, n_u4);
 }
 
+// ---------------------------------------------------------------------------
+// v0.12: MoE router on tensor cores (SAGER_ROUTER_TC). The router weight is
+// kept in fp32 [E x H]; the dp4a GEMV re-reads all 2 MB of it for every
+// token tile (~68 GB/s effective, 6-8% of the prefill GPU time). Here the
+// weight is cast to fp16 ONCE per call into a 1 MB scratch and the GEMM runs
+// with fp16 inputs / fp32 accumulate / fp32 C - the same output dtype the
+// dp4a path produces. Logits differ at the fp16-rounding level of W, which
+// can flip a near-tie at the top-k boundary - env-gated, the parity bench
+// arms pin SAGER_ROUTER_TC=0.
+// ---------------------------------------------------------------------------
+__global__ void cast_f32_f16_kernel(const float* __restrict__ src,
+                                    __half* __restrict__ dst, long long n) {
+  const long long i = static_cast<long long>(blockIdx.x) * blockDim.x +
+                      threadIdx.x;
+  if (i < n) dst[i] = __float2half(src[i]);
+}
+
+// C_row[n_tokens x n_rows] = X_row[n_tokens x k] * W_row[n_rows x k]^T with
+// fp16 I/O and fp32 C (same layout contract as tc_gemm_f16_raw).
+bool tc_gemm_f16_f32out_raw(const void* w16, const void* x16, float* y32,
+                            int n_rows, int k, int n_tokens,
+                            cudaStream_t stream) {
+  if (!g_tc_handle && !tc_handle()) return false;
+  if (cublasSetStream(g_tc_handle, stream) != CUBLAS_STATUS_SUCCESS)
+    return false;
+  const float one = 1.0f, zero = 0.0f;
+  return cublasGemmEx(
+      g_tc_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+      n_rows, n_tokens, k,
+      &one, w16, CUDA_R_16F, k,
+      x16, CUDA_R_16F, k,
+      &zero, y32, CUDA_R_32F, n_rows,
+      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS;
+}
+
+void tc_router_f32(const float* w_f32, const uint16_t* x, float* y,
+                   uint16_t* scratch, int n_rows, int k, int n_tokens,
+                   cudaStream_t stream) {
+  const long long n = static_cast<long long>(n_rows) * k;
+  cast_f32_f16_kernel<<<static_cast<int>((n + 255) / 256), 256, 0, stream>>>(
+      w_f32, reinterpret_cast<__half*>(scratch), n);
+  tc_gemm_f16_f32out_raw(scratch, x, y, n_rows, k, n_tokens, stream);
+}
+
 }  // namespace sager::cuda

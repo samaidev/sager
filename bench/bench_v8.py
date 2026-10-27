@@ -30,7 +30,8 @@ def base_env(extra: dict) -> dict:
     env = dict(os.environ)
     # benchmark knobs only; feature flags come from `extra`
     for k in ("SAGER_DECODE_FUSE", "SAGER_PF_MMQ", "SAGER_GDN_FFN_NORM",
-              "SAGER_HEAD_SMX", "SAGER_PF_TC", "SAGER_MOE_TC"):
+              "SAGER_HEAD_SMX", "SAGER_PF_TC", "SAGER_MOE_TC",
+              "SAGER_SH_TC", "SAGER_ROUTER_TC", "SAGER_GDN_R4"):
         env.pop(k, None)
     env.setdefault("SAGER_EXPERT_POOL_REUSE", "1")
     # v0.7 benchmark protocol: device decode + device sampler enabled
@@ -218,12 +219,17 @@ def main() -> None:
         # weight rounding + fp16 activations) - pinned OFF on both arms here,
         # measured separately in the perf arms.
         # v0.10: same for the MoE TC path (SAGER_MOE_TC).
+        # v0.12: same for the shared-expert / router TC paths and the GDN
+        # R4 scan (rounding-level changes) - pinned OFF on both arms here,
+        # measured separately in the perf arms.
         base = parity_arm({"SAGER_DECODE_FUSE": "0", "SAGER_PF_MMQ": "0",
                            "SAGER_GDN_FFN_NORM": "0", "SAGER_PF_TC": "0",
-                           "SAGER_MOE_TC": "0"},
+                           "SAGER_MOE_TC": "0", "SAGER_SH_TC": "0",
+                           "SAGER_ROUTER_TC": "0", "SAGER_GDN_R4": "0"},
                           model, chunk, prompt)
         new = parity_arm({"SAGER_GDN_FFN_NORM": "0", "SAGER_PF_TC": "0",
-                          "SAGER_MOE_TC": "0"},
+                          "SAGER_MOE_TC": "0", "SAGER_SH_TC": "0",
+                          "SAGER_ROUTER_TC": "0", "SAGER_GDN_R4": "0"},
                          model, chunk, prompt)
         ok = base == new and len(base) == 64
         out["parity"] = {"gdn_ffn_norm": "off", "v07_len": len(base), "v08_len": len(new),
@@ -240,16 +246,23 @@ def main() -> None:
             sys.exit(1)
 
     if not a.skip_bench:
-        arms = [("v10-default", {})]
+        arms = [("v12-default", {})]
         if os.environ.get("BENCH_ARMS", "1") != "0":
-            # exact v0.7 behavior: every v0.8/v0.9/v0.10 switch off
+            # exact v0.7 behavior: every v0.8/v0.9/v0.10/v0.12 switch off
             arms.append(("v07-exact", {"SAGER_DECODE_FUSE": "0",
                                        "SAGER_PF_MMQ": "0",
                                        "SAGER_HEAD_SMX": "0",
                                        "SAGER_GDN_FFN_NORM": "0",
                                        "SAGER_PF_TC": "0",
-                                       "SAGER_MOE_TC": "0"}))
-            # isolate the MoE TC contribution (dense TC off)
+                                       "SAGER_MOE_TC": "0",
+                                       "SAGER_SH_TC": "0",
+                                       "SAGER_ROUTER_TC": "0",
+                                       "SAGER_GDN_R4": "0"}))
+            # v0.11-equivalent reference on this binary (all v0.12 off)
+            arms.append(("v12-off", {"SAGER_GDN_R4": "0",
+                                     "SAGER_SH_TC": "0",
+                                     "SAGER_ROUTER_TC": "0"}))
+            # isolate the MoE routed-TC contribution (dense TC off)
             arms.append(("moe-tc-only", {"SAGER_PF_TC": "0",
                                          "SAGER_GDN_FFN_NORM": "0"}))
         if os.environ.get("BENCH_ISOLATE", "0") != "0":

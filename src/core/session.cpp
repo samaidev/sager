@@ -23,6 +23,7 @@
 
 #if defined(SAGER_HAVE_CUDA)
 #include "sager/kernels/cuda_ops.hpp"
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #endif
 
@@ -437,6 +438,9 @@ Status Session::prepare() {
       if (tk) topk2_ = (*tk != "0");
       const auto gw = env_get("SAGER_GDN_WS");
       if (gw) gdn_ws_ = (*gw != "0");
+      // v0.12 knob (default on; SAGER_GDN_R4=0 -> the v0.11 warp scan)
+      const auto gr4 = env_get("SAGER_GDN_R4");
+      if (gr4) gdn_r4_ = (*gr4 != "0");
       const auto mdb = env_get("SAGER_MOE_DEBUG");
       if (mdb) moe_dbg_ = (*mdb != "0");
       // v0.8 knobs (all default on; each flips cleanly back to the v0.7 path)
@@ -455,6 +459,14 @@ Status Session::prepare() {
       // GEMV family for the MoE experts)
       const auto mtc = env_get("SAGER_MOE_TC");
       if (mtc) pf_moe_tc_ = (*mtc != "0");
+      // v0.12 knobs (default on; the parity bench arms pin both off)
+      const auto stc = env_get("SAGER_SH_TC");
+      if (stc) pf_sh_tc_ = (*stc != "0");
+      const auto rtc = env_get("SAGER_ROUTER_TC");
+      if (rtc) pf_router_tc_ = (*rtc != "0");
+      if (const auto dlp = env_get("SAGER_DUMP_LOGITS")) {
+        dbg_layers_ = (*dlp == "2");
+      }
     }
     const EngineDims& dd0 = mc_.dims;
     if (pf_batched_ &&
@@ -463,10 +475,12 @@ Status Session::prepare() {
              "(%d/%d) - per-row walk stays", dd0.hidden, dd0.n_ff_exp);
       pf_batched_ = false;
     }
-    SLOG_I("session", "prefill v0.9: batched=%d mtok=%d mmq=%d tc=%d "
+    SLOG_I("session", "prefill v0.12: batched=%d mtok=%d mmq=%d tc=%d "
+           "moe_tc=%d sh_tc=%d rt_tc=%d gdn_r4=%d "
            "stream_min=%d chunk_cap=%d cpu_rows=%d device=%d fuse=%d "
            "head_smx=%d",
            (int)pf_batched_, (int)pf_mtok_, (int)pf_mmq_, (int)pf_tc_,
+           (int)pf_moe_tc_, (int)pf_sh_tc_, (int)pf_router_tc_, (int)gdn_r4_,
            pf_stream_min_, pf_chunk_cap_, pf_cpu_cap_, (int)pf_device_,
            (int)dec_fuse_, (int)head_smx_);
   }
@@ -932,6 +946,28 @@ void Session::zero_gdn_states() {
 // the sequential rank-1 recurrence fuses into ONE kernel whose blocks keep
 // their state slice in shared memory for the whole chunk.
 // ---------------------------------------------------------------------------
+#if defined(SAGER_HAVE_CUDA)
+// v0.12 debug helper: health of one fp16 slab row (SAGER_DUMP_LOGITS=2).
+static void dbg_dump_f16(const char* tag, const uint16_t* dev, size_t off,
+                         int cnt, cudaStream_t s) {
+  static std::vector<uint16_t> buf;
+  if (buf.size() < static_cast<size_t>(cnt)) buf.resize(static_cast<size_t>(cnt));
+  cudaMemcpyAsync(buf.data(), dev + off, static_cast<size_t>(cnt) * sizeof(uint16_t),
+                  cudaMemcpyDeviceToHost, s);
+  cudaStreamSynchronize(s);
+  float sabs = 0.f, mx = 0.f;
+  int nans = 0;
+  for (int i = 0; i < cnt; ++i) {
+    const float v = __half2float(*reinterpret_cast<const __half*>(&buf[i]));
+    if (std::isnan(v)) ++nans;
+    sabs += fabsf(v);
+    mx = fmaxf(mx, fabsf(v));
+  }
+  fprintf(stderr, "[sager/dbg] %-18s sum|x|=%.4f max|x|=%.4f nan=%d\n",
+          tag, sabs, mx, nans);
+}
+#endif
+
 void Session::linear_layer_chunk(int layer, int n) {
   const EngineDims& d = mc_.dims;
   const GdnParams g = mc_.gdn();
@@ -956,6 +992,27 @@ void Session::linear_layer_chunk(int layer, int n) {
     cuda::rmsnorm_batched_f16(xn_.get(), x_.get(), lw.attn_norm, H,
                               mc_.norm_eps, n, s);
     cuda::quantize_q8_k(xn_.get(), d_xq_.get(), n * H, s);
+  }
+  if (dbg_layers_) {
+    dbg_dump_f16("xn(norm)", xn_.get(),
+                 static_cast<size_t>(n - 1) * H, H, s);
+    // raw view of the first Q4_K blocks of the qkvz carve (weight sanity)
+    static PinnedBuffer<uint8_t> dbg_w;
+    if (dbg_w.count() < 8 * 144) dbg_w.alloc(8 * 144);
+    cudaMemcpyAsync(dbg_w.get(), lw.lin_in_qkvz, 8 * 144,
+                    cudaMemcpyDeviceToHost, s);
+    stream_.sync();
+    for (int b = 0; b < 4; ++b) {
+      const uint8_t* p = dbg_w.get() + b * 144;
+      const float d = __half2float(
+          *reinterpret_cast<const __half*>(p));
+      const float dmin = __half2float(
+          *reinterpret_cast<const __half*>(p + 2));
+      fprintf(stderr,
+              "[sager/dbg] carve blk %d d=%.6f dmin=%.6f sc=%d/%d/%d q0=%u\n",
+              b, d, dmin, (int)p[4], (int)p[5], (int)p[6],
+              (unsigned)(p[16] & 0xF));
+    }
   }
   // fused projections for the whole window
   if (pf_tc_) {
@@ -983,12 +1040,20 @@ void Session::linear_layer_chunk(int layer, int n) {
     cuda::gemv_q4_k_q8_f16out_mtok(Q4W(lw.lin_in_ba), d_xq_.get(),
                                    lin_ba_b_.get(), g.ba_rows(), H, n, s);
   }
+  if (dbg_layers_) {
+    dbg_dump_f16("qkvz_proj", lin_proj_b_.get(),
+                 static_cast<size_t>(n - 1) * g.proj_rows(), g.proj_rows(), s);
+  }
   // causal conv over the chunk, then commit the state tail
   cuda::gdn_conv_chunk_f16(lin_conv_b_.get(), lin_proj_b_.get(), conv_st,
                            lw.lin_conv_w, lw.lin_conv_b, g.conv_dim(),
                            g.conv_kernel, n, s);
   cuda::gdn_conv_state_commit_f16(conv_st, lin_proj_b_.get(), g.conv_dim(),
                                   g.conv_kernel, n, s);
+  if (dbg_layers_) {
+    dbg_dump_f16("conv_out", lin_conv_b_.get(),
+                 static_cast<size_t>(n - 1) * g.conv_dim(), g.conv_dim(), s);
+  }
   // data-dependent gates + per-head L2 norm, batched
   cuda::gdn_gate_chunk_f32(lin_ba_b_.get(), lw.lin_A_log, lw.lin_dt_bias,
                            lin_ab_b_.get(), g.n_v_heads, n, s);
@@ -996,7 +1061,12 @@ void Session::linear_layer_chunk(int layer, int n) {
                               lin_conv_b_.get(), g.conv_dim(), g.n_k_heads,
                               g.key_dim, mc_.norm_eps, n, s);
   // fused recurrence scan (state stays in shared memory across the chunk)
-  if (gdn_ws_) {
+  if (gdn_ws_ && gdn_r4_) {
+    cuda::gdn_scan_chunk_f16_warp4(delta_st, lin_y_b_.get(), lin_qn_b_.get(),
+                                   lin_kn_b_.get(), lin_conv_b_.get(),
+                                   g.conv_dim(), lin_ab_b_.get(), g.n_k_heads,
+                                   g.key_dim, g.ratio(), g.value_dim, n, s);
+  } else if (gdn_ws_) {
     cuda::gdn_scan_chunk_f16_warp(delta_st, lin_y_b_.get(), lin_qn_b_.get(),
                                   lin_kn_b_.get(), lin_conv_b_.get(),
                                   g.conv_dim(), lin_ab_b_.get(), g.n_k_heads,
@@ -1006,6 +1076,10 @@ void Session::linear_layer_chunk(int layer, int n) {
                              lin_kn_b_.get(), lin_conv_b_.get(), g.conv_dim(),
                              lin_ab_b_.get(), g.n_k_heads, g.key_dim,
                              g.ratio(), g.value_dim, n, s);
+  }
+  if (dbg_layers_) {
+    dbg_dump_f16("scan_y", lin_y_b_.get(),
+                 static_cast<size_t>(n - 1) * g.y_rows(), g.y_rows(), s);
   }
   // output gating + out projection + residual
   cuda::gdn_out_norm_chunk_f16(lin_on_b_.get(), lin_y_b_.get(),
@@ -1033,6 +1107,12 @@ void Session::linear_layer_chunk(int layer, int n) {
     }
   }
   cuda::add_f16(x_.get(), o_proj_.get(), n * H, s);
+  if (dbg_layers_) {
+    dbg_dump_f16("lin_o_proj", o_proj_.get(),
+                 static_cast<size_t>(n - 1) * H, H, s);
+    dbg_dump_f16("x_after", x_.get(),
+                 static_cast<size_t>(n - 1) * H, H, s);
+  }
   // v0.8 FIX: the MoE half consumes ffn_norm(x) - never applied on GDN
   // layers before v0.8 (see linear_layer_launch for the full note).
   if (gdn_ffn_norm_) {
@@ -1996,8 +2076,20 @@ void Session::moe_dispatch_device(int layer, int n) {
   // is a loss); the win is the batched top-k kernel's warp-parallel
   // selection (below in moe.cu) - the v0.7 kernel selected serially in
   // thread 0 (~20-40 us per layer).
-  cuda::gemv_f32_out_f16x_mtok(lw.router, xn_.get(), route_logits_.get(),
-                               E, H, n, s);
+  // v0.12: TC router for large chunks (SAGER_ROUTER_TC) - the dp4a GEMV
+  // re-reads the 2 MB fp32 W per token tile; the TC path casts W to fp16
+  // once (1 MB scratch at the front of d_wtc_, which is free until the MoE
+  // ring builds below) and runs one GemmEx with fp32 C. Same output dtype;
+  // logits differ at the fp16-rounding level (top-k near-ties can flip).
+  if (pf_router_tc_ && n >= 256 && !capturing &&
+      d_wtc_.count() >= static_cast<size_t>(E) * H &&
+      cuda::tc_handle() != nullptr) {
+    cuda::tc_router_f32(lw.router, xn_.get(), route_logits_.get(),
+                        d_wtc_.get(), E, H, n, s);
+  } else {
+    cuda::gemv_f32_out_f16x_mtok(lw.router, xn_.get(), route_logits_.get(),
+                                 E, H, n, s);
+  }
   cuda::router_topk_batched(route_logits_.get(), route_idx_.get(),
                             route_w_.get(), E, K, K + 1, n, s);
   (void)dec_fuse_;
@@ -2243,7 +2335,52 @@ void Session::moe_dispatch_device(int layer, int n) {
                            n, K, H, s);
 
   // 10) shared expert, batched (identical to the host path).
+  //     v0.12: TC path for large chunks (SAGER_SH_TC). The dp4a GEMV family
+  //     here costs ~18% of the prefill GPU time (gemv2 gate+up + down
+  //     mtok); the TC path dequantizes each weight once into the front of
+  //     d_wtc_ (the MoE fp16 ring is dead after the down phase above -
+  //     in-stream reuse is safe) and needs NO Q8 requant for the down
+  //     input (the fp16 silu output feeds GemmEx directly).
   if (lw.shared_gate) {
+    const bool sh_tc = pf_sh_tc_ && n >= 256 && !capturing &&
+                       d_wtc_.count() >= 3ull * FFX * H &&
+                       cuda::tc_handle() != nullptr;
+    // v0.8 (n=1): write the shared row straight into the combine slab's
+    // reserved slot K instead of a separate buffer + 2D memcpy node.
+    uint16_t* sh_out = (n == 1)
+        ? expert_y_.get() + static_cast<size_t>(K) * H
+        : shared_yb_.get();
+    if (sh_tc) {
+      uint16_t* wsc = d_wtc_.get();
+      if (!cuda::tc_gemm_q4_k_f16(
+              reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_gate),
+              xn_.get(), sh_g_.get(), wsc, FFX, H, n, s) ||
+          !cuda::tc_gemm_q4_k_f16(
+              reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_up),
+              xn_.get(), sh_u_.get(), wsc + static_cast<size_t>(FFX) * H,
+              FFX, H, n, s)) {
+        SLOG_E("moe", "layer %d: shared gate/up TC failed - dp4a fallback",
+               layer);
+        cuda::quantize_q8_k(xn_.get(), d_xq_moe_.get(),
+                            static_cast<size_t>(n) * H, s);
+        cuda::gemv2_q4_k_q8_f16out_mtok(
+            reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_gate),
+            reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_up),
+            d_xq_moe_.get(), sh_g_.get(), sh_u_.get(), FFX, H, n, s);
+      }
+      cuda::silu_mul_f16(sh_g_.get(), sh_g_.get(), sh_u_.get(), 1, n * FFX, s);
+      if (!cuda::tc_gemm_q4_k_f16(
+              reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_out),
+              sh_g_.get(), sh_out, wsc + 2ull * FFX * H, H, FFX, n, s)) {
+        SLOG_E("moe", "layer %d: shared down TC failed - dp4a fallback",
+               layer);
+        cuda::quantize_q8_k(sh_g_.get(), d_hqg_.get(),
+                            static_cast<size_t>(n) * FFX, s);
+        cuda::gemv_q4_k_q8_f16out_mtok(
+            reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_out),
+            d_hqg_.get(), sh_out, H, FFX, n, s);
+      }
+    } else {
     cuda::gemv2_q4_k_q8_f16out_mtok(
         reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_gate),
         reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_up),
@@ -2251,14 +2388,10 @@ void Session::moe_dispatch_device(int layer, int n) {
     cuda::silu_mul_f16(sh_g_.get(), sh_g_.get(), sh_u_.get(), 1, n * FFX, s);
     cuda::quantize_q8_k(sh_g_.get(), d_hqg_.get(),
                         static_cast<size_t>(n) * FFX, s);
-    // v0.8 (n=1): write the shared row straight into the combine slab's
-    // reserved slot K instead of a separate buffer + 2D memcpy node.
-    uint16_t* sh_out = (n == 1)
-        ? expert_y_.get() + static_cast<size_t>(K) * H
-        : shared_yb_.get();
     cuda::gemv_q4_k_q8_f16out_mtok(
         reinterpret_cast<const q4k::BlockQ4K*>(lw.shared_out), d_hqg_.get(),
         sh_out, H, FFX, n, s);
+    }
     if (lw.shared_gate_w) {
       cuda::gemv_f32_out_f16x_batched(lw.shared_gate_w, xn_.get(),
                                       d_sgate_.get(), 1, H, n, s);
@@ -2596,6 +2729,28 @@ void Session::head_launch() {
 void Session::head_launch_row(int row) {
   const EngineDims& d = mc_.dims;
   cudaStream_t s = stream_.get();
+  // v0.12 debug: pre-norm residual row health (SAGER_DUMP_LOGITS=1)
+  if (const char* dl = std::getenv("SAGER_DUMP_LOGITS")) {
+    if (*dl && *dl != '0') {
+      static PinnedBuffer<float> dbg_row;
+      if (dbg_row.count() < static_cast<size_t>(d.hidden)) {
+        dbg_row.alloc(static_cast<size_t>(d.hidden));
+      }
+      const uint16_t* xrow = x_.get() + static_cast<size_t>(row) * d.hidden;
+      cudaMemcpyAsync(dbg_row.get(), xrow, d.hidden * sizeof(uint16_t),
+                      cudaMemcpyDeviceToHost, s);
+      stream_.sync();
+      float sabs = 0.f, mx = 0.f;
+      for (int i = 0; i < d.hidden; ++i) {
+        const float v = __half2float(
+            *reinterpret_cast<const __half*>(&dbg_row.get()[i]));
+        sabs += fabsf(v);
+        mx = fmaxf(mx, fabsf(v));
+      }
+      fprintf(stderr, "[sager/dbg] x_row sum|x|=%.4f max|x|=%.4f (H=%d)\n",
+              sabs, mx, d.hidden);
+    }
+  }
   cuda::rmsnorm_f16(xn_.get(), x_.get() + static_cast<size_t>(row) * d.hidden,
                     w_.output_norm, d.hidden, mc_.norm_eps, s);
   // MTP stash: prefill's tail row is the hidden the first draft conditions on.
@@ -2622,6 +2777,40 @@ void Session::head_launch_row(int row) {
   cudaMemcpyAsync(logits_host_.get(), logits_.get(),
                   d.n_vocab * sizeof(float), cudaMemcpyDeviceToHost, s);
   stream_.sync();
+  // v0.12 debug: dump the prefill tail-row logits distribution
+  // (SAGER_DUMP_LOGITS=1). One row per generate - cheap, stderr only.
+  if (const char* dl = std::getenv("SAGER_DUMP_LOGITS")) {
+    if (*dl && *dl != '0') {
+      const int nv = d.n_vocab;
+      const float* lg = logits_host_.get();
+      float mx = -1e30f, mn = 1e30f, sum = 0.f;
+      for (int i = 0; i < nv; ++i) {
+        const float v = lg[i];
+        if (v > mx) mx = v;
+        if (v < mn) mn = v;
+        sum += v;
+      }
+      int top[8];
+      float tv[8];
+      for (int k = 0; k < 8; ++k) { tv[k] = -1e30f; top[k] = -1; }
+      for (int i = 0; i < nv; ++i) {
+        const float v = lg[i];
+        for (int k = 0; k < 8; ++k) {
+          if (v > tv[k]) {
+            for (int q = 7; q > k; --q) { tv[q] = tv[q - 1]; top[q] = top[q - 1]; }
+            tv[k] = v; top[k] = i;
+            break;
+          }
+        }
+      }
+      fprintf(stderr, "[sager/dbg] logits n=%d max=%.3f min=%.3f mean=%.4f top:",
+              nv, mx, mn, sum / static_cast<float>(nv));
+      for (int k = 0; k < 8; ++k) {
+        fprintf(stderr, " (%d,%.3f)", top[k], tv[k]);
+      }
+      fprintf(stderr, "\n");
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -3157,6 +3346,30 @@ Status Session::forward_window(const std::vector<int>& window,
   cudaMemcpy(d_params_.get(), &sp, sizeof(sp), cudaMemcpyHostToDevice);
 
   cuda::gather_embed(x_.get(), w_.tok_embd, d_ids_.get(), n, d.hidden, s);
+  // v0.12 debug: post-embed health of the last row (SAGER_DUMP_LOGITS=1)
+  if (const char* dl = std::getenv("SAGER_DUMP_LOGITS")) {
+    if (*dl && *dl != '0') {
+      static PinnedBuffer<uint16_t> dbg_emb;
+      if (dbg_emb.count() < static_cast<size_t>(d.hidden)) {
+        dbg_emb.alloc(static_cast<size_t>(d.hidden));
+      }
+      const uint16_t* xrow = x_.get() +
+          static_cast<size_t>(n - 1) * d.hidden;
+      cudaMemcpyAsync(dbg_emb.get(), xrow, d.hidden * sizeof(uint16_t),
+                      cudaMemcpyDeviceToHost, s);
+      stream_.sync();
+      float sabs = 0.f, mx = 0.f;
+      for (int i = 0; i < d.hidden; ++i) {
+        const float v = __half2float(
+            *reinterpret_cast<const __half*>(&dbg_emb.get()[i]));
+        sabs += fabsf(v);
+        mx = fmaxf(mx, fabsf(v));
+      }
+      fprintf(stderr,
+              "[sager/dbg] post_embed row n=%d sum|x|=%.4f max|x|=%.4f\n",
+              n, sabs, mx);
+    }
+  }
 
   pump_ ? pump_->begin_step(static_cast<uint64_t>(pos_) + 1) : void(0);
   // Batched route slabs are sized for pf_chunk_cap_ tokens; a caller that
@@ -3184,6 +3397,29 @@ Status Session::forward_window(const std::vector<int>& window,
     resolve_cpu_mailbox(L - 1, n);   // no-op unless the prior layer mailed
     if (mc_.is_linear(L)) linear_layer_launch(L, n);
     else                  dense_layer_launch(L, n);
+    // v0.12 debug: per-layer residual health (SAGER_DUMP_LOGITS=2)
+    if (dbg_layers_) {
+      static PinnedBuffer<uint16_t> dbg_l;
+      if (dbg_l.count() < static_cast<size_t>(d.hidden)) {
+        dbg_l.alloc(static_cast<size_t>(d.hidden));
+      }
+      const uint16_t* xrow = x_.get() +
+          static_cast<size_t>(n - 1) * d.hidden;
+      cudaMemcpyAsync(dbg_l.get(), xrow, d.hidden * sizeof(uint16_t),
+                      cudaMemcpyDeviceToHost, s);
+      stream_.sync();
+      float sabs = 0.f, mx = 0.f;
+      int nans = 0;
+      for (int i = 0; i < d.hidden; ++i) {
+        const float v = __half2float(
+            *reinterpret_cast<const __half*>(&dbg_l.get()[i]));
+        if (std::isnan(v)) ++nans;
+        sabs += fabsf(v);
+        mx = fmaxf(mx, fabsf(v));
+      }
+      fprintf(stderr, "[sager/dbg] L=%d(%s) post sum|x|=%.4f max|x|=%.4f nan=%d\n",
+              L, mc_.is_linear(L) ? "gdn" : "attn", sabs, mx, nans);
+    }
     if (prof.on) cudaEventRecord(fw_ev_[fw_ev_pe_++], s);
     if (device_dispatch) {
       moe_dispatch_device(L, n);
