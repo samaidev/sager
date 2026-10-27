@@ -943,7 +943,9 @@ __global__ void gemv_q6_k_q8_smx_kernel(const uint8_t* __restrict__ w6,
       isum = __dp4a(static_cast<int>(wpack), static_cast<int>(xpack), isum);
       xsum = __dp4a(static_cast<int>(xpack), 0x01010101, xsum);
     }
-    acc += d * static_cast<float>(sc[t]) *
+    // v0.12 fix: include the Q8 activation block scale (xb.d) - same bug as
+    // gemv_q6_k_q8_kernel; the smx head path inflated logits ~1/d8 (~50x).
+    acc += xb.d * d * static_cast<float>(sc[t]) *
            static_cast<float>(isum - 32 * xsum);
   }
 

@@ -1638,7 +1638,11 @@ __global__ void gemv_q6_k_q8_kernel(const uint8_t* __restrict__ w6,
       isum = __dp4a(static_cast<int>(wpack), static_cast<int>(xpack), isum);
       xsum = __dp4a(static_cast<int>(xpack), 0x01010101, xsum);
     }
-    acc += d * static_cast<float>(sc[t]) *
+    // v0.12 fix: include the Q8 activation block scale (xb.d). The Q4_K gemv
+    // path multiplies xb.d * (sd*dot - sm*xsum); omitting it here inflated
+    // head logits by ~1/d8 (~50x, observed |logit| <= 156 vs correct ~8)
+    // and made every greedy pick garbage.
+    acc += xb.d * d * static_cast<float>(sc[t]) *
            static_cast<float>(isum - 32 * xsum);
   }
 
