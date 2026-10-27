@@ -106,6 +106,11 @@ int main() {
   // ---- 1. quantize_q8_k CUDA vs host ---------------------------------------
   std::vector<uint16_t> x_f16(TOK * K);
   for (size_t i = 0; i < x.size(); ++i) x_f16[i] = f2h(x[i]);
+  // v0.12 fix: the host reference must consume the SAME fp16-rounded values
+  // the kernel sees. Comparing against the raw fp32 tensor makes every fp16
+  // amax/code rounding difference look like a kernel bug (40/40 mismatch).
+  std::vector<float> x_h(TOK * K);
+  for (size_t i = 0; i < x.size(); ++i) x_h[i] = h2f(x_f16[i]);
   uint16_t* d_x16 = upload(x_f16);
   BlockQ8K* d_xq = nullptr;
   cudaMalloc(&d_xq, size_t(TOK) * NB * sizeof(BlockQ8K));
@@ -117,7 +122,7 @@ int main() {
   int q8_mismatch = 0;
   for (int t = 0; t < TOK; ++t) {
     std::vector<BlockQ8K> xq_host(NB);
-    quantize_row_q8_K(&x[size_t(t) * K], xq_host.data(), K);
+    quantize_row_q8_K(&x_h[size_t(t) * K], xq_host.data(), K);
     for (int b = 0; b < NB; ++b) {
       const BlockQ8K& a = xq_gpu[size_t(t) * NB + b];
       const BlockQ8K& e = xq_host[b];
