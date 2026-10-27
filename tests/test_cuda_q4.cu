@@ -23,6 +23,7 @@
 
 using namespace sager;          // NOLINT
 using namespace sager::q4k;     // NOLINT
+using namespace sager::cuda;    // NOLINT
 
 static int g_failures = 0;
 
