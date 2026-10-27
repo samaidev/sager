@@ -1110,9 +1110,9 @@ void Session::linear_layer_chunk(int layer, int n) {
   // causal conv over the chunk, then commit the state tail
   cuda::gdn_conv_chunk_f16(lin_conv_b_.get(), lin_proj_b_.get(), conv_st,
                            lw.lin_conv_w, lw.lin_conv_b, g.conv_dim(),
-                           g.conv_kernel, n, s);
+                           g.conv_kernel, n, s, g.proj_rows());
   cuda::gdn_conv_state_commit_f16(conv_st, lin_proj_b_.get(), g.conv_dim(),
-                                  g.conv_kernel, n, s);
+                                  g.conv_kernel, n, s, g.proj_rows());
   if (dbg_layers_) {
     dbg_dump_f16("conv_out", lin_conv_b_.get(),
                  static_cast<size_t>(n - 1) * g.conv_dim(), g.conv_dim(), s);

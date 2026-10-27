@@ -149,12 +149,12 @@ void gdn_out_norm_f16(uint16_t* out, const uint16_t* y, const uint16_t* z,
 void gdn_conv_chunk_f16(uint16_t* conv_out, const uint16_t* proj,
                         const uint16_t* state_old, const uint16_t* w,
                         const uint16_t* b, int conv_dim, int ck, int n,
-                        cudaStream_t stream);
+                        cudaStream_t stream, int proj_stride = 0);
 
 // conv_state <- the last (ck-1) raw conv inputs of the chunk.
 void gdn_conv_state_commit_f16(uint16_t* conv_state, const uint16_t* proj,
                                int conv_dim, int ck, int n,
-                               cudaStream_t stream);
+                               cudaStream_t stream, int proj_stride = 0);
 
 // ab [n x 2nv] = {alpha | beta} per token from ba [n x 2nv].
 void gdn_gate_chunk_f32(const uint16_t* ba, const float* A,

@@ -247,7 +247,8 @@ __global__ void gdn_conv_chunk_kernel(uint16_t* conv_out,
                                       const uint16_t* proj,
                                       const uint16_t* state_old,
                                       const uint16_t* w, const uint16_t* b,
-                                      int conv_dim, int ck, int n) {
+                                      int conv_dim, int ck, int n,
+                                      int proj_stride) {
   const int d = blockIdx.x * blockDim.x + threadIdx.x;
   const int t = blockIdx.y;
   if (d >= conv_dim || t >= n) return;
@@ -258,10 +259,14 @@ __global__ void gdn_conv_chunk_kernel(uint16_t* conv_out,
     // v0.12 fix: convert the tap through ldh - a raw uint16_t here multiplies
     // the fp16 BIT PATTERN as an integer (value 25.0 = bits 16847), which
     // amplified the conv output ~650x and NaN'd the scan at layer 1.
+    // v0.12 fix 2: index proj with its REAL row stride (proj_rows = conv_dim
+    // + z rows); the old conv_dim stride misaligned every window with t >= 1
+    // onto the previous token's z slice (cos 1.0 reproduced with the wrong
+    // stride, 0.87 with the right one).
     const float v =
         (src_t < 0)
             ? ldh(&state_old[static_cast<size_t>(d) * nm1 + (src_t + nm1)])
-            : ldh(&proj[static_cast<size_t>(src_t) * conv_dim + d]);
+            : ldh(&proj[static_cast<size_t>(src_t) * proj_stride + d]);
     acc += ldh(w + static_cast<size_t>(d) * ck + j) * v;
   }
   sth(conv_out + static_cast<size_t>(t) * conv_dim + d, siluf(acc));
@@ -270,7 +275,8 @@ __global__ void gdn_conv_chunk_kernel(uint16_t* conv_out,
 // Commit the conv state at chunk end: state[d, j] = raw(n - (ck-1) + j, d).
 __global__ void gdn_conv_state_commit_kernel(uint16_t* conv_state,
                                              const uint16_t* proj,
-                                             int conv_dim, int ck, int n) {
+                                             int conv_dim, int ck, int n,
+                                             int proj_stride) {
   const int d = blockIdx.x * blockDim.x + threadIdx.x;
   if (d >= conv_dim) return;
   const int nm1 = ck - 1;
@@ -279,7 +285,7 @@ __global__ void gdn_conv_state_commit_kernel(uint16_t* conv_state,
   for (int j = 0; j < nm1 && j < 16; ++j) {
     const int src_t = n - nm1 + j;
     tmp[j] = (src_t >= 0)
-                 ? proj[static_cast<size_t>(src_t) * conv_dim + d]
+                 ? proj[static_cast<size_t>(src_t) * proj_stride + d]
                  : st[n + j];   // still inside the OLD state window
   }
   for (int j = 0; j < nm1 && j < 16; ++j) st[j] = tmp[j];
@@ -450,19 +456,23 @@ __global__ void gdn_out_norm_chunk_kernel(uint16_t* out, const uint16_t* y,
 void gdn_conv_chunk_f16(uint16_t* conv_out, const uint16_t* proj,
                         const uint16_t* state_old, const uint16_t* w,
                         const uint16_t* b, int conv_dim, int ck, int n,
-                        cudaStream_t stream) {
+                        cudaStream_t stream, int proj_stride) {
   const int block = 256;
   dim3 grid((conv_dim + block - 1) / block, n);
   gdn_conv_chunk_kernel<<<grid, block, 0, stream>>>(conv_out, proj, state_old,
-                                                    w, b, conv_dim, ck, n);
+                                                    w, b, conv_dim, ck, n,
+                                                    proj_stride > 0 ? proj_stride
+                                                                    : conv_dim);
 }
 
 void gdn_conv_state_commit_f16(uint16_t* conv_state, const uint16_t* proj,
                                int conv_dim, int ck, int n,
-                               cudaStream_t stream) {
+                               cudaStream_t stream, int proj_stride) {
   const int block = 256;
   gdn_conv_state_commit_kernel<<<(conv_dim + block - 1) / block, block, 0,
-                                 stream>>>(conv_state, proj, conv_dim, ck, n);
+                                 stream>>>(conv_state, proj, conv_dim, ck, n,
+                                           proj_stride > 0 ? proj_stride
+                                                           : conv_dim);
 }
 
 void gdn_gate_chunk_f32(const uint16_t* ba, const float* A,
