@@ -3559,6 +3559,8 @@ Status Session::forward_window(const std::vector<int>& window,
       }
       fprintf(stderr, "[sager/dbg] L=%d(%s) moe  sum|x|=%.4f max|x|=%.4f nan=%d\n",
               L, mc_.is_linear(L) ? "gdn" : "attn", sabs2, mx2, nans2);
+      dbg_write_row("moe", x_.get(), static_cast<size_t>(n - 1) * d.hidden,
+                    d.hidden, L, s);
     }
     if (prof.on) cudaEventRecord(fw_ev_[fw_ev_pe_++], s);
   }
