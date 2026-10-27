@@ -1732,7 +1732,7 @@ void Session::moe_dispatch_batched(int layer, int n) {
     dbg_write_row_f32("routeidx", route_idx_.get(),
                       static_cast<size_t>(n - 1) * (K + 1), K + 1, layer, s);
     dbg_write_row_f32("routelogits", route_logits_.get(),
-                      static_cast<size_t>(n - 1) * E, E, layer, s);
+                      0, E * n, layer, s);
   }
 
   // 3) the ONE per-layer sync: routing decision to the host.
