@@ -1165,7 +1165,7 @@ void Session::linear_layer_chunk(int layer, int n) {
       const char* e = std::getenv("SAGER_DBG_ROW_LAYERS");
       return e ? std::atoi(e) : 0;
     }();
-    if (dbg_row_layers > 0 && layer < dbg_row_layers && !capturing) {
+    if (dbg_row_layers > 0 && layer < dbg_row_layers && n > 1) {
       static PinnedBuffer<uint16_t> rowbuf;
       if (rowbuf.count() < static_cast<size_t>(H))
         rowbuf.alloc(static_cast<size_t>(H));
