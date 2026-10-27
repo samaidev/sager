@@ -50,7 +50,7 @@ def quant_q4k(w):
     dd = d * is_
     mm = dmin * im_
     q = np.clip(np.rint((xb + mm) / dd), 0, 15).astype(np.uint8)
-    qs = (q[:, :, 0::2] & 0xF) | ((q[:, :, 1::2] & 0xF) << 4)  # [nb,8,16]
+    qs = (q[:, 0::2, :] & 0xF) | ((q[:, 1::2, :] & 0xF) << 4)  # [nb,4,32] ggml order
     sc = np.zeros((nb, 12), dtype=np.uint8)
     d6 = is_.astype(np.uint8).reshape(nb, 8)
     m6 = im_.astype(np.uint8).reshape(nb, 8)

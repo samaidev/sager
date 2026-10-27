@@ -17,16 +17,25 @@ void dequant_row(const BlockQ4K* blocks, float* out, int n) {
     const float d = half_to_float(bl.d);
     const float dmin = half_to_float(bl.dmin);
     float* ob = out + static_cast<size_t>(b) * kQK_K;
-    for (int s = 0; s < kNumSubBlocks; ++s) {
-      uint8_t d6, m6;
-      get_scale_min_k4(s, bl.scales, &d6, &m6);
-      const float sd = d * static_cast<float>(d6);
-      const float sm = dmin * static_cast<float>(m6);
-      const uint8_t* qs = bl.qs + s * (kQK / 2);
-      float* os = ob + s * kQK;
-      for (int j = 0; j < kQK / 2; ++j) {
-        os[2 * j]     = sd * static_cast<float>(qs[j] & 0xF) - sm;
-        os[2 * j + 1] = sd * static_cast<float>(qs[j] >> 4) - sm;
+    // ggml Q4_K nibble order (v0.12 fix): the 128 qs bytes split into four
+    // 32-byte groups; group g's LOW nibbles are sub-block 2g (weights
+    // 64g..64g+31) and its HIGH nibbles are sub-block 2g+1 (weights
+    // 64g+32..64g+63). The previous adjacent-pair reading was Q4_0 semantics
+    // and silently permuted every community/llama.cpp-converted Q4_K file.
+    for (int g = 0; g < kNumSubBlocks / 2; ++g) {
+      const uint8_t* q = bl.qs + g * 32;
+      uint8_t d0, m0, d1, m1;
+      get_scale_min_k4(2 * g, bl.scales, &d0, &m0);
+      get_scale_min_k4(2 * g + 1, bl.scales, &d1, &m1);
+      const float sd0 = d * static_cast<float>(d0);
+      const float sm0 = dmin * static_cast<float>(m0);
+      const float sd1 = d * static_cast<float>(d1);
+      const float sm1 = dmin * static_cast<float>(m1);
+      float* o0 = ob + g * 64;
+      float* o1 = o0 + kQK;
+      for (int l = 0; l < 32; ++l) {
+        o0[l] = sd0 * static_cast<float>(q[l] & 0xF) - sm0;
+        o1[l] = sd1 * static_cast<float>(q[l] >> 4) - sm1;
       }
     }
   }
@@ -59,6 +68,7 @@ void quantize_row_q8_K(const float* x, BlockQ8K* out, int n) {
 std::vector<BlockQ4K> quantize_row(const float* x, int n) {
   const int nb = n / kQK_K;
   std::vector<BlockQ4K> out(static_cast<size_t>(nb));
+  uint8_t codes[kNumSubBlocks][kQK];
 
   auto eval_err = [](const float* sb, float dd, float mm) {
     const float id = dd > 0.f ? 1.f / dd : 0.f;
@@ -77,6 +87,7 @@ std::vector<BlockQ4K> quantize_row(const float* x, int n) {
     const float* xb = x + static_cast<size_t>(b) * kQK_K;
     BlockQ4K& bl = out[static_cast<size_t>(b)];
     std::memset(&bl, 0, sizeof(bl));
+    std::memset(codes, 0, sizeof(codes));
 
     // Super scale: max sub-block (max-min) amplitude keeps 6-bit scales in range.
     float max_abs = 1e-30f;
@@ -136,20 +147,27 @@ std::vector<BlockQ4K> quantize_row(const float* x, int n) {
         }
       }
 
-      // Final encode with the winning (d_s, m_s), clamped nibble pack.
+      // Final encode with the winning (d_s, m_s): keep the 32 codes; the
+      // ggml-order byte pack happens after all sub-blocks are quantized.
       const float bd = d * static_cast<float>(b_is);
       const float bm = dmin * static_cast<float>(b_im);
       const float id = bd > 0.f ? 1.f / bd : 0.f;
-      uint8_t* qs = bl.qs + s * (kQK / 2);
-      for (int j = 0; j < kQK / 2; ++j) {
-        const int q0 = std::max(0, std::min(15, static_cast<int>(
-            std::nearbyint((sb[2 * j] + bm) * id))));
-        const int q1 = std::max(0, std::min(15, static_cast<int>(
-            std::nearbyint((sb[2 * j + 1] + bm) * id))));
-        qs[j] = static_cast<uint8_t>((q0 & 0xF) | ((q1 & 0xF) << 4));
+      for (int j = 0; j < kQK; ++j) {
+        codes[s][j] = static_cast<uint8_t>(std::max(0, std::min(15,
+            static_cast<int>(std::nearbyint((sb[j] + bm) * id)))));
       }
       set_scale_min_k4(s, bl.scales, static_cast<uint8_t>(b_is),
                        static_cast<uint8_t>(b_im));
+    }
+
+    // ggml Q4_K byte pack: group g's 32 bytes carry sub-block 2g in the LOW
+    // nibbles and sub-block 2g+1 in the HIGH nibbles (one weight per byte).
+    for (int g = 0; g < kNumSubBlocks / 2; ++g) {
+      uint8_t* q = bl.qs + g * 32;
+      for (int l = 0; l < 32; ++l) {
+        q[l] = static_cast<uint8_t>((codes[2 * g][l] & 0xF) |
+                                    ((codes[2 * g + 1][l] & 0xF) << 4));
+      }
     }
   }
   return out;
@@ -163,19 +181,26 @@ float vec_dot_ref(const BlockQ4K* w, const BlockQ8K* x, int n) {
     const BlockQ8K& xb = x[b];
     const float d = half_to_float(bl.d);
     const float dmin = half_to_float(bl.dmin);
-    for (int s = 0; s < kNumSubBlocks; ++s) {
-      uint8_t d6, m6;
-      get_scale_min_k4(s, bl.scales, &d6, &m6);
-      const float sd = d * static_cast<float>(d6);
-      const float sm = dmin * static_cast<float>(m6);
-      const uint8_t* qs = bl.qs + s * (kQK / 2);
-      int psum = 0;
-      for (int j = 0; j < kQK / 2; ++j) {
-        psum += (qs[j] & 0xF) * xb.qs[s * kQK + 2 * j];
-        psum += (qs[j] >> 4) * xb.qs[s * kQK + 2 * j + 1];
+    // ggml Q4_K order: group g = one 32-byte chunk, low nibbles -> sub-block
+    // 2g, high nibbles -> sub-block 2g+1 (mirrors dequant_row).
+    for (int g = 0; g < kNumSubBlocks / 2; ++g) {
+      const uint8_t* q = bl.qs + g * 32;
+      uint8_t d0, m0, d1, m1;
+      get_scale_min_k4(2 * g, bl.scales, &d0, &m0);
+      get_scale_min_k4(2 * g + 1, bl.scales, &d1, &m1);
+      const float sd0 = d * static_cast<float>(d0);
+      const float sm0 = dmin * static_cast<float>(m0);
+      const float sd1 = d * static_cast<float>(d1);
+      const float sm1 = dmin * static_cast<float>(m1);
+      int p0 = 0, p1 = 0;
+      for (int l = 0; l < 32; ++l) {
+        p0 += (q[l] & 0xF) * xb.qs[g * 64 + l];
+        p1 += (q[l] >> 4) * xb.qs[g * 64 + 32 + l];
       }
-      acc += xb.d * (sd * static_cast<float>(psum) -
-                     sm * static_cast<float>(xb.bsums[s]));
+      acc += xb.d * (sd0 * static_cast<float>(p0) -
+                     sm0 * static_cast<float>(xb.bsums[2 * g]));
+      acc += xb.d * (sd1 * static_cast<float>(p1) -
+                     sm1 * static_cast<float>(xb.bsums[2 * g + 1]));
     }
   }
   return acc;

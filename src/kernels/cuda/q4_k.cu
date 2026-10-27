@@ -30,28 +30,23 @@ __device__ __forceinline__ void unpack_scales6(const uint8_t* sc, int s,
   *sm = dmin * static_cast<float>(m6);
 }
 
-// One sub-block (32 weights = 16 qs bytes) dot via 8 dp4a; returns int dot.
-// Each iteration: 2 bytes of nibbles (4 weights, low nibble first) x 4 int8s.
-__device__ __forceinline__ int dp4a_subblock(const uint8_t* qs16,
-                                             const int8_t* xq32) {
+// One sub-block (32 weights) dot via 8 dp4a; returns int dot.
+// ggml Q4_K nibble order (v0.12 fix): sub-block sb's 32 weights live in the
+// 32-byte group sb>>1 - LOW nibbles for even sb, HIGH nibbles for odd sb
+// (one weight per byte). The previous adjacent-pair reading was Q4_0
+// semantics and permuted every llama.cpp-converted Q4_K file.
+__device__ __forceinline__ int dp4a_subblock(const uint8_t* qs32,
+                                             const int8_t* xq32, int side) {
   int acc_i = 0;
+  const int shift = side * 4;
   #pragma unroll
   for (int i = 0; i < 8; ++i) {
-    const uint32_t raw = *reinterpret_cast<const uint16_t*>(qs16 + i * 2);
+    const uint32_t raw = *reinterpret_cast<const uint32_t*>(qs32 + i * 4);
+    // one 0..15 nibble per byte; unsigned int8 view is exact, while the
+    // int8 activation bytes MUST be read as signed (the unsigned overload
+    // would corrupt every negative activation).
+    const uint32_t wpack = (raw >> shift) & 0x0F0F0F0Fu;
     const uint32_t xpack = *reinterpret_cast<const uint32_t*>(xq32 + i * 4);
-    // nibbles: even index = low nibble, odd = high nibble of each byte.
-    // Restore natural order w0,w1,w2,w3 within each 4-weight group.
-    const int w0 = static_cast<int>(raw & 0xFu);
-    const int w1 = static_cast<int>((raw >> 4) & 0xFu);
-    const int w2 = static_cast<int>((raw >> 8) & 0xFu);
-    const int w3 = static_cast<int>((raw >> 12) & 0xFu);
-    const uint32_t wpack = static_cast<uint32_t>(w0) |
-                           (static_cast<uint32_t>(w1) << 8) |
-                           (static_cast<uint32_t>(w2) << 16) |
-                           (static_cast<uint32_t>(w3) << 24);
-    // Cast to int: nibble bytes are 0..15 so signed interpretation is exact,
-    // while the int8 activation bytes MUST be read as signed. The unsigned
-    // overload would corrupt every negative activation.
     acc_i = __dp4a(static_cast<int>(wpack), static_cast<int>(xpack), acc_i);
   }
   return acc_i;
@@ -82,7 +77,8 @@ __global__ void gemv_q4_k_q8_kernel(const q4k::BlockQ4K* __restrict__ w,
     const float dmin = __half2float(*reinterpret_cast<const __half*>(&b.dmin));
     float sd, sm;
     unpack_scales6(b.scales, sb, d, dmin, &sd, &sm);
-    const int dot = dp4a_subblock(b.qs + sb * 16, xb.qs + sb * 32);
+    const int dot = dp4a_subblock(b.qs + (sb >> 1) * 32, xb.qs + sb * 32,
+                                  sb & 1);
     const float xsum = static_cast<float>(xb.bsums[sb]);
     acc += xb.d * (sd * static_cast<float>(dot) - sm * xsum);
   }
@@ -173,7 +169,8 @@ __global__ void gemv_q4_k_q8_f16_kernel(const q4k::BlockQ4K* __restrict__ w,
     const float dmin = __half2float(*reinterpret_cast<const __half*>(&b.dmin));
     float sd, sm;
     unpack_scales6(b.scales, sb, d, dmin, &sd, &sm);
-    const int dot = dp4a_subblock(b.qs + sb * 16, xb.qs + sb * 32);
+    const int dot = dp4a_subblock(b.qs + (sb >> 1) * 32, xb.qs + sb * 32,
+                                  sb & 1);
     acc += xb.d * (sd * static_cast<float>(dot) -
                    sm * static_cast<float>(xb.bsums[sb]));
   }
@@ -205,7 +202,8 @@ __global__ void gemv_ptrs_q4_k_q8_f16_kernel(
     const float dmin = __half2float(*reinterpret_cast<const __half*>(&b.dmin));
     float sd, sm;
     unpack_scales6(b.scales, sb, d, dmin, &sd, &sm);
-    const int dot = dp4a_subblock(b.qs + sb * 16, xb.qs + sb * 32);
+    const int dot = dp4a_subblock(b.qs + (sb >> 1) * 32, xb.qs + sb * 32,
+                                  sb & 1);
     acc += xb.d * (sd * static_cast<float>(dot) -
                    sm * static_cast<float>(xb.bsums[sb]));
   }
@@ -238,7 +236,8 @@ __global__ void gemv_q4_k_q8_f16_batched_kernel(
     const float dmin = __half2float(*reinterpret_cast<const __half*>(&b.dmin));
     float sd, sm;
     unpack_scales6(b.scales, sb, d, dmin, &sd, &sm);
-    const int dot = dp4a_subblock(b.qs + sb * 16, xb.qs + sb * 32);
+    const int dot = dp4a_subblock(b.qs + (sb >> 1) * 32, xb.qs + sb * 32,
+                                  sb & 1);
     acc += xb.d * (sd * static_cast<float>(dot) -
                    sm * static_cast<float>(xb.bsums[sb]));
   }
@@ -272,7 +271,8 @@ __global__ void gemv_q4_k_q8_batched_kernel(const q4k::BlockQ4K* __restrict__ w,
     const float dmin = __half2float(*reinterpret_cast<const __half*>(&b.dmin));
     float sd, sm;
     unpack_scales6(b.scales, sb, d, dmin, &sd, &sm);
-    const int dot = dp4a_subblock(b.qs + sb * 16, xb.qs + sb * 32);
+    const int dot = dp4a_subblock(b.qs + (sb >> 1) * 32, xb.qs + sb * 32,
+                                  sb & 1);
     acc += xb.d * (sd * static_cast<float>(dot) -
                    sm * static_cast<float>(xb.bsums[sb]));
   }
@@ -400,7 +400,8 @@ __global__ void gemv_q4_k_q8_f16out_mtok_kernel(
           __half2float(*reinterpret_cast<const __half*>(&b.dmin));
       float sd, sm;
       unpack_scales6(b.scales, sb, d, dmin, &sd, &sm);
-      const int dot = dp4a_subblock(b.qs + sb * 16, xb_row[blk].qs + sb * 32);
+      const int dot = dp4a_subblock(b.qs + (sb >> 1) * 32, xb_row[blk].qs + sb * 32,
+                                 sb & 1);
       acc += xb_row[blk].d * (sd * static_cast<float>(dot) -
                       sm * static_cast<float>(xb_row[blk].bsums[sb]));
     }
@@ -466,7 +467,8 @@ __global__ void gemv2_q4_k_q8_f16out_mtok_kernel(
       float sd, sm;
       unpack_scales6(wg_sh[blk].scales, sb, d, dmin, &sd, &sm);
       const int dotg =
-          dp4a_subblock(wg_sh[blk].qs + sb * 16, xb_row[blk].qs + sb * 32);
+          dp4a_subblock(wg_sh[blk].qs + (sb >> 1) * 32,
+                               xb_row[blk].qs + sb * 32, sb & 1);
       accg += xb_row[blk].d * (sd * static_cast<float>(dotg) -
                           sm * static_cast<float>(xb_row[blk].bsums[sb]));
       const float d2 = __half2float(*reinterpret_cast<const __half*>(&wu_sh[blk].d));
@@ -474,7 +476,8 @@ __global__ void gemv2_q4_k_q8_f16out_mtok_kernel(
           __half2float(*reinterpret_cast<const __half*>(&wu_sh[blk].dmin));
       unpack_scales6(wu_sh[blk].scales, sb, d2, dmin2, &sd, &sm);
       const int dotu =
-          dp4a_subblock(wu_sh[blk].qs + sb * 16, xb_row[blk].qs + sb * 32);
+          dp4a_subblock(wu_sh[blk].qs + (sb >> 1) * 32,
+                               xb_row[blk].qs + sb * 32, sb & 1);
       accu += xb_row[blk].d * (sd * static_cast<float>(dotu) -
                           sm * static_cast<float>(xb_row[blk].bsums[sb]));
     }
@@ -548,7 +551,8 @@ __global__ void gemv_grouped2_q4_k_q8_f16out_mtok_kernel(
       float sd, sm;
       unpack_scales6(wg_sh[blk].scales, sb, d, dmin, &sd, &sm);
       const int dotg =
-          dp4a_subblock(wg_sh[blk].qs + sb * 16, xb_row[blk].qs + sb * 32);
+          dp4a_subblock(wg_sh[blk].qs + (sb >> 1) * 32,
+                               xb_row[blk].qs + sb * 32, sb & 1);
       accg += xb_row[blk].d * (sd * static_cast<float>(dotg) -
                        sm * static_cast<float>(xb_row[blk].bsums[sb]));
       const float d2 = __half2float(*reinterpret_cast<const __half*>(&wu_sh[blk].d));
@@ -556,7 +560,8 @@ __global__ void gemv_grouped2_q4_k_q8_f16out_mtok_kernel(
           __half2float(*reinterpret_cast<const __half*>(&wu_sh[blk].dmin));
       unpack_scales6(wu_sh[blk].scales, sb, d2, dmin2, &sd, &sm);
       const int dotu =
-          dp4a_subblock(wu_sh[blk].qs + sb * 16, xb_row[blk].qs + sb * 32);
+          dp4a_subblock(wu_sh[blk].qs + (sb >> 1) * 32,
+                               xb_row[blk].qs + sb * 32, sb & 1);
       accu += xb_row[blk].d * (sd * static_cast<float>(dotu) -
                        sm * static_cast<float>(xb_row[blk].bsums[sb]));
     }
@@ -622,7 +627,8 @@ __global__ void gemv_grouped_q4_k_q8_f16out_mtok_kernel(
           __half2float(*reinterpret_cast<const __half*>(&b.dmin));
       float sd, sm;
       unpack_scales6(b.scales, sb, d, dmin, &sd, &sm);
-      const int dot = dp4a_subblock(b.qs + sb * 16, xb_row[blk].qs + sb * 32);
+      const int dot = dp4a_subblock(b.qs + (sb >> 1) * 32, xb_row[blk].qs + sb * 32,
+                                 sb & 1);
       acc += xb_row[blk].d * (sd * static_cast<float>(dot) -
                       sm * static_cast<float>(xb_row[blk].bsums[sb]));
     }
@@ -726,7 +732,8 @@ __global__ void gemv_grouped2_tab_q4_k_q8_f16out_mtok_kernel(
       float sd, sm;
       unpack_scales6(wg_sh[blk].scales, sb, d, dmin, &sd, &sm);
       const int dotg =
-          dp4a_subblock(wg_sh[blk].qs + sb * 16, xb_row[blk].qs + sb * 32);
+          dp4a_subblock(wg_sh[blk].qs + (sb >> 1) * 32,
+                               xb_row[blk].qs + sb * 32, sb & 1);
       accg += xb_row[blk].d * (sd * static_cast<float>(dotg) -
                        sm * static_cast<float>(xb_row[blk].bsums[sb]));
       const float d2 = __half2float(*reinterpret_cast<const __half*>(&wu_sh[blk].d));
@@ -734,7 +741,8 @@ __global__ void gemv_grouped2_tab_q4_k_q8_f16out_mtok_kernel(
           __half2float(*reinterpret_cast<const __half*>(&wu_sh[blk].dmin));
       unpack_scales6(wu_sh[blk].scales, sb, d2, dmin2, &sd, &sm);
       const int dotu =
-          dp4a_subblock(wu_sh[blk].qs + sb * 16, xb_row[blk].qs + sb * 32);
+          dp4a_subblock(wu_sh[blk].qs + (sb >> 1) * 32,
+                               xb_row[blk].qs + sb * 32, sb & 1);
       accu += xb_row[blk].d * (sd * static_cast<float>(dotu) -
                        sm * static_cast<float>(xb_row[blk].bsums[sb]));
     }
@@ -810,7 +818,8 @@ __global__ void gemv_grouped_tab_q4_k_q8_f16out_mtok_kernel(
           __half2float(*reinterpret_cast<const __half*>(&b.dmin));
       float sd, sm;
       unpack_scales6(b.scales, sb, d, dmin, &sd, &sm);
-      const int dot = dp4a_subblock(b.qs + sb * 16, xb_row[blk].qs + sb * 32);
+      const int dot = dp4a_subblock(b.qs + (sb >> 1) * 32, xb_row[blk].qs + sb * 32,
+                                 sb & 1);
       acc += xb_row[blk].d * (sd * static_cast<float>(dot) -
                       sm * static_cast<float>(xb_row[blk].bsums[sb]));
     }
@@ -846,12 +855,13 @@ __device__ __forceinline__ void mtok_g_load(const q4k::BlockQ4K& b, int sb,
   const float d = __half2float(*reinterpret_cast<const __half*>(&b.d));
   const float dmin = __half2float(*reinterpret_cast<const __half*>(&b.dmin));
   unpack_scales6(b.scales, sb, d, dmin, &st.sd, &st.sm);
+  // ggml Q4_K order: one 0..15 nibble per byte, group sb>>1, side sb&1.
+  const int shift = (sb & 1) * 4;
+  const uint8_t* qb = b.qs + (sb >> 1) * 32;
   #pragma unroll
   for (int i = 0; i < 8; ++i) {
-    const uint32_t raw =
-        *reinterpret_cast<const uint16_t*>(b.qs + sb * 16 + i * 2);
-    st.wp[i] = (raw & 0xFu) | ((raw & 0xF0u) << 4) | ((raw & 0xF00u) << 8) |
-               ((raw & 0xF000u) << 12);
+    const uint32_t raw = *reinterpret_cast<const uint32_t*>(qb + i * 4);
+    st.wp[i] = (raw >> shift) & 0x0F0F0F0Fu;
   }
 }
 

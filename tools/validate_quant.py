@@ -100,18 +100,23 @@ def dequant_q4_k_row(raw: bytes, n: int) -> np.ndarray:
     scales = raw[4:16]
     qs = raw[16:16 + 128]
     out = np.empty(n, dtype=np.float32)
-    for s in range(8):
-        if s < 4:
-            d6 = scales[s] & 63
-            m6 = scales[s + 4] & 63
-        else:
-            d6 = (scales[s + 4] & 0xF) | ((scales[s - 4] >> 6) << 4)
-            m6 = (scales[s + 4] >> 4) | ((scales[s] >> 6) << 4)
-        sd = d * d6
-        sm = dmin * m6
-        for j in range(16):
-            out[s * 32 + 2 * j] = sd * (qs[s * 16 + j] & 0xF) - sm
-            out[s * 32 + 2 * j + 1] = sd * (qs[s * 16 + j] >> 4) - sm
+    # ggml Q4_K order (v0.12 fix): group g's 32 bytes - LOW nibbles are
+    # sub-block 2g (weights 64g..64g+31), HIGH nibbles are sub-block 2g+1.
+    for g in range(4):
+        d6 = {}
+        m6 = {}
+        for s in (2 * g, 2 * g + 1):
+            if s < 4:
+                d6[s] = scales[s] & 63
+                m6[s] = scales[s + 4] & 63
+            else:
+                d6[s] = (scales[s + 4] & 0xF) | ((scales[s - 4] >> 6) << 4)
+                m6[s] = (scales[s + 4] >> 4) | ((scales[s] >> 6) << 4)
+        sd0, sm0 = d * d6[2 * g], dmin * m6[2 * g]
+        sd1, sm1 = d * d6[2 * g + 1], dmin * m6[2 * g + 1]
+        for l in range(32):
+            out[g * 64 + l] = sd0 * (qs[g * 32 + l] & 0xF) - sm0
+            out[g * 64 + 32 + l] = sd1 * (qs[g * 32 + l] >> 4) - sm1
     return out
 
 

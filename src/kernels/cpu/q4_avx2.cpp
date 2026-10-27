@@ -58,9 +58,10 @@ void gemv_q4_k_q8_scalar(const q4k::BlockQ4K* w, const q4k::BlockQ8K* x,
       float sum = 0.f;
       for (int s = 0; s < 8; ++s) {
         float psum = 0.f;
+        const uint8_t* qb = b.qs + (s >> 1) * 32;
         for (int j = 0; j < q4k::kQK; ++j) {
           const int idx = s * q4k::kQK + j;
-          const int nib = (idx & 1) ? (b.qs[idx >> 1] >> 4) : (b.qs[idx >> 1] & 0xF);
+          const int nib = (s & 1) ? (qb[j] >> 4) : (qb[j] & 0xF);
           psum += static_cast<float>(nib) * static_cast<float>(xb.qs[idx]);
         }
         sum += xb.d * (sd[s] * psum - sm[s] * sub_sum8(xb, s));
@@ -93,21 +94,17 @@ void quantize_row_q8_k_avx2(const float* x, q4k::BlockQ8K* out, int n) {
 }
 
 // One sub-block (32 weights) dot with exact scale handling.
-// qs bytes (16) hold the nibbles: low nibble = even index, high = odd index.
-// We restore natural lane order with two byte interleaves, then use
-// maddubs (u8*s8 -> s16 pairs) exactly like the on-device kernel.
-static inline float dot_subblock_avx2(const uint8_t* qs16,
+// ggml Q4_K order (v0.12 fix): one weight per byte - the 32-byte group
+// sb>>1, LOW nibbles for even sb, HIGH for odd sb - selected by 'side'.
+static inline float dot_subblock_avx2(const uint8_t* qs32,
                                       const int8_t* xq32,
                                       float sd, float sm, float xd,
-                                      float xsum) {
-  const __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qs16));
-  const __m128i lowMask = _mm_set1_epi8(0x0F);
-  const __m128i lo = _mm_and_si128(raw, lowMask);                       // w0,w2,...
-  const __m128i hi = _mm_and_si128(_mm_srli_epi16(raw, 4), lowMask);    // w1,w3,...
-  // natural order: [w0..w15] and [w16..w31]
-  const __m128i w_lo = _mm_unpacklo_epi8(lo, hi);
-  const __m128i w_hi = _mm_unpackhi_epi8(lo, hi);
-  const __m256i w = _mm256_set_m128i(w_hi, w_lo);                       // 32 u8 lanes
+                                      float xsum, int side) {
+  const __m256i raw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qs32));
+  const __m256i lowMask = _mm256_set1_epi8(0x0F);
+  const __m256i w = side
+      ? _mm256_and_si256(_mm256_srli_epi16(raw, 4), lowMask)   // high nibbles
+      : _mm256_and_si256(raw, lowMask);                        // low nibbles
   const __m256i xv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xq32));
   const __m256i p = _mm256_maddubs_epi16(w, xv);                        // 16 x s16 pairs
 
@@ -137,9 +134,9 @@ void gemv_q4_k_q8_avx2(const q4k::BlockQ4K* w, const q4k::BlockQ8K* x,
       unpack_scales(b, sd, sm);
       float sum = 0.f;
       for (int s = 0; s < 8; ++s) {
-        sum += dot_subblock_avx2(b.qs + s * 16, xb.qs + s * q4k::kQK,
+        sum += dot_subblock_avx2(b.qs + (s >> 1) * 32, xb.qs + s * q4k::kQK,
                                  sd[s], sm[s], xb.d,
-                                 static_cast<float>(xb.bsums[s]));
+                                 static_cast<float>(xb.bsums[s]), s & 1);
       }
       acc += sum;
     }

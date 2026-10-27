@@ -51,12 +51,14 @@ __device__ __forceinline__ void mmq_g_load(const q4k::BlockQ4K& b, int sb,
   const float d = __half2float(*reinterpret_cast<const __half*>(&b.d));
   const float dmin = __half2float(*reinterpret_cast<const __half*>(&b.dmin));
   mmq_unpack_scales6(b.scales, sb, d, dmin, &st.sd, &st.sm);
+  // ggml Q4_K order (v0.12 fix): one 0..15 nibble per byte, group sb>>1,
+  // LOW nibbles for even sb / HIGH for odd sb.
+  const int shift = (sb & 1) * 4;
+  const uint8_t* qb = b.qs + (sb >> 1) * 32;
   #pragma unroll
   for (int i = 0; i < 8; ++i) {
-    const uint32_t raw =
-        *reinterpret_cast<const uint16_t*>(b.qs + sb * 16 + i * 2);
-    st.wp[i] = (raw & 0xFu) | ((raw & 0xF0u) << 4) | ((raw & 0xF00u) << 8) |
-               ((raw & 0xF000u) << 12);
+    const uint32_t raw = *reinterpret_cast<const uint32_t*>(qb + i * 4);
+    st.wp[i] = (raw >> shift) & 0x0F0F0F0Fu;
   }
 }
 

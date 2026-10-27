@@ -14,10 +14,16 @@
 //   12 bytes scales   : 8 sub-block 6-bit scales (d) interleaved with 8 x 6-bit
 //                       mins (m), packed in the standard K-quant bit order
 //                       (see scales_pack/scales_unpack below)
-//   128 bytes qs      : 8 sub-blocks x 32 x 4-bit codes (low nibble first)
+//   128 bytes qs      : four 32-byte groups; group g's LOW nibbles are
+//                       sub-block 2g (weights 64g..64g+31) and its HIGH
+//                       nibbles are sub-block 2g+1 (weights 64g+32..64g+63) -
+//                       ggml Q4_K order, one weight per byte
 //
 // Reconstruction: w[i] = sub_d[b] * q[i] - sub_m[b],  b = i / 32
 //   sub_d[b] = d * scales[b], sub_m[b] = dmin * mins[b]
+// v0.12: dequant/quantize/kernels were corrected from an adjacent-pair
+// (Q4_0-style) reading to this ggml order - byte-compatible with
+// llama.cpp-converted Q4_K files (verified vs bf16 ground truth, cos 0.996).
 #pragma once
 
 #include <cstdint>

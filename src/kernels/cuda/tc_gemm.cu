@@ -72,23 +72,26 @@ __device__ __forceinline__ void dequant_q4k_u4(const uint8_t* base, int u4r,
   const int q = u4r & 3;                 // quarter of it: 8 weights
   float sd, sm;
   unpack_scales6_tc(sc, sb, d, dmin, &sd, &sm);
-  const int qi = sb * (q4k::kQK / 2) + q * 4;
-  const unsigned word =
-      *reinterpret_cast<const unsigned*>(base + (q4k::kQK_K / 16) + qi);
-  const unsigned n0 = (word >> 0) & 0xFFu, n1 = (word >> 8) & 0xFFu;
-  const unsigned n2 = (word >> 16) & 0xFFu, n3 = (word >> 24) & 0xFFu;
-  // byte j -> halves {2j, 2j+1} = (low nibble, high nibble), matching the
-  // reference kernel's buf[2*j] / buf[2*j+1] layout.
+  // ggml Q4_K order (v0.12 fix): sub-block sb's 32 weights sit in the 32-byte
+  // group sb>>1 - LOW nibbles for even sb, HIGH for odd sb (one weight per
+  // byte). This thread's 8 weights are the q-th octet of the sub-block; the
+  // linear store property is preserved (weight w still lands at out[w]).
+  const int shift = (sb & 1) * 4;
+  const uint8_t* qb =
+      base + (q4k::kQK_K / 16) + (sb >> 1) * 32 + q * 8;
+  const unsigned w0 = *reinterpret_cast<const unsigned*>(qb);
+  const unsigned w1 = *reinterpret_cast<const unsigned*>(qb + 4);
   union H2U { __half2 h; unsigned u; };
-  auto pk_half = [&](unsigned byte) -> unsigned {
-    H2U c;
-    c.h = __halves2half2(
-        __float2half(sd * static_cast<float>(byte & 0xF) - sm),
-        __float2half(sd * static_cast<float>(byte >> 4) - sm));
-    return c.u;
+  auto nib_half = [&](unsigned byte) -> __half {
+    return __float2half(
+        sd * static_cast<float>((byte >> shift) & 0xF) - sm);
   };
-  reinterpret_cast<uint4*>(out)[0] =
-      make_uint4(pk_half(n0), pk_half(n1), pk_half(n2), pk_half(n3));
+  H2U p0, p1, p2, p3;
+  p0.h = __halves2half2(nib_half(w0 & 0xFFu), nib_half((w0 >> 8) & 0xFFu));
+  p1.h = __halves2half2(nib_half((w0 >> 16) & 0xFFu), nib_half((w0 >> 24) & 0xFFu));
+  p2.h = __halves2half2(nib_half(w1 & 0xFFu), nib_half((w1 >> 8) & 0xFFu));
+  p3.h = __halves2half2(nib_half((w1 >> 16) & 0xFFu), nib_half((w1 >> 24) & 0xFFu));
+  reinterpret_cast<uint4*>(out)[0] = make_uint4(p0.u, p1.u, p2.u, p3.u);
 }
 
 __global__ void dequant_q4_k_f16_kernel(const q4k::BlockQ4K* __restrict__ w,

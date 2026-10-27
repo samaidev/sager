@@ -73,6 +73,7 @@ def quantize_q4_k_row(x: np.ndarray) -> bytes:
         dmin = d
         block = bytearray(4 + 12 + 128)
         struct.pack_into("<HH", block, 0, int(_fp16(d)), int(_fp16(dmin)))
+        codes = [np.zeros(QK, dtype=np.uint8) for _ in range(8)]
         for s in range(8):
             sb = xb[s * QK:(s + 1) * QK]
             mn, mx = float(sb.min()), float(sb.max())
@@ -104,10 +105,13 @@ def quantize_q4_k_row(x: np.ndarray) -> bytes:
                         best, b_is, b_im = e, is_, im
             _set_scale(block[4:], s, b_is, b_im)
             dd, mm = d * b_is, dmin * b_im
-            q = np.clip(np.rint((sb + mm) / dd), 0, 15).astype(np.uint8)
-            qs = bytes((q[2 * j] & 0xF) | ((q[2 * j + 1] & 0xF) << 4)
-                       for j in range(16))
-            block[16 + s * 16:16 + (s + 1) * 16] = qs
+            codes[s] = np.clip(np.rint((sb + mm) / dd), 0, 15).astype(np.uint8)
+        # ggml Q4_K byte pack (v0.12 fix): group g's 32 bytes carry sub-block
+        # 2g in the LOW nibbles and sub-block 2g+1 in the HIGH nibbles.
+        for g in range(4):
+            block[16 + g * 32:16 + (g + 1) * 32] = bytes(
+                (codes[2 * g][l] & 0xF) | ((codes[2 * g + 1][l] & 0xF) << 4)
+                for l in range(32))
         out += block
     return bytes(out)
 
@@ -152,7 +156,8 @@ def quantize_q4_k_fast(w: np.ndarray) -> bytes:
     dd = d * is_
     mm = dmin * im_
     q = np.clip(np.rint((xb + mm) / dd), 0, 15).astype(np.uint8)
-    qs = (q[:, :, 0::2] & 0xF) | ((q[:, :, 1::2] & 0xF) << 4)
+    # ggml Q4_K byte pack (v0.12 fix): group g = sub-block 2g low | 2g+1 high.
+    qs = (q[:, 0::2, :] & 0xF) | ((q[:, 1::2, :] & 0xF) << 4)   # [nb,4,32]
     sc = np.zeros((nb, 12), dtype=np.uint8)
     d6 = is_.astype(np.uint8).reshape(nb, 8)
     m6 = im_.astype(np.uint8).reshape(nb, 8)
