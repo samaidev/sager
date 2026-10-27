@@ -966,6 +966,26 @@ static void dbg_dump_f16(const char* tag, const uint16_t* dev, size_t off,
   fprintf(stderr, "[sager/dbg] %-18s sum|x|=%.4f max|x|=%.4f nan=%d\n",
           tag, sabs, mx, nans);
 }
+// v0.12 debug: fp32 variant (route logits / combine weights).
+static void dbg_dump_f32(const char* tag, const float* dev, size_t off,
+                         int cnt, cudaStream_t s) {
+  static std::vector<float> buf;
+  if (buf.size() < static_cast<size_t>(cnt)) buf.resize(static_cast<size_t>(cnt));
+  cudaMemcpyAsync(buf.data(), dev + off, static_cast<size_t>(cnt) * sizeof(float),
+                  cudaMemcpyDeviceToHost, s);
+  cudaStreamSynchronize(s);
+  float sabs = 0.f, mx = 0.f;
+  int nans = 0;
+  for (int i = 0; i < cnt; ++i) {
+    const float v = buf[i];
+    if (std::isnan(v)) ++nans;
+    sabs += fabsf(v);
+    mx = fmaxf(mx, fabsf(v));
+  }
+  fprintf(stderr, "[sager/dbg] %-18s sum=%.4f max=%.4f nan=%d v0-5=%.4g/%.4g/%.4g/%.4g/%.4g/%.4g\n",
+          tag, sabs, mx, nans, buf[0], buf[1 % cnt], buf[2 % cnt],
+          buf[3 % cnt], buf[4 % cnt], buf[5 % cnt]);
+}
 #endif
 
 void Session::linear_layer_chunk(int layer, int n) {
@@ -2092,6 +2112,13 @@ void Session::moe_dispatch_device(int layer, int n) {
   }
   cuda::router_topk_batched(route_logits_.get(), route_idx_.get(),
                             route_w_.get(), E, K, K + 1, n, s);
+  // v0.12 debug: router health on the first MoE layer (SAGER_DUMP_LOGITS=2)
+  if (dbg_layers_ && layer == 0 && !capturing) {
+    dbg_dump_f32("route_logits0", route_logits_.get(),
+                 static_cast<size_t>(n - 1) * E, 16, s);
+    dbg_dump_f32("route_w0", route_w_.get(),
+                 static_cast<size_t>(n - 1) * (K + 1), K + 1, s);
+  }
   (void)dec_fuse_;
   if (capturing) {
     cudaMemcpyAsync(d_route_w_all_.get() +
