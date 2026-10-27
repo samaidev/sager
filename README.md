@@ -39,7 +39,48 @@ Sage-A1.5 is a HYBRID (config.json: `full_attention_interval=4`, 40 blocks → *
 
 KV is now allocated only for the 10 full-attention layers (GDN layers keep fixed-size recurrence state — ~60 MB total instead of hundreds of MB of KV).
 
-## v0.8: prefill MMQ GEMM + decode fusions + GDN ffn-norm fix (NEWEST)
+## v0.11: flash-tile GQA attention + split-KV flash decode (NEWEST)
+
+Measured on one Tesla T4, protocol-matched binary A/B (bench_v8, medians of 3,
+parity gate IDENTICAL), full details in [BENCH_RESULTS_v011.md](BENCH_RESULTS_v011.md):
+
+| metric | v0.10 (same VM) | v0.11 | speedup | vs v0.8 published |
+|---|---|---|---|---|
+| prefill pp512 | 727.4 tok/s | **823.8 tok/s** | 1.13x | **3.35x** |
+| prefill pp2048 | 518.3 tok/s | **731.9 tok/s** | **1.41x** | **3.35x** |
+| decode tg128 | 26.00 tok/s | **33.30 tok/s** | **1.28x** | 1.22x |
+
+8. **Flash-tile prefill attention** (`SAGER_ATTN_NEW=1`, default): block =
+   (kv group, token), 8 warps share one staged 16-row K/V tile, Q8 KV
+   dequantized once per block instead of once per (token, head) warp, q in
+   registers, expf once per (row, warp). nsys: attention 2836 -> 1056 ms
+   (2.69x) over two 2048-token prefills, 39% -> 20% of GPU time.
+9. **Split-KV flash decode**: fixed (n_head, 64) graph-safe grid, blocks
+   self-range on device, warp-interleaved online-softmax partials + merge
+   kernel. Decode attention: ms-scale -> ~16 us/step. Also **fixes a latent
+   v0.10 accumulator overflow** for head_dim=256 (see numerics notes in
+   BENCH_RESULTS_v011.md - greedy streams change vs v0.10; pre-v0.11
+   attention dims 128..255 carried partially undefined values).
+10. Real model dims discovered: h=16, kvh=2, head_dim=256 (one-shot stderr
+    diagnostic prints the dispatch decision).
+
+## v0.9 + v0.10: tensor-core prefill (dense + MoE grouped GEMM)
+
+| metric | v0.8 | v0.9 | v0.10 |
+|---|---|---|---|
+| prefill pp512 | 245.6 | 387.0 | 785.5 tok/s |
+| prefill pp2048 | 218.8 | 316.6 | 559.5 tok/s |
+| decode tg128 | 29.36 | 27.70 | 27.31 tok/s |
+
+- v0.9: `SAGER_PF_TC=1` (default) - dense Q4_K projections dequantize once
+  per chunk into fp16 and run cuBLAS GemmEx tensor-core GEMMs; dp4a fallback
+  preserved. Details in [BENCH_RESULTS_v09.md](BENCH_RESULTS_v09.md).
+- v0.10: `SAGER_MOE_TC=1` (default) - routed experts served by a grouped
+  TC GEMM pipeline (dequant ring + GemmEx groups of 8), zero new VRAM;
+  MoE expert math 3.12x, pp2048 +77% over v0.9. Details in
+  [BENCH_RESULTS_v010.md](BENCH_RESULTS_v010.md).
+
+## v0.8: prefill MMQ GEMM + decode fusions + GDN ffn-norm fix
 
 Measured on the same T4 (Sage-A1.5-Q4_K_M, branch v0.8-opt, warm pool):
 
