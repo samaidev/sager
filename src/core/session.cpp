@@ -991,6 +991,23 @@ static void dbg_dump_f16(const char* tag, const uint16_t* dev, size_t off,
   fprintf(stderr, "[sager/dbg] %-18s sum|x|=%.4f max|x|=%.4f nan=%d\n",
           tag, sabs, mx, nans);
 }
+// v0.12 debug: write one full fp16 row to <prefix>_<tag>_L<layer>.bin
+static void dbg_write_row(const char* tag, const uint16_t* dev, size_t off,
+                          int cnt, int layer, cudaStream_t s) {
+  const char* prefix = std::getenv("SAGER_DBG_DUMP_ROW");
+  if (!prefix || layer != 0) return;
+  static std::vector<uint16_t> buf;
+  if (buf.size() < static_cast<size_t>(cnt)) buf.resize(static_cast<size_t>(cnt));
+  cudaMemcpyAsync(buf.data(), dev + off, static_cast<size_t>(cnt) * sizeof(uint16_t),
+                  cudaMemcpyDeviceToHost, s);
+  cudaStreamSynchronize(s);
+  char path[256];
+  std::snprintf(path, sizeof(path), "%s_%s_L%d.bin", prefix, tag, layer);
+  if (FILE* fp = std::fopen(path, "wb")) {
+    std::fwrite(buf.data(), 2, cnt, fp);
+    std::fclose(fp);
+  }
+}
 // v0.12 debug: fp32 variant (route logits / combine weights).
 static void dbg_dump_f32(const char* tag, const float* dev, size_t off,
                          int cnt, cudaStream_t s) {
@@ -1088,6 +1105,7 @@ void Session::linear_layer_chunk(int layer, int n) {
   if (dbg_layers_) {
     dbg_dump_f16("qkvz_proj", lin_proj_b_.get(),
                  static_cast<size_t>(n - 1) * g.proj_rows(), g.proj_rows(), s);
+    dbg_write_row("proj", lin_proj_b_.get(), static_cast<size_t>(n - 1) * g.proj_rows(), g.proj_rows(), layer, s);
   }
   // causal conv over the chunk, then commit the state tail
   cuda::gdn_conv_chunk_f16(lin_conv_b_.get(), lin_proj_b_.get(), conv_st,
@@ -1098,6 +1116,7 @@ void Session::linear_layer_chunk(int layer, int n) {
   if (dbg_layers_) {
     dbg_dump_f16("conv_out", lin_conv_b_.get(),
                  static_cast<size_t>(n - 1) * g.conv_dim(), g.conv_dim(), s);
+    dbg_write_row("conv", lin_conv_b_.get(), static_cast<size_t>(n - 1) * g.conv_dim(), g.conv_dim(), layer, s);
   }
   // data-dependent gates + per-head L2 norm, batched
   cuda::gdn_gate_chunk_f32(lin_ba_b_.get(), lw.lin_A_log, lw.lin_dt_bias,
@@ -1125,6 +1144,7 @@ void Session::linear_layer_chunk(int layer, int n) {
   if (dbg_layers_) {
     dbg_dump_f16("scan_y", lin_y_b_.get(),
                  static_cast<size_t>(n - 1) * g.y_rows(), g.y_rows(), s);
+    dbg_write_row("scan", lin_y_b_.get(), static_cast<size_t>(n - 1) * g.y_rows(), g.y_rows(), layer, s);
   }
   // output gating + out projection + residual
   cuda::gdn_out_norm_chunk_f16(lin_on_b_.get(), lin_y_b_.get(),
