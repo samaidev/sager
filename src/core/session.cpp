@@ -1105,7 +1105,7 @@ void Session::linear_layer_chunk(int layer, int n) {
   if (dbg_layers_) {
     dbg_dump_f16("qkvz_proj", lin_proj_b_.get(),
                  static_cast<size_t>(n - 1) * g.proj_rows(), g.proj_rows(), s);
-    dbg_write_row("proj", lin_proj_b_.get(), static_cast<size_t>(n - 1) * g.proj_rows(), g.proj_rows(), layer, s);
+    dbg_write_row("proj", lin_proj_b_.get(), 0, g.proj_rows() * n, layer, s);
   }
   // causal conv over the chunk, then commit the state tail
   cuda::gdn_conv_chunk_f16(lin_conv_b_.get(), lin_proj_b_.get(), conv_st,
@@ -1116,7 +1116,7 @@ void Session::linear_layer_chunk(int layer, int n) {
   if (dbg_layers_) {
     dbg_dump_f16("conv_out", lin_conv_b_.get(),
                  static_cast<size_t>(n - 1) * g.conv_dim(), g.conv_dim(), s);
-    dbg_write_row("conv", lin_conv_b_.get(), static_cast<size_t>(n - 1) * g.conv_dim(), g.conv_dim(), layer, s);
+    dbg_write_row("conv", lin_conv_b_.get(), 0, g.conv_dim() * n, layer, s);
   }
   // data-dependent gates + per-head L2 norm, batched
   cuda::gdn_gate_chunk_f32(lin_ba_b_.get(), lw.lin_A_log, lw.lin_dt_bias,
@@ -1144,7 +1144,7 @@ void Session::linear_layer_chunk(int layer, int n) {
   if (dbg_layers_) {
     dbg_dump_f16("scan_y", lin_y_b_.get(),
                  static_cast<size_t>(n - 1) * g.y_rows(), g.y_rows(), s);
-    dbg_write_row("scan", lin_y_b_.get(), static_cast<size_t>(n - 1) * g.y_rows(), g.y_rows(), layer, s);
+    dbg_write_row("scan", lin_y_b_.get(), 0, g.y_rows() * n, layer, s);
   }
   // output gating + out projection + residual
   cuda::gdn_out_norm_chunk_f16(lin_on_b_.get(), lin_y_b_.get(),
