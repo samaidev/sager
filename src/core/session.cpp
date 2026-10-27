@@ -800,6 +800,31 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
   if (!(n_tokens == 1 && dec_fuse_)) {
     cuda::add_f16(x_.get(), o_proj_.get(), n_tokens * H, s);
   }
+  // v0.12 debug: full-row dump of the post-attention residual (attention
+  // layers; same contract as the GDN chunk dump above).
+  if (dbg_layers_) {
+    static const int dbg_row_layers_a = [] {
+      const char* e = std::getenv("SAGER_DBG_ROW_LAYERS");
+      return e ? std::atoi(e) : 0;
+    }();
+    if (dbg_row_layers_a > 0 && layer < dbg_row_layers_a &&
+        n_tokens > 1) {
+      static PinnedBuffer<uint16_t> rowbuf_a;
+      if (rowbuf_a.count() < static_cast<size_t>(H))
+        rowbuf_a.alloc(static_cast<size_t>(H));
+      cudaMemcpyAsync(rowbuf_a.get(),
+                      x_.get() + static_cast<size_t>(n_tokens - 1) * H,
+                      H * sizeof(uint16_t), cudaMemcpyDeviceToHost, s);
+      stream_.sync();
+      char path[256];
+      std::snprintf(path, sizeof(path), "%s_L%d.bin",
+                    std::getenv("SAGER_DBG_DUMP_ROW"), layer);
+      if (FILE* fp = std::fopen(path, "wb")) {
+        std::fwrite(rowbuf_a.get(), 2, H, fp);
+        std::fclose(fp);
+      }
+    }
+  }
   if (dec_fuse_ && n_tokens == 1) {
     cuda::rmsnorm_quant_f16(xn_.get(), x_.get(), lw.ffn_norm, d_xq_.get(),
                             H, mc_.norm_eps, n_tokens, s);
@@ -1132,6 +1157,29 @@ void Session::linear_layer_chunk(int layer, int n) {
                  static_cast<size_t>(n - 1) * H, H, s);
     dbg_dump_f16("x_after", x_.get(),
                  static_cast<size_t>(n - 1) * H, H, s);
+  }
+  // v0.12 debug: full-row dump of the post-attention residual for the first
+  // layers (SAGER_DBG_DUMP_ROW=/prefix writes /prefix_L<layer>.bin, raw f16)
+  if (dbg_layers_) {
+    static const int dbg_row_layers = [] {
+      const char* e = std::getenv("SAGER_DBG_ROW_LAYERS");
+      return e ? std::atoi(e) : 0;
+    }();
+    if (dbg_row_layers > 0 && layer < dbg_row_layers && !capturing) {
+      static PinnedBuffer<uint16_t> rowbuf;
+      if (rowbuf.count() < static_cast<size_t>(H))
+        rowbuf.alloc(static_cast<size_t>(H));
+      cudaMemcpyAsync(rowbuf.get(), x_.get() + static_cast<size_t>(n - 1) * H,
+                      H * sizeof(uint16_t), cudaMemcpyDeviceToHost, s);
+      stream_.sync();
+      char path[256];
+      std::snprintf(path, sizeof(path), "%s_L%d.bin",
+                    std::getenv("SAGER_DBG_DUMP_ROW"), layer);
+      if (FILE* fp = std::fopen(path, "wb")) {
+        std::fwrite(rowbuf.get(), 2, H, fp);
+        std::fclose(fp);
+      }
+    }
   }
   // v0.8 FIX: the MoE half consumes ffn_norm(x) - never applied on GDN
   // layers before v0.8 (see linear_layer_launch for the full note).
