@@ -3428,6 +3428,29 @@ Status Session::forward_window(const std::vector<int>& window,
     } else {
       for (int t = 0; t < n; ++t) moe_dispatch_row(L, t);
     }
+    // v0.12 debug: after-MoE residual health (SAGER_DUMP_LOGITS=2)
+    if (dbg_layers_) {
+      static PinnedBuffer<uint16_t> dbg_m;
+      if (dbg_m.count() < static_cast<size_t>(d.hidden)) {
+        dbg_m.alloc(static_cast<size_t>(d.hidden));
+      }
+      const uint16_t* xrow2 = x_.get() +
+          static_cast<size_t>(n - 1) * d.hidden;
+      cudaMemcpyAsync(dbg_m.get(), xrow2, d.hidden * sizeof(uint16_t),
+                      cudaMemcpyDeviceToHost, s);
+      stream_.sync();
+      float sabs2 = 0.f, mx2 = 0.f;
+      int nans2 = 0;
+      for (int i = 0; i < d.hidden; ++i) {
+        const float v = __half2float(
+            *reinterpret_cast<const __half*>(&dbg_m.get()[i]));
+        if (std::isnan(v)) ++nans2;
+        sabs2 += fabsf(v);
+        mx2 = fmaxf(mx2, fabsf(v));
+      }
+      fprintf(stderr, "[sager/dbg] L=%d(%s) moe  sum|x|=%.4f max|x|=%.4f nan=%d\n",
+              L, mc_.is_linear(L) ? "gdn" : "attn", sabs2, mx2, nans2);
+    }
     if (prof.on) cudaEventRecord(fw_ev_[fw_ev_pe_++], s);
   }
   resolve_cpu_mailbox(d.n_layer - 1, n);   // force the last layer's mailbox
