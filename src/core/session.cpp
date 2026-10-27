@@ -1008,6 +1008,23 @@ static void dbg_write_row(const char* tag, const uint16_t* dev, size_t off,
     std::fclose(fp);
   }
 }
+// v0.12 debug: fp32 row writer for route weights / indices.
+static void dbg_write_row_f32(const char* tag, const void* dev, size_t off,
+                              int cnt, int layer, cudaStream_t s) {
+  const char* prefix = std::getenv("SAGER_DBG_DUMP_ROW");
+  if (!prefix || layer != 0) return;
+  static std::vector<char> buf;
+  if (buf.size() < static_cast<size_t>(cnt) * 16) buf.resize(static_cast<size_t>(cnt) * 16);
+  cudaMemcpyAsync(buf.data(), static_cast<const char*>(dev) + off,
+                  static_cast<size_t>(cnt) * 16, cudaMemcpyDeviceToHost, s);
+  cudaStreamSynchronize(s);
+  char path[256];
+  std::snprintf(path, sizeof(path), "%s_%s_L%d.bin", prefix, tag, layer);
+  if (FILE* fp = std::fopen(path, "wb")) {
+    std::fwrite(buf.data(), 16, cnt, fp);
+    std::fclose(fp);
+  }
+}
 // v0.12 debug: fp32 variant (route logits / combine weights).
 static void dbg_dump_f32(const char* tag, const float* dev, size_t off,
                          int cnt, cudaStream_t s) {
@@ -1709,6 +1726,12 @@ void Session::moe_dispatch_batched(int layer, int n) {
   }
   cuda::router_topk_batched(route_logits_.get(), route_idx_.get(),
                             route_w_.get(), E, K, K + 1, n, s);
+  if (dbg_layers_ && layer == 0) {
+    dbg_write_row_f32("routew", route_w_.get(),
+                      static_cast<size_t>(n - 1) * (K + 1), K + 1, layer, s);
+    dbg_write_row_f32("routeidx", route_idx_.get(),
+                      static_cast<size_t>(n - 1) * (K + 1), K + 1, layer, s);
+  }
 
   // 3) the ONE per-layer sync: routing decision to the host.
   cudaMemcpyAsync(h_route_idx_.get(), route_idx_.get(),
