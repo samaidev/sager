@@ -3285,6 +3285,9 @@ const float* Session::decode_step(int last_id) {
     dec_mail_ok_ = true;
     int pe = 1;
     std::fill(used_full_.begin(), used_full_.end(), 0);
+    if (dbg_layers_) {
+      dbg_dump_f16("devpath.embed", x_.get(), 0, 64, s);
+    }
     for (int L = 0; L < d.n_layer; ++L) {
       resolve_cpu_mailbox(L - 1, 1);
       // v0.6: replay the FULL layer (dense + MoE) from one graph. Absent
@@ -3308,6 +3311,11 @@ const float* Session::decode_step(int last_id) {
       if (prof.on) cudaEventRecord(prof_ev_[pe++], s);
       if (!use_full) moe_dispatch_device(L, 1);
       if (prof.on) cudaEventRecord(prof_ev_[pe++], s);
+      if (dbg_layers_ && L < 4) {
+        char tg[32];
+        std::snprintf(tg, sizeof(tg), "devpath.L%d", L);
+        dbg_dump_f16(tg, x_.get(), 0, 64, s);
+      }
     }
     if (prof.on) cudaEventRecord(prof_ev_[pe++], s);   // layers done
     resolve_cpu_mailbox(d.n_layer - 1, 1);
