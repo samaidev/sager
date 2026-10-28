@@ -775,8 +775,10 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
                  static_cast<size_t>(n_tokens - 1) * KVd, 64, s);
     dbg_dump_f16("attn.v", v_.get(),
                  static_cast<size_t>(n_tokens - 1) * KVd, 64, s);
-    dbg_dump_f16("attn.kv_k0", kv_.k_slab(0), 0, 64, s);
-    dbg_dump_f16("attn.kv_v0", kv_.v_slab(0), 0, 64, s);
+    dbg_dump_f16("attn.kv_k0",
+                 reinterpret_cast<const uint16_t*>(kv_.k_slab(0)), 0, 64, s);
+    dbg_dump_f16("attn.kv_v0",
+                 reinterpret_cast<const uint16_t*>(kv_.v_slab(0)), 0, 64, s);
     dbg_dump_f16("attn.out", attn_out_.get(),
                  static_cast<size_t>(n_tokens - 1) * Q, 64, s);
     dbg_dump_f16("attn.gate", d_gate_.get(),
