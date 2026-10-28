@@ -608,6 +608,9 @@ Status Session::prepare() {
 // ---------------------------------------------------------------------------
 // Dense layer body (graph-captured for decode, eager-batched for prefill)
 // ---------------------------------------------------------------------------
+static void dbg_dump_f16(const char* tag, const uint16_t* dev, size_t off,
+                         int cnt, cudaStream_t s);
+
 void Session::dense_layer_launch(int layer, int n_tokens) {
   const EngineDims& d = mc_.dims;
   const LayerWeights& lw = w_.layers()[static_cast<size_t>(layer)];
