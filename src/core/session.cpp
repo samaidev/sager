@@ -2229,6 +2229,12 @@ void Session::moe_dispatch_device(int layer, int n) {
                             route_w_.get(), E, K, K + 1, n, s);
   // v0.12 debug: router health on the first MoE layer (SAGER_DUMP_LOGITS=2)
   if (dbg_layers_ && layer == 0 && !capturing) {
+    // pre-topk logits for row 0 and the last row (the post-topk dump below
+    // reads the same buffer - topk does not modify global logits, but the
+    // pre-topk view removes any doubt).
+    dbg_dump_f32("rl_pre_r0", route_logits_.get(), 0, 16, s);
+    dbg_dump_f32("rl_pre_last", route_logits_.get(),
+                 static_cast<size_t>(n - 1) * E, 16, s);
     dbg_dump_f32("route_logits0", route_logits_.get(),
                  static_cast<size_t>(n - 1) * E, 16, s);
     dbg_dump_f32("route_w0", route_w_.get(),
