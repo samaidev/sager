@@ -795,6 +795,22 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
             wq_s, wk_s, wv_s, wo_s,
             __half2float(*reinterpret_cast<const __half*>(&wq16[0])),
             __half2float(*reinterpret_cast<const __half*>(&wk16[0])));
+    {
+      static bool wfile_done = false;
+      if (!wfile_done) {
+        wfile_done = true;
+        std::vector<uint8_t> full(4096);
+        cudaMemcpy(full.data(), lw.wq, 4096, cudaMemcpyDeviceToHost);
+        if (FILE* fp = std::fopen("/content/attnwq_L3.bin", "wb")) {
+          std::fwrite(full.data(), 1, full.size(), fp);
+          std::fclose(fp);
+        }
+      }
+    }
+    dbg_dump_f16("attn.xrow", x_.get(),
+                 static_cast<size_t>(n_tokens - 1) * H, 64, s);
+    dbg_dump_f16("attn.xq", reinterpret_cast<const uint16_t*>(d_xq_.get()),
+                 0, 64, s);
     dbg_dump_f16("attn.q", q_.get(),
                  static_cast<size_t>(n_tokens - 1) * Q, 64, s);
     dbg_dump_f16("attn.k", k_.get(),
