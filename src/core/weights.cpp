@@ -426,11 +426,57 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
       if (!q) return Status::kGgufParseError;
       const int q_rows = q->dims.size() >= 2
                              ? static_cast<int>(q->dims[1]) : Qrows;
-      s = copymat(lw.wq, q, "attn_q");
-      if (s != Status::kOk) return s;
-      // qwen3.5 gated attention: the q tensor carries [q | gate]; the full
-      // 2Q-row copy above already filled the gate half of the carve.
       lw.attn_gated = (q_rows == 2 * Qrows);
+      if (lw.attn_gated) {
+        // qwen3.5 gated attention (v0.12.1 fix): the fused q_proj output is
+        // PER-HEAD interleaved - head h owns rows [h*2*hd, h*2*hd + hd) for
+        // its query and rows [h*2*hd + hd, (h+1)*2*hd) for its sigmoid gate
+        // (transformers view(..., -1, head_dim*2).chunk(2, dim=-1); llama.cpp
+        // qwen3next reshapes to (head_dim*2, n_head) and views the gate at
+        // element offset head_dim). The old copy treated the tensor as
+        // [Q | Q] halves - every full-attention layer's q and gate were
+        // scrambled (8 of 16 heads read the wrong rows entirely).
+        const int hd = d.head_dim;
+        const size_t rowb = static_cast<size_t>(q->row_bytes);
+        const uint8_t* src = static_cast<const uint8_t*>(f.tensor_data(*q));
+        std::vector<uint8_t> tmp(q->nbytes);
+        for (int h = 0; h < d.n_head; ++h) {
+          std::memcpy(tmp.data() + static_cast<size_t>(h * hd) * rowb,
+                      src + static_cast<size_t>(h * 2 * hd) * rowb,
+                      static_cast<size_t>(hd) * rowb);
+          std::memcpy(tmp.data() +
+                          static_cast<size_t>(Qrows + h * hd) * rowb,
+                      src + static_cast<size_t>(h * 2 * hd + hd) * rowb,
+                      static_cast<size_t>(hd) * rowb);
+        }
+        if (q->type == 12) {
+          SAGER_CUDA_CHECK(cudaMemcpy(lw.wq, tmp.data(), tmp.size(),
+                                      cudaMemcpyHostToDevice));
+        } else if (q->type == 14) {
+          // Q6_K fused q: requant the deinterleaved rows row-by-row.
+          const int cols = static_cast<int>(q->dims[0]);
+          const size_t blocks_per_row =
+              static_cast<size_t>(cols) / q4k::kQK_K;
+          std::vector<q4k::BlockQ4K> out(
+              static_cast<size_t>(q_rows) * blocks_per_row);
+          std::vector<float> row(cols);
+          for (int r = 0; r < q_rows; ++r) {
+            dequant_row_q6(tmp.data() + static_cast<size_t>(r) * rowb,
+                           row.data(), cols);
+            auto blocks = q4k::quantize_row(row.data(), cols);
+            std::memcpy(out.data() + static_cast<size_t>(r) * blocks_per_row,
+                        blocks.data(), blocks_per_row * q4k::kBlockBytes);
+          }
+          SAGER_CUDA_CHECK(cudaMemcpy(lw.wq, out.data(),
+                                      out.size() * q4k::kBlockBytes,
+                                      cudaMemcpyHostToDevice));
+        } else {
+          return Status::kGgufParseError;
+        }
+      } else {
+        s = copymat(lw.wq, q, "attn_q");
+        if (s != Status::kOk) return s;
+      }
       s = copymat(lw.wk, f.tensor((lp + "attn_k.weight").c_str()), "attn_k");
       if (s != Status::kOk) return s;
       s = copymat(lw.wv, f.tensor((lp + "attn_v.weight").c_str()), "attn_v");
