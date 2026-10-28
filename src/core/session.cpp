@@ -1092,6 +1092,21 @@ void Session::linear_layer_chunk(int layer, int n) {
               b, d, dmin, (int)p[4], (int)p[5], (int)p[6],
               (unsigned)(p[16] & 0xF));
     }
+    // v0.12 diag: dump the first 2 requantized rows of the qkvz weight for
+    // offline comparison against the GGUF Q6_K source (SAGER_DBG_DUMP_QKVZ).
+    if (const char* qz = std::getenv("SAGER_DBG_DUMP_QKVZ")) {
+      const size_t rowb = static_cast<size_t>(H / 32) * 144;
+      static std::vector<uint8_t> dbuf;
+      dbuf.resize(2 * rowb);
+      cudaMemcpy(dbuf.data(), lw.lin_in_qkvz, 2 * rowb,
+                 cudaMemcpyDeviceToHost);
+      char qp[256];
+      std::snprintf(qp, sizeof(qp), "%s_L%d.bin", qz, layer);
+      if (FILE* fp = std::fopen(qp, "wb")) {
+        std::fwrite(dbuf.data(), 1, 2 * rowb, fp);
+        std::fclose(fp);
+      }
+    }
   }
   // fused projections for the whole window
   if (pf_tc_) {
