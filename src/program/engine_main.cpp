@@ -129,6 +129,28 @@ json::Value load_cmd(EngineState& es, const json::Value& req) {
   es.suffix = std::make_unique<SuffixDrafter>();
   es.suffix->set_max_draft(cp.enable_suffix_draft ? cp.suffix_max_draft : 0);
 
+  // v0.12 diag: dump the first 2 rows of every GDN layer's qkvz carve right
+  // after prepare (before any prefill) - splits load-time vs first-prefill
+  // corruption (SAGER_DBG_DUMP_QKVZ0=<prefix>).
+  if (const char* qz0 = std::getenv("SAGER_DBG_DUMP_QKVZ0")) {
+    const EngineDims& dd = es.mc.dims;
+    const size_t rowb = static_cast<size_t>(dd.hidden / 32) * 8 * 144;
+    std::vector<uint8_t> dbuf(2 * rowb);
+    for (int L = 0; L < dd.n_layer; ++L) {
+      if (!es.mc.is_linear(L)) continue;
+      const uint16_t* src = es.weights->layers()[static_cast<size_t>(L)].lin_in_qkvz;
+      if (!src) continue;
+      cudaMemcpy(dbuf.data(), src, 2 * rowb, cudaMemcpyDeviceToHost);
+      char qp[256];
+      std::snprintf(qp, sizeof(qp), "%s_L%d.bin", qz0, L);
+      if (FILE* fp = std::fopen(qp, "wb")) {
+        std::fwrite(dbuf.data(), 1, dbuf.size(), fp);
+        std::fclose(fp);
+      }
+    }
+    SLOG_I("config", "SAGER_DBG_DUMP_QKVZ0: dumped post-prepare qkvz rows");
+  }
+
   const EngineDims& d = es.mc.dims;
   json::Value out = json::Value::object();
   out["type"] = "loaded";

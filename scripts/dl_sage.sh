@@ -3,8 +3,11 @@
 #
 # Pulls (resumable, skip-if-present):
 #   1. Sage-A1.5-Q4_K_M.gguf            21,713,463,520 B  (model weights)
-#   2. Sage-A1.5-Q4_K_M-expert-pool.bin 18,119,393,280 B  (prebuilt pinned-RAM
-#      expert pool - saves the ~10 min first-load pool build)
+#   2. Sage-A1.5-Q4_K_M-expert-pool-v012-fixed.bin 18,119,393,280 B
+#      (expert pool rebuilt with the FIXED requant pipeline @ sager-v0.12.0;
+#      the earlier Sage-A1.5-Q4_K_M-expert-pool.bin artifact contains garbage
+#      down segments from the pre-fix Q4_K nibble order - do NOT use it with
+#      SAGER_EXPERT_POOL_REUSE=1)
 #   3. sager_t4_cuda_artifacts.tar.gz   prebuilt sager_engine binaries (opt-in,
 #      ART_TARBALL=1)
 #
@@ -22,7 +25,7 @@ MODEL_REPO="${MODEL_REPO:-InternScience/Sage-A1.5-Q4_K_M-GGUF}"
 MODEL_FILE="${MODEL_FILE:-Sage-A1.5-Q4_K_M.gguf}"
 ART_REPO="${ART_REPO:-tchbcb/sager-t4-cuda-artifacts}"
 MS_ART_REPO="${MS_ART_REPO:-luoyunlan168/sager-t4-cuda-artifacts}"
-ART_FILE="${ART_FILE:-Sage-A1.5-Q4_K_M-expert-pool.bin}"
+ART_FILE="${ART_FILE:-Sage-A1.5-Q4_K_M-expert-pool-v012-fixed.bin}"
 ART_TARBALL="${ART_TARBALL:-0}"
 mkdir -p "$CONTENT_DIR"
 
