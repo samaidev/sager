@@ -769,6 +769,32 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
   }
   // v0.12 diag: dense-layer pipeline health on the first attention layer
   if (dbg_layers_ && layer == 3) {
+    fprintf(stderr, "[sager/dbg] dense L3 n_tokens=%d Q=%d KVd=%d\n",
+            n_tokens, Q, KVd);
+    static PinnedBuffer<uint8_t> wdbg;
+    if (wdbg.count() < 4 * 1024) wdbg.alloc(4 * 1024);
+    cudaMemcpyAsync(wdbg.get(), lw.wq, 1024, cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(wdbg.get() + 1024, lw.wk, 1024, cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(wdbg.get() + 2048, lw.wv, 1024, cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(wdbg.get() + 3072, lw.wo, 1024, cudaMemcpyDeviceToHost, s);
+    stream_.sync();
+    const uint16_t* wq16 = reinterpret_cast<const uint16_t*>(wdbg.get());
+    const uint16_t* wk16 = reinterpret_cast<const uint16_t*>(wdbg.get() + 1024);
+    const uint16_t* wv16 = reinterpret_cast<const uint16_t*>(wdbg.get() + 2048);
+    const uint16_t* wo16 = reinterpret_cast<const uint16_t*>(wdbg.get() + 3072);
+    float wq_s = 0, wk_s = 0, wv_s = 0, wo_s = 0;
+    for (int i = 0; i < 512; ++i) {
+      wq_s += std::fabs(__half2float(*reinterpret_cast<const __half*>(&wq16[i])));
+      wk_s += std::fabs(__half2float(*reinterpret_cast<const __half*>(&wk16[i])));
+      wv_s += std::fabs(__half2float(*reinterpret_cast<const __half*>(&wv16[i])));
+      wo_s += std::fabs(__half2float(*reinterpret_cast<const __half*>(&wo16[i])));
+    }
+    fprintf(stderr,
+            "[sager/dbg] attn.W sum16 wq=%.4f wk=%.4f wv=%.4f wo=%.4f "
+            "wq0=%.6g wk0=%.6g\n",
+            wq_s, wk_s, wv_s, wo_s,
+            __half2float(*reinterpret_cast<const __half*>(&wq16[0])),
+            __half2float(*reinterpret_cast<const __half*>(&wk16[0])));
     dbg_dump_f16("attn.q", q_.get(),
                  static_cast<size_t>(n_tokens - 1) * Q, 64, s);
     dbg_dump_f16("attn.k", k_.get(),
