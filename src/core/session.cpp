@@ -821,6 +821,41 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
                  reinterpret_cast<const uint16_t*>(kv_.k_slab(0)), 0, 64, s);
     dbg_dump_f16("attn.kv_v0",
                  reinterpret_cast<const uint16_t*>(kv_.v_slab(0)), 0, 64, s);
+    {
+      static bool kvfile_done = false;
+      if (!kvfile_done) {
+        kvfile_done = true;
+        const int rowb = kv_.q8() ? (KVd / 32) * 34 : KVd * 2;
+        const size_t nb = static_cast<size_t>(rowb) * 3;
+        std::vector<uint8_t> kb(nb), vb(nb);
+        cudaMemcpy(kb.data(), kv_.k_slab(0), nb, cudaMemcpyDeviceToHost);
+        cudaMemcpy(vb.data(), kv_.v_slab(0), nb, cudaMemcpyDeviceToHost);
+        if (FILE* fp = std::fopen("/content/kvslab_k.bin", "wb")) {
+          std::fwrite(kb.data(), 1, nb, fp);
+          std::fclose(fp);
+        }
+        if (FILE* fp = std::fopen("/content/kvslab_v.bin", "wb")) {
+          std::fwrite(vb.data(), 1, nb, fp);
+          std::fclose(fp);
+        }
+        std::vector<uint16_t> krow(static_cast<size_t>(KVd)),
+            vrow(static_cast<size_t>(KVd));
+        cudaMemcpy(krow.data(),
+                   k_.get() + static_cast<size_t>(n_tokens - 1) * KVd,
+                   KVd * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(vrow.data(),
+                   v_.get() + static_cast<size_t>(n_tokens - 1) * KVd,
+                   KVd * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+        if (FILE* fp = std::fopen("/content/attnk_row.bin", "wb")) {
+          std::fwrite(krow.data(), 2, KVd, fp);
+          std::fclose(fp);
+        }
+        if (FILE* fp = std::fopen("/content/attnv_row.bin", "wb")) {
+          std::fwrite(vrow.data(), 2, KVd, fp);
+          std::fclose(fp);
+        }
+      }
+    }
     dbg_dump_f16("attn.out", attn_out_.get(),
                  static_cast<size_t>(n_tokens - 1) * Q, 64, s);
     dbg_dump_f16("attn.gate", d_gate_.get(),
