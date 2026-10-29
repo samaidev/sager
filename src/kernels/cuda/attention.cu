@@ -83,8 +83,12 @@ __global__ void kv_append_q8_kernel(const uint16_t* k, const uint16_t* v,
     #pragma unroll
     for (int j = 0; j < kQ8Group; ++j) amax = fmaxf(amax, fabsf(ldh(src + j)));
     const float d = amax / 127.f;
-    const uint16_t dh = __float2half_rn(d);
-    *reinterpret_cast<uint16_t*>(dst) = dh;
+    // v0.12.2 FIX: bit-cast the half scale. Assigning __half to uint16_t
+    // went through half->float->uint16 truncation and stored 0 for every
+    // block, so all q8 KV scales read back as 0 and attention output was
+    // exactly zero on every full-attention layer (word soup root cause 6).
+    *reinterpret_cast<uint16_t*>(dst) =
+        __half_as_ushort(__float2half_rn(d));
     const float id = d > 0.f ? 1.f / d : 0.f;
     #pragma unroll
     for (int j = 0; j < kQ8Group; ++j) {
