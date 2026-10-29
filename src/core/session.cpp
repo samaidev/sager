@@ -1208,6 +1208,22 @@ void Session::linear_layer_chunk(int layer, int n) {
         std::fclose(fp);
       }
     }
+    // v0.12 diag: dump carve rows 0-3 (Q4_K raw) for offline requant check.
+    {
+      static bool carverow_done = false;
+      if (!carverow_done) {
+        carverow_done = true;
+        const size_t rowb2 = static_cast<size_t>(H / 256) * 144;
+        static std::vector<uint8_t> cbuf;
+        cbuf.resize(4 * rowb2);
+        cudaMemcpy(cbuf.data(), lw.lin_in_qkvz, 4 * rowb2,
+                   cudaMemcpyDeviceToHost);
+        if (FILE* fp = std::fopen("/content/carverow0_3.bin", "wb")) {
+          std::fwrite(cbuf.data(), 1, cbuf.size(), fp);
+          std::fclose(fp);
+        }
+      }
+    }
   }
   // fused projections for the whole window
   if (pf_tc_) {
