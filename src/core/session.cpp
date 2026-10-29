@@ -1232,6 +1232,35 @@ void Session::linear_layer_chunk(int layer, int n) {
           std::fwrite(cbuf.data(), 1, cbuf.size(), fp);
           std::fclose(fp);
         }
+        // v0.12 diag: hot-slab health - first 512 KB of the VRAM expert slab
+        // + the layer-0 gate pointer table (host mirrors).
+        if (hot_ && hot_->pool.get()) {
+          const size_t nb2 = 512 * 1024;
+          std::vector<uint8_t> hbuf(nb2);
+          cudaMemcpy(hbuf.data(), hot_->pool.get(), nb2,
+                     cudaMemcpyDeviceToHost);
+          if (FILE* fp2 = std::fopen("/content/hotslab.bin", "wb")) {
+            std::fwrite(hbuf.data(), 1, nb2, fp2);
+            std::fclose(fp2);
+          }
+          FILE* ft = std::fopen("/content/hottab.txt", "w");
+          if (ft) {
+            const size_t peb = mc_.expert_bytes();
+            for (int e = 0; e < 8; ++e) {
+              const q4k::BlockQ4K* p = hot_->tables_host[
+                  static_cast<size_t>(0) * 3 * mc_.dims.n_expert + e];
+              const q4k::BlockQ4K* base = hot_->pool.get();
+              long slot = p ? (reinterpret_cast<const uint8_t*>(p) -
+                               reinterpret_cast<const uint8_t*>(base)) /
+                                  static_cast<long>(peb) : -1;
+              long off = p ? (reinterpret_cast<const uint8_t*>(p) -
+                              reinterpret_cast<const uint8_t*>(base)) : -1;
+              fprintf(ft, "L0 e%d ptr=%p slot=%ld off=%ld\n", e,
+                      (const void*)p, slot, off);
+            }
+            std::fclose(ft);
+          }
+        }
       }
     }
   }
