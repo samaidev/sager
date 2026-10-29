@@ -840,18 +840,20 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
         }
         std::vector<uint16_t> krow(static_cast<size_t>(KVd)),
             vrow(static_cast<size_t>(KVd));
-        cudaMemcpy(krow.data(),
-                   k_.get() + static_cast<size_t>(n_tokens - 1) * KVd,
-                   KVd * sizeof(uint16_t), cudaMemcpyDeviceToHost);
-        cudaMemcpy(vrow.data(),
-                   v_.get() + static_cast<size_t>(n_tokens - 1) * KVd,
-                   KVd * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(krow.data(), k_.get(),
+                   static_cast<size_t>(n_tokens) * KVd * sizeof(uint16_t),
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(vrow.data(), v_.get(),
+                   static_cast<size_t>(n_tokens) * KVd * sizeof(uint16_t),
+                   cudaMemcpyDeviceToHost);
         if (FILE* fp = std::fopen("/content/attnk_row.bin", "wb")) {
-          std::fwrite(krow.data(), 2, KVd, fp);
+          std::fwrite(krow.data(), 2,
+                      static_cast<size_t>(n_tokens) * KVd, fp);
           std::fclose(fp);
         }
         if (FILE* fp = std::fopen("/content/attnv_row.bin", "wb")) {
-          std::fwrite(vrow.data(), 2, KVd, fp);
+          std::fwrite(vrow.data(), 2,
+                      static_cast<size_t>(n_tokens) * KVd, fp);
           std::fclose(fp);
         }
       }
