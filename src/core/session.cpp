@@ -1249,12 +1249,11 @@ void Session::linear_layer_chunk(int layer, int n) {
             for (int e = 0; e < 8; ++e) {
               const q4k::BlockQ4K* p = hot_->tables_host[
                   static_cast<size_t>(0) * 3 * mc_.dims.n_expert + e];
-              const q4k::BlockQ4K* base = hot_->pool.get();
-              long slot = p ? (reinterpret_cast<const uint8_t*>(p) -
-                               reinterpret_cast<const uint8_t*>(base)) /
+              const uint8_t* base =
+                  reinterpret_cast<const uint8_t*>(hot_->pool.get());
+              long slot = p ? (reinterpret_cast<const uint8_t*>(p) - base) /
                                   static_cast<long>(peb) : -1;
-              long off = p ? (reinterpret_cast<const uint8_t*>(p) -
-                              reinterpret_cast<const uint8_t*>(base)) : -1;
+              long off = p ? (reinterpret_cast<const uint8_t*>(p) - base) : -1;
               fprintf(ft, "L0 e%d ptr=%p slot=%ld off=%ld\n", e,
                       (const void*)p, slot, off);
             }
