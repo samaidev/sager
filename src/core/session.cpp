@@ -157,19 +157,27 @@ Status Session::alloc_scratch() {
   // v0.9: fp16 dequant scratch for the TC prefill GEMM path - ONE reuse
   // buffer sized for the largest dense projection (GDN qkvz proj_rows x H
   // dominates; lin_out is H x y_rows, smaller in elements).
-  // v0.10: the MoE TC ring lives here too (two disjoint regions of G slots
-  // each) - allocate it whenever either TC path is on.
+  // v0.12.3 FIX: the dense TC dequant scratch and the MoE TC expert ring are
+  // now DISJOINT regions of d_wtc_. They used to overlap (ring_need ==
+  // dense_need for qwen35moe) and the in-stream reuse contract broke down:
+  // the pump's stream-all loader machinery keeps queueing ring-slot work
+  // across layer boundaries, so the next layer's ring writes landed while a
+  // previous dense GemmEx was still pending - clobbering the first ~8 slots
+  // worth (8192 rows) of every qkvz dequant and scrambling every dense
+  // projection (word soup root cause 7). The ring also shrinks to 4 slots
+  // to keep the VRAM delta small.
   {
     const auto g = mc_.gdn();
     size_t need = static_cast<size_t>(std::max(g.proj_rows(), g.y_rows())) *
                   static_cast<size_t>(H);
     need = std::max(need, static_cast<size_t>(Q) * H);
     need = std::max(need, static_cast<size_t>(H) * g.y_rows());
+    wtc_dense_elems_ = need;
     if (pf_moe_tc_) {
-      // ring: moe_grp_ x (gate+up slot + down slot) fp16 elems
+      // ring: 4 x (gate+up slot + down slot) fp16 elems, AFTER the scratch
       const size_t ring_need =
-          static_cast<size_t>(8) * 3 * static_cast<size_t>(FFX) * H;
-      need = std::max(need, ring_need);
+          static_cast<size_t>(4) * 3 * static_cast<size_t>(FFX) * H;
+      need += ring_need;
     }
     if (pf_tc_ || pf_moe_tc_) {
       if (!ok(d_wtc_.alloc(need), "d_wtc_")) return Status::kOomVram;
@@ -225,8 +233,10 @@ Status Session::alloc_scratch() {
   // h_moe_meta_ is 16 B of pinned host memory.
   if (pf_moe_tc_) {
     moe_slot_elems_ = static_cast<size_t>(3) * FFX * H;  // gate+up rows then down
-    // ring capacity from the dense TC scratch: floor to a power of two
-    int g = static_cast<int>(d_wtc_.count() / moe_slot_elems_);
+    // v0.12.3: ring capacity from the region AFTER the dense scratch
+    size_t ring_avail = d_wtc_.count() > wtc_dense_elems_
+                            ? d_wtc_.count() - wtc_dense_elems_ : 0;
+    int g = static_cast<int>(ring_avail / moe_slot_elems_);
     while (g > 1 && (g & (g - 1)) != 0) --g;
     moe_grp_ = g < 1 ? 1 : (g > 8 ? 8 : g);
     if (!h_moe_meta_.alloc(4)) return Status::kOomRam;
@@ -2412,7 +2422,7 @@ void Session::moe_dispatch_device(int layer, int n) {
   const size_t lstride = static_cast<size_t>(d.n_moe_layer) * E;
   const bool moe_tc = pf_moe_tc_ && ev_moe_plan_ && n >= 256 && !capturing &&
                       moe_grp_ >= 2 && moe_slot_elems_ > 0 &&
-                      d_wtc_.count() >=
+                      d_wtc_.count() >= wtc_dense_elems_ +
                           static_cast<size_t>(moe_grp_) * moe_slot_elems_ &&
                       cuda::tc_handle() != nullptr;
   if (moe_tc) {
@@ -2467,8 +2477,8 @@ void Session::moe_dispatch_device(int layer, int n) {
     const int G = moe_grp_;   // power of two
     const size_t gu_slot = 2ull * FFX * H;              // fp16 elems / slot
     const size_t dn_slot = static_cast<size_t>(H) * FFX;
-    uint16_t* ring_gu = d_wtc_.get();
-    uint16_t* ring_dn = d_wtc_.get() + G * gu_slot;
+    uint16_t* ring_gu = d_wtc_.get() + wtc_dense_elems_;  // v0.12.3: disjoint
+    uint16_t* ring_dn = ring_gu + G * gu_slot;
     for (int e = 0; e < E; ++e) {
       const int o = h_off_.get()[e];
       if (h_off_.get()[e + 1] > o &&

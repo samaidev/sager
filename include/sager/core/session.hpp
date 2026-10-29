@@ -313,6 +313,10 @@ class Session {
   // SAGER_PF_BATCHED=0 also reverts - same slab contract as the mtok path)
   bool pf_tc_ = true;
   DeviceBuffer<uint16_t> d_wtc_;   // fp16 dequant scratch [max_rows * k]
+  // v0.12.3: dense scratch = the FRONT of d_wtc_; the MoE TC expert ring
+  // lives AFTER it (disjoint regions - they used to overlap and cross-layer
+  // ring writes clobbered pending dense dequants, word soup root cause 7).
+  size_t wtc_dense_elems_ = 0;
   // v0.10 MoE tensor-core path (SAGER_MOE_TC=0 reverts to the grouped dp4a
   // GEMV family): routed rows compact in fp16, routed experts dequantize into
   // a small ring of fp16 slots, one GemmEx per (expert, matrix).
