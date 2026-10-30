@@ -326,10 +326,55 @@ def find_weights(hf_dir: str) -> Dict[str, str]:
         files.update(f for f in os.listdir(hf_dir) if f.endswith(".safetensors"))
     mapping = {}
     for fn in sorted(files):
-        with safe_open(os.path.join(hf_dir, fn), framework="numpy") as f:
-            for k in f.keys():
-                mapping[k] = os.path.join(hf_dir, fn)
+        p = os.path.join(hf_dir, fn)
+        with open(p, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            h = json.loads(f.read(n))
+        for k in h:
+            if k != "__metadata__":
+                mapping[k] = p
     return mapping
+
+
+class _RawST:
+    """Minimal safetensors reader (numpy has no bfloat16, and the Sage
+    checkpoint is bf16 - safe_open(framework="numpy") cannot materialize
+    it). Parses each shard header once; get() returns float32 arrays."""
+
+    def get(self, name):
+        fn, v = self.keys_cache[name]
+        p, base, _ = self.hdr[fn]
+        s, e = v["data_offsets"]
+        with open(p, "rb") as f:
+            f.seek(base + s)
+            raw = f.read(e - s)
+        dt = v["dtype"]
+        if dt == "F32":
+            return np.frombuffer(raw, dtype=np.float32).copy()
+        if dt == "BF16":
+            u = np.frombuffer(raw, dtype=np.uint16).astype(np.uint32)
+            return (u << 16).view(np.float32)
+        if dt == "F16":
+            return np.frombuffer(raw, dtype=np.uint16).copy().view(
+                np.float16).astype(np.float32)
+        raise ValueError(f"unsupported dtype {dt} for {name}")
+
+    def __init__(self, hf_dir: str, files):
+        self.dir = hf_dir
+        self.hdr = {}
+        self.keys_cache = {}
+        for fn in files:
+            p = os.path.join(hf_dir, fn)
+            with open(p, "rb") as f:
+                n = struct.unpack("<Q", f.read(8))[0]
+                h = json.loads(f.read(n))
+            self.hdr[fn] = (p, 8 + n, h)
+            for k, v in h.items():
+                if k != "__metadata__":
+                    self.keys_cache[k] = (fn, v)
+
+    def shape(self, name):
+        return tuple(self.keys_cache[name][1]["shape"])
 
 
 def cfg_from_hf(hf_dir: str) -> dict:
@@ -437,8 +482,10 @@ def convert(hf_dir: str, out_path: str, workers: int, fast: bool = False) -> Non
                 return f"{m}{cand}."
         raise KeyError(f"no experts dir under {m}")
 
+    _reader = _RawST(hf_dir, sorted(set(mapping.values())))
+
     def src(name: str) -> np.ndarray:
-        return safe_open(mapping[name], framework="numpy").get_tensor(name)
+        return _reader.get(name)
 
     # ---- metadata ----
     w.add("general.architecture", "sager.sage_a15")
@@ -590,20 +637,15 @@ def convert(hf_dir: str, out_path: str, workers: int, fast: bool = False) -> Non
                                  ("up_proj.weight", "ffn_up_exps"),
                                  ("down_proj.weight", "ffn_down_exps")):
             names = [f"{prefix}{e}.{suffix}" for e in range(cfg["n_expert"])]
-            shapes = []
-            for e in (0, cfg["n_expert"] - 1):
-                with safe_open(mapping[names[e]], framework="numpy") as pr:
-                    shapes.append(pr.get_slice(names[e]).get_shape())
-            assert shapes[0] == shapes[1], f"{out_name}: ragged experts"
-            rows, cols = shapes[0]
+            shp = _reader.shape(names[0])
+            rows, cols = int(shp[-2]), int(shp[-1])
             stack_shape = (cfg["n_expert"], rows, cols)
 
             def provider(names=names, rows=rows, cols=cols,
                          out_name=out_name):
                 mats = np.empty((len(names), rows, cols), dtype=np.float32)
                 for i, nm in enumerate(names):
-                    with safe_open(mapping[nm], framework="numpy") as f:
-                        mats[i] = f.get_tensor(nm).astype(np.float32)
+                    mats[i] = _reader.get(nm)
                 return qexp(mats)
 
             w.add_tensor_deferred(f"blk.{layer}.{out_name}", stack_shape,
