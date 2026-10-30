@@ -1,6 +1,8 @@
 // gguf.cpp - GGUF v3 reader implementation (mmap based).
 #include "sager/core/gguf.hpp"
+#include "sager/core/log.hpp"
 
+#include <cerrno>
 #include <cstring>
 #include <unordered_map>
 
@@ -85,19 +87,19 @@ Status File::open(const std::string& path) {
   map_len_ = static_cast<size_t>(sz.QuadPart);
   HANDLE m = CreateFileMappingA(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
   CloseHandle(h);
-  if (!m) return Status::kGgufParseError;
+  if (!m) { SLOG_E("gguf", "open failed: %s", path.c_str()); return Status::kGgufParseError; }
   map_ = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
   CloseHandle(m);
-  if (!map_) return Status::kGgufParseError;
+  if (!map_) { SLOG_E("gguf", "map failed: %s", path.c_str()); return Status::kGgufParseError; }
 #else
   int fd = ::open(path.c_str(), O_RDONLY);
   if (fd < 0) return Status::kFileNotFound;
   struct stat st{};
-  if (::fstat(fd, &st) != 0 || st.st_size < 32) { ::close(fd); return Status::kGgufParseError; }
+  if (::fstat(fd, &st) != 0 || st.st_size < 32) { ::close(fd); SLOG_E("gguf", "file too small"); return Status::kGgufParseError; }
   map_len_ = static_cast<size_t>(st.st_size);
   map_ = ::mmap(nullptr, map_len_, PROT_READ, MAP_PRIVATE, fd, 0);
   ::close(fd);
-  if (map_ == MAP_FAILED) { map_ = nullptr; return Status::kGgufParseError; }
+  if (map_ == MAP_FAILED) { map_ = nullptr; SLOG_E("gguf", "mmap failed (%s)", strerror(errno)); return Status::kGgufParseError; }
 #endif
 
   cursor_ = static_cast<const uint8_t*>(map_);
@@ -108,18 +110,18 @@ Status File::open(const std::string& path) {
   }
   uint32_t version = 0;
   if (!read_exact(&version, 4) || version != 3) {
-    close(); return Status::kGgufParseError;  // v1/v2 files: re-export with the converter
+    close(); SLOG_E("gguf", "bad version %u", version); return Status::kGgufParseError;  // v1/v2 files: re-export with the converter
   }
 
   uint64_t n_tensors = 0, n_kv = 0;
-  if (!read_exact(&n_tensors, 8) || !read_exact(&n_kv, 8)) { close(); return Status::kGgufParseError; }
+  if (!read_exact(&n_tensors, 8) || !read_exact(&n_kv, 8)) { close(); SLOG_E("gguf", "header read failed"); return Status::kGgufParseError; }
 
   // --- KV metadata ---
   for (uint64_t i = 0; i < n_kv; ++i) {
     std::string key;
-    if (!read_str(&key)) { close(); return Status::kGgufParseError; }
+    if (!read_str(&key)) { close(); SLOG_E("gguf", "kv %llu: bad string", (unsigned long long)i); return Status::kGgufParseError; }
     uint32_t vtype = 0;
-    if (!read_exact(&vtype, 4)) { close(); return Status::kGgufParseError; }
+    if (!read_exact(&vtype, 4)) { close(); SLOG_E("gguf", "kv %llu: bad type", (unsigned long long)i); return Status::kGgufParseError; }
 
     Value v; v.type = static_cast<Type>(vtype);
     switch (v.type) {
@@ -182,7 +184,9 @@ Status File::open(const std::string& path) {
         break;
       }
       default:
-        close(); return Status::kGgufParseError;
+        close(); SLOG_E("gguf", "kv %llu (%s): unknown type %u",
+                        (unsigned long long)i, key.c_str(), vtype);
+        return Status::kGgufParseError;
     }
     kv_.emplace(std::move(key), std::move(v));
   }
@@ -190,9 +194,9 @@ Status File::open(const std::string& path) {
   // --- Tensor directory ---
   for (uint64_t i = 0; i < n_tensors; ++i) {
     TensorInfo t;
-    if (!read_str(&t.name)) { close(); return Status::kGgufParseError; }
+    if (!read_str(&t.name)) { close(); SLOG_E("gguf", "tensor %llu: bad name", (unsigned long long)i); return Status::kGgufParseError; }
     uint32_t n_dims = 0;
-    if (!read_exact(&n_dims, 4) || n_dims == 0 || n_dims > 4) { close(); return Status::kGgufParseError; }
+    if (!read_exact(&n_dims, 4) || n_dims == 0 || n_dims > 4) { close(); SLOG_E("gguf", "tensor %s: bad ndims", t.name.c_str()); return Status::kGgufParseError; }
     t.dims.resize(n_dims);
     for (uint32_t d = 0; d < n_dims; ++d) {
       if (!read_exact(&t.dims[d], 8)) { close(); return Status::kGgufParseError; }
@@ -200,7 +204,7 @@ Status File::open(const std::string& path) {
     if (!read_exact(&t.type, 4) || !read_exact(&t.offset, 8)) { close(); return Status::kGgufParseError; }
     t.nbytes = type_total_bytes(t.type, t.dims);
     t.row_bytes = type_row_bytes(t.type, t.dims.empty() ? 0 : t.dims[0]);
-    if (t.nbytes == 0) { close(); return Status::kGgufParseError; }  // unsupported dtype
+    if (t.nbytes == 0) { close(); SLOG_E("gguf", "tensor %s: unsupported dtype %u", t.name.c_str(), t.type); return Status::kGgufParseError; }  // unsupported dtype
     tensors_.emplace(t.name, std::move(t));
   }
 
@@ -209,7 +213,7 @@ Status File::open(const std::string& path) {
   if (alignment_ == 0) alignment_ = 32;
   uint64_t data_start = static_cast<uint64_t>(cursor_ - static_cast<const uint8_t*>(map_));
   data_start = (data_start + alignment_ - 1) / alignment_ * alignment_;
-  if (data_start >= map_len_) { close(); return Status::kGgufParseError; }
+  if (data_start >= map_len_) { close(); SLOG_E("gguf", "data start %llu >= file %llu", (unsigned long long)data_start, (unsigned long long)map_len_); return Status::kGgufParseError; }
   data_base_ = static_cast<const uint8_t*>(map_) + data_start;
 
   return Status::kOk;
