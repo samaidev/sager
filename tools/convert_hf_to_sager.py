@@ -252,8 +252,11 @@ class GGUFWriter:
         # tensor dir: names, dims, type, offset. Sizes of deferred tensors
         # come from their shapes (deterministic for every quant we emit),
         # so the whole directory is built before any data exists.
-        all_tensors = [(n, d, q) for n, d, q, _ in self.tensors] + \
-                      [(n, d, q) for n, d, q, _ in self.deferred]
+        # deferred (expert) tensors FIRST in the file: each one frees an HF
+        # shard via on_release, and the freed bf16 bytes (x1.8 of the q4
+        # size) must land before the eager tensors need the headroom.
+        all_tensors = [(n, d, q) for n, d, q, _ in self.deferred] + \
+                      [(n, d, q) for n, d, q, _ in self.tensors]
         td = b""
         off = 0
         for name, dims, qtype in all_tensors:
@@ -274,14 +277,7 @@ class GGUFWriter:
             f.write(meta)
             f.write(td)
             pad = b"\0" * align
-            for name, dims, qtype, data in self.tensors:
-                f.write(data)
-                p = (-len(data)) % align
-                if p:
-                    f.write(pad[:p])
-                if self.on_release:
-                    self.on_release(name)
-            for i, (name, dims, qtype, provider) in enumerate(self.deferred):
+            for name, dims, qtype, provider in self.deferred:
                 data = provider()
                 assert len(data) == self._nbytes(dims, qtype), \
                     f"{name}: {len(data)} != {self._nbytes(dims, qtype)}"
@@ -290,6 +286,13 @@ class GGUFWriter:
                 if p:
                     f.write(pad[:p])
                 del data
+                if self.on_release:
+                    self.on_release(name)
+            for name, dims, qtype, data in self.tensors:
+                f.write(data)
+                p = (-len(data)) % align
+                if p:
+                    f.write(pad[:p])
                 if self.on_release:
                     self.on_release(name)
         print(f"[convert] wrote {path} "
