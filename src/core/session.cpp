@@ -3035,6 +3035,20 @@ void Session::cpu_pool_patch_rows(int layer, int n, const int* uniq,
   }
   pool_.submit(std::move(mjobs));
   pool_.wait_done(nullptr);
+  // v0.12.6 diag: patch numerical verification (layer 0, eager mailbox path)
+  if (dbg_layers_ && layer == 0 && n_patch > 0) {
+    static int dump_cnt_e = 0;
+    if (dump_cnt_e++ < 3) {
+      float ys = 0.f, ymx = 0.f, xs = 0.f;
+      for (int i = 0; i < H; ++i) {
+        ys += std::fabs(miss_y_.get()[i]);
+        ymx = std::fmax(ymx, std::fabs(miss_y_.get()[i]));
+        xs += std::fabs(miss_x_.get()[i]);
+      }
+      SLOG_W("moe", "epatchdump L0 #%d: rows=%d e0=%d |x|=%.4f |y|=%.4f max|y|=%.4f",
+             dump_cnt_e, n_patch, patches[0].e, xs, ys, ymx);
+    }
+  }
   cudaMemcpyAsync(d_miss_y_.get(), miss_y_.get(),
                   static_cast<size_t>(n_patch) * H * sizeof(float),
                   cudaMemcpyHostToDevice, s);
@@ -3152,6 +3166,23 @@ void Session::patch_graph_mailbox(int layer, int cnt) {
   }
   pool_.submit(std::move(mjobs));
   pool_.wait_done(nullptr);
+  // v0.12.6 diag: patch numerical verification (layer 0, graph mailbox path)
+  if (dbg_layers_ && layer == 0 && n_patch > 0) {
+    static int dump_cnt_g = 0;
+    if (dump_cnt_g++ < 3) {
+      float ys = 0.f, ymx = 0.f, xs = 0.f;
+      for (int i = 0; i < H; ++i) {
+        ys += std::fabs(miss_y_.get()[i]);
+        ymx = std::fmax(ymx, std::fabs(miss_y_.get()[i]));
+        xs += std::fabs(miss_x_.get()[i]);
+      }
+      float w0 = 0.f;
+      cudaMemcpy(&w0, d_route_w_all_.get() + static_cast<size_t>(layer) * (K + 1),
+                 sizeof(float), cudaMemcpyDeviceToHost);
+      SLOG_W("moe", "gpatchdump L0 #%d: rows=%d e0=%d |x|=%.4f |y|=%.4f max|y|=%.4f w0=%.5f",
+             dump_cnt_g, n_patch, patches[0].e, xs, ys, ymx, w0);
+    }
+  }
   cudaMemcpyAsync(d_miss_y_.get(), miss_y_.get(),
                   static_cast<size_t>(n_patch) * H * sizeof(float),
                   cudaMemcpyHostToDevice, s);
