@@ -15,8 +15,16 @@ __device__ __forceinline__ void sth(uint16_t* p, float v) {
 
 // Router top-k. n_expert <= 1024: single block, probabilities in smem.
 // Greedy selection (argmax + mask) k times - n_expert_used is tiny (8).
+// v0.12.4 FIX (word-soup root cause 8): the kernels now own the shared-expert
+// combine slot. out_w[K] used to be host-managed, but the device-dispatch and
+// captured-decode paths never rewrote it: prepare() seeded only row 0 and the
+// graph-warmup memset zeroed it again, so every decode step (and every
+// device-prefill row >= 1) combined the shared expert with weight 0/garbage -
+// silently dropping it from the residual stream (word soup since the MoE
+// walk moved on-device). The router now writes the slot every launch.
 __global__ void router_topk_kernel(const float* logits, int* idx,
-                                   float* weight, int n_expert, int k) {
+                                   float* weight, int n_expert, int k,
+                                   float shared_w) {
   extern __shared__ float smem[];   // n_expert probs + scratch
   float* prob = smem;
 
@@ -72,6 +80,7 @@ __global__ void router_topk_kernel(const float* logits, int* idx,
     }
     if (lane == 0 && wsum > 0.f)
       for (int kk = 0; kk < k; ++kk) weight[kk] /= wsum;  // renormalized top-k
+    if (lane == 0) weight[k] = shared_w;   // shared-expert combine slot
   }
 }
 
@@ -93,9 +102,9 @@ __global__ void moe_combine_kernel(uint16_t* out, const uint16_t* expert_out,
 }  // namespace
 
 void router_topk(const float* logits, int* idx, float* weight, int n_expert,
-                 int n_expert_used, cudaStream_t stream) {
+                 int n_expert_used, float shared_w, cudaStream_t stream) {
   router_topk_kernel<<<1, 128, n_expert * sizeof(float), stream>>>(
-      logits, idx, weight, n_expert, n_expert_used);
+      logits, idx, weight, n_expert, n_expert_used, shared_w);
 }
 
 void moe_combine_f16(uint16_t* out, const uint16_t* expert_out, const int* idx,
@@ -155,7 +164,8 @@ namespace {
 // Router top-k for every row of the chunk; one block per row.
 __global__ void router_topk_batched_kernel(const float* logits, int* idx,
                                            float* weight, int n_expert, int k,
-                                           int stride, int n_rows) {
+                                           int stride, int n_rows,
+                                           float shared_w) {
   extern __shared__ float smem[];
   float* prob = smem;
   const int row = blockIdx.x;
@@ -214,8 +224,11 @@ __global__ void router_topk_batched_kernel(const float* logits, int* idx,
       }
       __syncwarp();
     }
-    if (lane == 0 && wsum > 0.f) {
-      for (int kk = 0; kk < k; ++kk) out_w[kk] /= wsum;
+    if (lane == 0) {
+      if (wsum > 0.f) {
+        for (int kk = 0; kk < k; ++kk) out_w[kk] /= wsum;
+      }
+      out_w[k] = shared_w;   // shared-expert combine slot (stride k+1)
     }
   }
 }
@@ -294,9 +307,10 @@ __global__ void scatter_rows_generic_kernel(uint16_t* dst,
 
 void router_topk_batched(const float* logits, int* idx, float* weight,
                          int n_expert, int n_expert_used, int idx_stride,
-                         int n_rows, cudaStream_t stream) {
+                         int n_rows, float shared_w, cudaStream_t stream) {
   router_topk_batched_kernel<<<n_rows, 128, n_expert * sizeof(float), stream>>>(
-      logits, idx, weight, n_expert, n_expert_used, idx_stride, n_rows);
+      logits, idx, weight, n_expert, n_expert_used, idx_stride, n_rows,
+      shared_w);
 }
 
 void gather_rows_q8(q4k::BlockQ8K* dst, const q4k::BlockQ8K* src,

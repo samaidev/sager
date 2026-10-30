@@ -346,16 +346,18 @@ void attention_prefill_f16(uint16_t* out, const uint16_t* q,
 
 // ---- MoE ----------------------------------------------------------------------
 // Softmax over logits then top-k (values sorted descending).
+// shared_w is written into weight[n_expert_used] - the shared-expert combine
+// slot (v0.12.4: the router owns this slot; see moe.cu root-cause-8 note).
 void router_topk(const float* logits, int* idx, float* weight, int n_expert,
-                 int n_expert_used, cudaStream_t stream);
+                 int n_expert_used, float shared_w, cudaStream_t stream);
 
 // v0.2.3 batched prefill path:
 // Top-k for n_rows routers at once; logits [n_rows x n_expert], results at
 // [row * idx_stride + kk] (idx_stride is usually K+1 so the shared-expert
-// combine slot stays host-managed).
+// combine slot stays router-managed - shared_w lands in out_w[K]).
 void router_topk_batched(const float* logits, int* idx, float* weight,
                          int n_expert, int n_expert_used, int idx_stride,
-                         int n_rows, cudaStream_t stream);
+                         int n_rows, float shared_w, cudaStream_t stream);
 
 // dst[r] = src[src_rows[r]] for whole BlockQ8K activation rows (the routed
 // rows are compacted expert-major before the per-expert GEMMs).

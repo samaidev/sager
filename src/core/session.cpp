@@ -577,12 +577,21 @@ Status Session::prepare() {
   // Static combine extension: slot K carries the shared expert with weight 1.
   // (Buffers above are sized [K+1]; these writes must come after alloc_scratch,
   //  which allocates both the pinned staging and the device route slots.)
-  h_route_idx_[d.n_expert_used] = 0;
-  h_route_w_[d.n_expert_used] = 1.0f;
+  // v0.12.4: seed EVERY row's slot K, not just row 0 - the device-dispatch
+  // path never uploads route_w_, so rows >= 1 used to combine garbage here.
+  // Belt-and-braces only: the router kernels now write slot K every launch.
+  for (int r = 0; r < pf_rt_; ++r) {
+    h_route_idx_[static_cast<size_t>(r) * (d.n_expert_used + 1) +
+                 d.n_expert_used] = 0;
+    h_route_w_[static_cast<size_t>(r) * (d.n_expert_used + 1) +
+               d.n_expert_used] = 1.0f;
+  }
   cudaMemcpy(route_idx_.get(), h_route_idx_.get(),
-             (d.n_expert_used + 1) * sizeof(int), cudaMemcpyHostToDevice);
+             static_cast<size_t>(pf_rt_) * (d.n_expert_used + 1) * sizeof(int),
+             cudaMemcpyHostToDevice);
   cudaMemcpy(route_w_.get(), h_route_w_.get(),
-             (d.n_expert_used + 1) * sizeof(float), cudaMemcpyHostToDevice);
+             static_cast<size_t>(pf_rt_) * (d.n_expert_used + 1) * sizeof(float),
+             cudaMemcpyHostToDevice);
 
   kv_.init({d.n_layer - n_gdn_layers, d.n_head_kv, d.head_dim, cp_.n_ctx,
             cp_.kv_q8});
@@ -1702,7 +1711,7 @@ void Session::moe_dispatch_row(int layer, int row) {
   }
   cuda::gemv_f32_out_f16x(lw.router, xn_row, route_logits_.get(), E, H, s);
   cuda::router_topk(route_logits_.get(), route_idx_.get(), route_w_.get(), E,
-                    K, s);
+                    K, lw.shared_gate ? 1.0f : 0.0f, s);
 
   // Shared expert into combine row K (weight 1, see prepare()).
   detail::shared_expert_forward(w_, layer, d_hq_.get(), xn_row, shared_y_.get(),
@@ -1895,7 +1904,8 @@ void Session::moe_dispatch_batched(int layer, int n) {
                                     E, H, n, s);
   }
   cuda::router_topk_batched(route_logits_.get(), route_idx_.get(),
-                            route_w_.get(), E, K, K + 1, n, s);
+                            route_w_.get(), E, K, K + 1, n,
+                            lw.shared_gate ? 1.0f : 0.0f, s);
   if (dbg_layers_ && layer == 0) {
     dbg_write_row_f32("routew", route_w_.get(),
                       static_cast<size_t>(n - 1) * (K + 1), K + 1, layer, s);
@@ -2381,7 +2391,8 @@ void Session::moe_dispatch_device(int layer, int n) {
                                  E, H, n, s);
   }
   cuda::router_topk_batched(route_logits_.get(), route_idx_.get(),
-                            route_w_.get(), E, K, K + 1, n, s);
+                            route_w_.get(), E, K, K + 1, n,
+                            lw.shared_gate ? 1.0f : 0.0f, s);
   // v0.12 debug: router health on the first MoE layer (SAGER_DUMP_LOGITS=2)
   if (dbg_layers_ && layer == 0 && !capturing) {
     // pre-topk logits for row 0 and the last row (the post-topk dump below
