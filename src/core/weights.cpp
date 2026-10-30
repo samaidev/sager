@@ -659,7 +659,13 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
 #endif
 }
 
+// v0.12.8 diag: name the failing tensor on every parse-error return.
+#define GPE() do { \
+    SLOG_E("weights", "load failed at %s:%d", __FILE__, __LINE__); \
+    return Status::kGgufParseError; \
+  } while (0)
 Status Weights::load_expert_pool(gguf::File& f, const ModelConfig& cfg) {
+
   const EngineDims& d = dims;
   const size_t ebytes = cfg.expert_bytes();
   expert_pool_bytes_ = static_cast<size_t>(d.experts_total()) * ebytes;
@@ -765,9 +771,9 @@ Status Weights::load_expert_pool(gguf::File& f, const ModelConfig& cfg) {
       const auto* g = find_tensor_w(f, "blk." + std::to_string(L) + ".ffn_gate_exps");
       const auto* u = find_tensor_w(f, "blk." + std::to_string(L) + ".ffn_up_exps");
       const auto* dnw = find_tensor_w(f, "blk." + std::to_string(L) + ".ffn_down_exps");
-      if (!g || !u || !dnw) return Status::kGgufParseError;
-      if (g->type != 12 || u->type != 12) return Status::kGgufParseError;
-      if (dnw->type != 12 && dnw->type != 14) return Status::kGgufParseError;
+      if (!g || !u || !dnw) GPE()
+      if (g->type != 12 || u->type != 12) GPE()
+      if (dnw->type != 12 && dnw->type != 14) GPE()
       // expert-major slices of the 3D stacked tensors [n_expert, rows, cols]
       const uint8_t* gb = f.tensor_data(*g) + static_cast<size_t>(e) * gu;
       const uint8_t* ub = f.tensor_data(*u) + static_cast<size_t>(e) * gu;
