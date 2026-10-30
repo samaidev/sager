@@ -426,6 +426,14 @@ class Session {
   void* head_graph_ = nullptr;    // cudaGraphExec_t, owned raw
   bool  step_graph_ok_ = false;
   bool  step_graph_on_ = true;
+  // v0.12.6 (root cause 11): the whole-step graph combines absent experts at
+  // zero and the step-end patch re-runs only the head - the mid-layer residual
+  // flow never sees the missing contributions. Exact only at ZERO mails, so
+  // the whole-step path is gated adaptively: per-layer steps (which patch
+  // between layers) must run clean first.
+  bool  step_graph_allow_ = false;
+  int   clean_decode_steps_ = 0;
+  int   step_mail_cnt_ = 0;       // absent experts seen in the current step
   bool  fast_sample_ = true;   // device top-k on the legacy decode path
   bool  capturing_step_ = false;  // whole-step capture in progress
 
@@ -433,7 +441,7 @@ class Session {
   bool pf_batched_ = true;    // SAGER_PF_BATCHED=0 -> legacy per-row walk
   int  pf_stream_min_ = 384;  // SAGER_PF_STREAM_MIN: tokens to arm stream-all
   int  pf_chunk_cap_ = 2048;  // SAGER_PF_CHUNK: batched route-buffer chunk cap
-  int  pf_cpu_cap_ = 256;     // SAGER_PF_CPU_ROWS: CPU-pool fallback row cap
+  int  pf_cpu_cap_ = 1024;    // SAGER_PF_CPU_ROWS: CPU-pool fallback row cap
 
   bool prepared_ = false;
 };

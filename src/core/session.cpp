@@ -2908,14 +2908,24 @@ void Session::drain_expert_touch(int n_rows) {
 // the patch because the resolution happens at the next layer boundary).
 // ---------------------------------------------------------------------------
 void Session::resolve_cpu_mailbox(int layer, int n) {
-  if (layer < 0 || mail_pending_ != layer || !pump_ ||
-      !ev_scan_ || (!pump_->stream_active() && !dec_mail_ok_)) {
+  // v0.12.6 (root cause 11): the old guard (!pump_->stream_active() &&
+  // !dec_mail_ok_) also blocked the SMALL-CHUNK prefill walk (n <
+  // pf_stream_min_), where absent experts were silently dropped from the
+  // residual stream - every 26-31 token prompt combined only the resident
+  // subset of its routed experts. mail_pending_ == layer is the real
+  // freshness contract: the device dispatch set it after writing
+  // d_mail_/d_off_/d_gslot_/d_grows_ for exactly this layer.
+  if (layer < 0 || mail_pending_ != layer || !pump_ || !ev_scan_) {
     return;
   }
-  // Non-blocking first: the scan kernel of layer `layer` is near the head of
-  // the queue; if it has not run yet, retry at the next boundary and force
-  // at the end of the window.
-  if (cudaEventQuery(ev_scan_) != cudaSuccess) return;
+  // v0.12.6: BLOCK on the scan event. The old cudaEventQuery retry silently
+  // dropped the mail whenever the host ran ahead of the GPU (typical for
+  // small-chunk prefills with no pump stream session) - the next boundary
+  // targets a different layer so the retry contract never fired. The wait
+  // is bounded: the event is recorded right after the scan kernel, and in
+  // stream-all chunks the pump's stream_wait_layer already serializes the
+  // host to within one layer of the GPU.
+  if (cudaEventSynchronize(ev_scan_) != cudaSuccess) return;
   mail_pending_ = -1;
   const int cnt = *h_mail_n_.get();
   if (cnt <= 0) return;
@@ -2957,6 +2967,7 @@ void Session::resolve_cpu_mailbox(int layer, int n) {
     for (int e : uniq) dec_promote_.emplace_back(layer, e);
   }
   cpu_pool_patch_rows(layer, n, uniq.data(), static_cast<int>(uniq.size()));
+  if (dec_mail_ok_) step_mail_cnt_ += static_cast<int>(uniq.size());
 }
 
 // ---------------------------------------------------------------------------
@@ -3430,15 +3441,19 @@ const float* Session::decode_step(int last_id) {
   cudaStream_t s = stream_.get();
   const bool dev_path = dec_device_ && pf_device_ && pump_ != nullptr;
 
-  if (dev_path && step_graph_ok_) {
+  if (dev_path && step_graph_ok_ && step_graph_allow_) {
     // ---- v0.7 whole-step decode: TWO cudaGraphLaunch calls carry the whole
     // step (embedding + 40 layers, then head + penalties + top-k + mirrors).
     // The pinned stage buffers are read by memcpy nodes at replay time, so
     // the CPU only writes them, launches, and syncs once. Absent experts
     // still zero + mail in-kernel; the step-end CPU patch re-runs the head
     // graph (rare at ~99% row residency) to keep logits exact.
+    // v0.12.6: this path is EXACT only when NO layer mails (the mid-layer
+    // residual flow cannot be corrected retroactively); step_graph_allow_
+    // is the adaptive gate that guarantees it.
     dev_sample_valid_ = false;
     if (!dec_tbl_built_) build_decode_table();
+    step_mail_cnt_ = 0;
     const int p7 = pos_;
     int* st7 = h_step_stage_.get();
     st7[0] = last_id;
@@ -3466,6 +3481,9 @@ const float* Session::decode_step(int last_id) {
 
     // Rare absent-expert patch: recompute the missing rows from the CPU pool
     // into x_, then replay the head graph so logits stay exact.
+    // v0.12.6: ANY mail means this step's mid-layer flow was approximate -
+    // fall back to the per-layer path (which patches between layers) until
+    // several consecutive clean steps prove the residency is warm again.
     bool patched7 = false;
     const int Lm7 = mc_.dims.n_moe_layer;
     for (int L = 0; L < mc_.dims.n_layer &&
@@ -3473,12 +3491,17 @@ const float* Session::decode_step(int last_id) {
       const int cnt7 = h_mail_n_all_.get()[L];
       if (cnt7 > 0) {
         patch_graph_mailbox(L, cnt7);
+        step_mail_cnt_ += cnt7;
         patched7 = true;
       }
     }
     if (patched7) {
       cudaGraphLaunch(static_cast<cudaGraphExec_t>(head_graph_), s);
       stream_.sync();
+    }
+    if (step_mail_cnt_ > 0) {
+      clean_decode_steps_ = 0;
+      step_graph_allow_ = false;
     }
     dev_sample_k_ = dev_sample_ ? 32 : 0;
     dev_sample_valid_ = dev_sample_;
@@ -3552,13 +3575,29 @@ const float* Session::decode_step(int last_id) {
 
     pump_->begin_step(static_cast<uint64_t>(perf.steps) + 1);
     dec_mail_ok_ = true;
+    step_mail_cnt_ = 0;
     int pe = 1;
     std::fill(used_full_.begin(), used_full_.end(), 0);
     if (dbg_layers_) {
       dbg_dump_f16("devpath.embed", x_.get(), 0, 64, s);
     }
     for (int L = 0; L < d.n_layer; ++L) {
-      resolve_cpu_mailbox(L - 1, 1);
+      // v0.12.6 (root cause 11): with full-layer graphs the layer's mail
+      // lands in the per-layer device slices (d_mail_n_all_[L-1]); patch it
+      // RIGHT HERE - before layer L runs - so the corrected residual feeds
+      // the rest of the step (the v0.6 step-end patch was too late and the
+      // v0.4 resolve_cpu_mailbox contract never fires under graph replay).
+      if (L > 0 && graphs_.full_valid() && used_full_[L - 1]) {
+        int cntL = 0;
+        cudaMemcpy(&cntL, d_mail_n_all_.get() + (L - 1), sizeof(int),
+                   cudaMemcpyDeviceToHost);
+        if (cntL > 0) {
+          patch_graph_mailbox(L - 1, cntL);
+          step_mail_cnt_ += cntL;
+        }
+      } else {
+        resolve_cpu_mailbox(L - 1, 1);
+      }
       // v0.6: replay the FULL layer (dense + MoE) from one graph. Absent
       // experts zero their rows in-kernel and mail to the per-layer slot;
       // the step-end patch recomputes them from the CPU pool before the
@@ -3587,24 +3626,25 @@ const float* Session::decode_step(int last_id) {
       }
     }
     if (prof.on) cudaEventRecord(prof_ev_[pe++], s);   // layers done
-    resolve_cpu_mailbox(d.n_layer - 1, 1);
+    if (graphs_.full_valid() && used_full_[d.n_layer - 1]) {
+      int cntL = 0;
+      cudaMemcpy(&cntL, d_mail_n_all_.get() + (d.n_layer - 1), sizeof(int),
+                 cudaMemcpyDeviceToHost);
+      if (cntL > 0) {
+        patch_graph_mailbox(d.n_layer - 1, cntL);
+        step_mail_cnt_ += cntL;
+      }
+    } else {
+      resolve_cpu_mailbox(d.n_layer - 1, 1);
+    }
     dec_mail_ok_ = false;
 
     // v0.6: land the per-layer mail mirrors, then patch any absent-expert
     // rows (CPU pool + AVX2) into x_ BEFORE the head - the step's logits stay
     // exact even when a routed expert is not resident (v0.4 semantics).
     stream_.sync();
-    if (graphs_.full_valid()) {
-      for (int L = 0;
-           L < d.n_layer && L < static_cast<int>(used_full_.size()); ++L) {
-        if (!used_full_[L] ||
-            L >= static_cast<int>(h_mail_n_all_.count())) {
-          continue;
-        }
-        const int cnt = h_mail_n_all_.get()[L];
-        if (cnt > 0) patch_graph_mailbox(L, cnt);
-      }
-    }
+    // v0.12.6: the per-boundary patch above already handled every layer;
+    // the old step-end bulk patch would DOUBLE-ADD the missing rows.
 
     head_launch();
     if (prof.on) cudaEventRecord(prof_ev_[pe++], s);   // head done
@@ -3703,6 +3743,15 @@ const float* Session::decode_step(int last_id) {
       dec_tbl_built_ = false;
     }
     drain_expert_touch(1);
+
+    // v0.12.6: adaptive whole-step gate - only trust the whole-step graph
+    // after several consecutive ZERO-mail steps (per-layer, patched).
+    if (step_mail_cnt_ == 0) {
+      ++clean_decode_steps_;
+      if (clean_decode_steps_ >= 4) step_graph_allow_ = true;
+    } else {
+      clean_decode_steps_ = 0;
+    }
 
     const double ms = now_ms() - t0;
     perf.decode_tps = perf.decode_tps > 0
@@ -3967,8 +4016,16 @@ Status Session::forward_window(const std::vector<int>& window,
     }
     if (prof.on) cudaEventRecord(fw_ev_[fw_ev_pe_++], s);
   }
+  // v0.12.6: the tail resolve must not race the scan event - a non-blocking
+  // skip here would silently drop the last layer's mail (nothing retries it
+  // after the window ends).
+  stream_.sync();
   resolve_cpu_mailbox(d.n_layer - 1, n);   // force the last layer's mailbox
   pos_ = p + n;
+  // v0.12.6: the prefill touch feed + possible rebalance shift the hot set -
+  // re-earn the whole-step decode graph with clean per-layer steps.
+  step_graph_allow_ = false;
+  clean_decode_steps_ = 0;
   // NOTE: recent_ids_ is NOT touched here - rejected speculative tokens must
   // not pollute the sampler's repetition window. decode_step and
   // verify_window push exactly the tokens that were committed.
@@ -4038,6 +4095,11 @@ void Session::reset() {
   // with stale GDN states would leak the previous context into the new one.
   zero_gdn_states();
   mail_pending_ = -1;
+  // v0.12.6: residency changed - require fresh clean steps before the
+  // whole-step decode graph is trusted again.
+  step_graph_allow_ = false;
+  clean_decode_steps_ = 0;
+  step_mail_cnt_ = 0;
 #endif
   if (pump_) pump_->clear();   // residency tied to the previous conversation
 }
