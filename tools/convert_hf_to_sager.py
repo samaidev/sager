@@ -349,14 +349,15 @@ class _RawST:
             f.seek(base + s)
             raw = f.read(e - s)
         dt = v["dtype"]
+        shape = tuple(int(x) for x in v["shape"])
         if dt == "F32":
-            return np.frombuffer(raw, dtype=np.float32).copy()
+            return np.frombuffer(raw, dtype=np.float32).copy().reshape(shape)
         if dt == "BF16":
             u = np.frombuffer(raw, dtype=np.uint16).astype(np.uint32)
-            return (u << 16).view(np.float32)
+            return (u << 16).view(np.float32).reshape(shape)
         if dt == "F16":
-            return np.frombuffer(raw, dtype=np.uint16).copy().view(
-                np.float16).astype(np.float32)
+            return (np.frombuffer(raw, dtype=np.uint16).copy().view(
+                np.float16).astype(np.float32).reshape(shape))
         raise ValueError(f"unsupported dtype {dt} for {name}")
 
     def __init__(self, hf_dir: str, files):
