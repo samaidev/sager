@@ -35,6 +35,8 @@ Status HotTier::rebuild(const ExpertCache& cache, const Weights& w,
   const uint8_t* host_pool = w.host_expert_base();
 
   int slot = 0;
+  int copy_fail_ = 0;
+  std::vector<int> probe_slot, probe_e;
   resident_count = 0;
   for (int L = 0; L < n_layers; ++L) {
     q4k::BlockQ4K** tg = tables_host.data() +
@@ -53,10 +55,24 @@ Status HotTier::rebuild(const ExpertCache& cache, const Weights& w,
       uint8_t* dst = pool.get() + static_cast<size_t>(slot) * per_expert_bytes;
       // (Re)copy is idempotent; a full recopy on each rebuild costs at most
       // a few hundred MB over PCIe and happens off the decode path.
-      cudaMemcpyAsync(dst, src, per_expert_bytes, cudaMemcpyHostToDevice, 0);
+      // v0.12.4 diag: count silent copy failures (root cause 9 hunt).
+      cudaError_t crc = cudaMemcpyAsync(dst, src, per_expert_bytes,
+                                        cudaMemcpyHostToDevice, 0);
+      if (crc != cudaSuccess) {
+        ++copy_fail_;
+        if (copy_fail_ < 8)
+          SLOG_E("cache", "rebuild: H2D L%d e%d slot %zu FAILED: %s", L, e,
+                 slot, cudaGetErrorString(crc));
+        cudaGetLastError();
+      }
       tg[e] = reinterpret_cast<q4k::BlockQ4K*>(dst);
       tu[e] = reinterpret_cast<q4k::BlockQ4K*>(dst + gu);
       to[e] = reinterpret_cast<q4k::BlockQ4K*>(dst + 2 * gu);
+      if (L == 0 && (e == 5 || e == 19 || e == 116 || e == 140 || e == 300 ||
+                     e == 1000)) {
+        probe_slot.push_back(static_cast<int>(slot));
+        probe_e.push_back(e);
+      }
       ++slot;
       ++resident_count;
     }
@@ -64,7 +80,27 @@ Status HotTier::rebuild(const ExpertCache& cache, const Weights& w,
   (void)dn;
   const size_t table_bytes = tables_host.size() * sizeof(q4k::BlockQ4K*);
   cudaMemcpy(tables.get(), tables_host.data(), table_bytes, cudaMemcpyHostToDevice);
-  SLOG_I("cache", "hot tier rebuilt: %d experts resident", resident_count);
+  SLOG_I("cache", "hot tier rebuilt: %d experts resident (copy_fail %d)",
+         resident_count, copy_fail_);
+  // v0.12.4 diag: post-copy sample readback - compare a few slots against the
+  // mmap source right now (catches silent copy loss at the source).
+  {
+    std::vector<uint8_t> got(1024), want(1024);
+    int bad = 0;
+    for (size_t i = 0; i < probe_slot.size(); ++i) {
+      const int s = probe_slot[i];
+      const uint8_t* src = host_pool + static_cast<size_t>(probe_e[i]) * per_expert_bytes;
+      cudaMemcpy(got.data(), pool.get() + static_cast<size_t>(s) * per_expert_bytes,
+                 got.size(), cudaMemcpyDeviceToHost);
+      std::memcpy(want.data(), src, want.size());
+      if (std::memcmp(got.data(), want.data(), got.size()) != 0) {
+        ++bad;
+        SLOG_E("cache", "rebuild POSTCOPY MISMATCH slot %d (L0 e%d)", s, probe_e[i]);
+      }
+    }
+    SLOG_I("cache", "rebuild postcopy sample: %d mismatches of %zu",
+           bad, probe_slot.size());
+  }
   return Status::kOk;
 #else
   (void)cache; (void)w; (void)n_layers; (void)n_experts; (void)per_expert_bytes;
