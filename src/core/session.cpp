@@ -786,8 +786,20 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
     cuda::sigmoid_mul_rows_f16(attn_out_.get(), d_gate_.get(),
                                n_tokens * Q, Q, Q, 0, s);
   }
-  // v0.12 diag: dense-layer pipeline health on the first attention layer
-  if (dbg_layers_ && layer == 3) {
+  // v0.12 diag: dense-layer pipeline health on the first attention layer.
+  // v0.12.7: skip while stream-capturing - this block contains SYNCHRONOUS
+  // memcpys (illegal mid-capture); with SAGER_DUMP_LOGITS=2 armed they
+  // killed the L3 full-layer graph capture ("previous error during
+  // capture") and silently downgraded the whole session to eager.
+  int dbg_l3 = dbg_layers_ && layer == 3;
+  if (dbg_l3) {
+    cudaStreamCaptureStatus dbg_cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(s, &dbg_cs) == cudaSuccess &&
+        dbg_cs != cudaStreamCaptureStatusNone) {
+      dbg_l3 = 0;
+    }
+  }
+  if (dbg_l3) {
     fprintf(stderr, "[sager/dbg] dense L3 n_tokens=%d Q=%d KVd=%d\n",
             n_tokens, Q, KVd);
     static PinnedBuffer<uint8_t> wdbg;
@@ -2441,11 +2453,12 @@ void Session::moe_dispatch_device(int layer, int n) {
     // (~24 ms/step!). The whole-step graph copies both packed mirrors with
     // TWO bulk D2H nodes at its end instead.
   } else if (!capturing) {
-    // mailbox count mirror (lands before ev_scan_ fires)
-    cudaMemcpyAsync(h_mail_n_.get(), d_mail_n_.get(), sizeof(int),
-                    cudaMemcpyDeviceToHost, s);
-    cudaEventRecord(ev_scan_, s);
-    mail_pending_ = layer;
+    // v0.12.7 (root cause 13b): the handshake moved AFTER the grouped
+    // gate/up kernel (step 7b below) - THAT kernel is what atomicAdd()s
+    // the absent-expert mails into d_mail_n_. The old mirror sat right
+    // after the scan (which zeroes *mail_n), so the host always read 0
+    // and resolve_cpu_mailbox never fired the CPU-pool patch on the
+    // eager decode path.
   }
   // chunk-level touch feed: async route-id mirror (consumed by
   // drain_expert_touch at the chunk boundary - no per-layer sync). Layer
@@ -2548,9 +2561,14 @@ void Session::moe_dispatch_device(int layer, int n) {
     // gate + up: C_row[m_e x FFX] = X_row[m_e x H] * W_row[FFX x H]^T
     for (int g0 = 0; g0 < E; g0 += G) {
       const int ge = std::min(G, E - g0);
+      // v0.12.7 (root cause 13a): the residency table is [t][Lm][E] - the
+      // per-layer slice starts at t*lstride + layer*E. The missing layer
+      // offset made every layer dequantize LAYER 0's expert weights.
       cuda::dequant_experts_q4_k_f16(
-          d_ptr_table_.get() + 0 * lstride + g0,
-          d_ptr_table_.get() + 1 * lstride + g0, off_l + g0,
+          d_ptr_table_.get() + 0 * lstride +
+              static_cast<size_t>(layer) * E + g0,
+          d_ptr_table_.get() + 1 * lstride +
+              static_cast<size_t>(layer) * E + g0, off_l + g0,
           ring_gu, 0, 10, H, ge, G,
           static_cast<long long>(gu_slot), s);
       for (int e = g0; e < g0 + ge; ++e) {
@@ -2579,7 +2597,8 @@ void Session::moe_dispatch_device(int layer, int n) {
     for (int g0 = 0; g0 < E; g0 += G) {
       const int ge = std::min(G, E - g0);
       cuda::dequant_experts_q4_k_f16(
-          d_ptr_table_.get() + 2 * lstride + g0, nullptr, off_l + g0,
+          d_ptr_table_.get() + 2 * lstride +
+              static_cast<size_t>(layer) * E + g0, nullptr, off_l + g0,
           ring_dn, 0, 11, FFX, ge, G,
           static_cast<long long>(dn_slot), s);
       for (int e = g0; e < g0 + ge; ++e) {
@@ -2622,9 +2641,13 @@ void Session::moe_dispatch_device(int layer, int n) {
   //    residency-worst-case K/tile + E + 16, which is 94% empty blocks.
   const int tiles_max = std::min(static_cast<int>(Rmax) / tile_gu + E + 16,
                                  static_cast<int>(Rmax));
+  // v0.12.7 (root cause 13a): per-layer slice offset (table is [t][Lm][E]).
+  // The missing layer*E made every decode layer >= 1 read LAYER 0's
+  // residency - routing L0-expert weights into all later layers (word soup),
+  // and hiding every absent expert of the true layer.
   cuda::gemv_grouped2_tab_q4_k_q8_f16out_mtok(
-      d_ptr_table_.get() + 0 * lstride,
-      d_ptr_table_.get() + 1 * lstride,
+      d_ptr_table_.get() + 0 * lstride + static_cast<size_t>(layer) * E,
+      d_ptr_table_.get() + 1 * lstride + static_cast<size_t>(layer) * E,
       off_l, toff_l, meta_l, mail_l, mail_n_l,
       tiles_max, d_xqg_.get(), expert_g2_.get(),
       expert_u2_.get(), FFX, H, E, tile_gu, s);
@@ -2652,10 +2675,22 @@ void Session::moe_dispatch_device(int layer, int n) {
   // 7) down projection (last reader of the ring slots; absent experts'
   //    output rows are zeroed in-kernel so the combine adds 0).
   cuda::gemv_grouped_tab_q4_k_q8_f16out_mtok(
-      d_ptr_table_.get() + 2 * lstride, off_l, toff_l,
+      d_ptr_table_.get() + 2 * lstride + static_cast<size_t>(layer) * E,
+      off_l, toff_l,
       meta_l, tiles_max, d_hqg_.get(), y_grouped_.get(), H, FFX, E,
       tile_gu, s);
   MOE_DBG("down_tab");
+
+  // 7b) mailbox handshake AFTER the grouped GEMMs (v0.12.7 root cause 13b):
+  // the mirror must observe d_mail_n_ after the gate/up kernel added the
+  // absent-expert mails. Skipped while capturing - the graph path reads the
+  // per-layer device counters directly at the layer boundaries.
+  if (!capturing) {
+    cudaMemcpyAsync(h_mail_n_.get(), d_mail_n_.get(), sizeof(int),
+                    cudaMemcpyDeviceToHost, s);
+    cudaEventRecord(ev_scan_, s);
+    mail_pending_ = layer;
+  }
 
   // 8) ring slots of this layer's planned pairs free after the down GEMM.
   if (pump_->stream_active()) pump_->stream_consume_layer(layer, s);
@@ -3047,6 +3082,24 @@ void Session::cpu_pool_patch_rows(int layer, int n, const int* uniq,
       }
       SLOG_W("moe", "epatchdump L0 #%d: rows=%d e0=%d |x|=%.4f |y|=%.4f max|y|=%.4f",
              dump_cnt_e, n_patch, patches[0].e, xs, ys, ymx);
+      // diag10c: full vectors of patch row 0 for the numpy cross-check
+      const char* ddir = std::getenv("SAGER_DBG_DIR");
+      char pth[256];
+      std::snprintf(pth, sizeof(pth), "%s/patch_e_x_%d.bin",
+                    ddir ? ddir : "/content/dmp", dump_cnt_e);
+      if (FILE* fp = std::fopen(pth, "wb")) {
+        std::fwrite(miss_x_.get(), 4, H, fp);
+        std::fclose(fp);
+      }
+      std::snprintf(pth, sizeof(pth), "%s/patch_e_y_%d.bin",
+                    ddir ? ddir : "/content/dmp", dump_cnt_e);
+      if (FILE* fp = std::fopen(pth, "wb")) {
+        std::fwrite(miss_y_.get(), 4, H, fp);
+        std::fclose(fp);
+      }
+      SLOG_W("moe", "epatchdump L0 #%d meta: layer=%d e=%d r=%d kk=%d "
+             "cflat=%d rk=%d", dump_cnt_e, layer, patches[0].e, patches[0].r,
+             patches[0].kk, h_cflat_.get()[0], h_rk_.get()[0]);
     }
   }
   cudaMemcpyAsync(d_miss_y_.get(), miss_y_.get(),
@@ -3181,6 +3234,24 @@ void Session::patch_graph_mailbox(int layer, int cnt) {
                  sizeof(float), cudaMemcpyDeviceToHost);
       SLOG_W("moe", "gpatchdump L0 #%d: rows=%d e0=%d |x|=%.4f |y|=%.4f max|y|=%.4f w0=%.5f",
              dump_cnt_g, n_patch, patches[0].e, xs, ys, ymx, w0);
+      // diag10c: full vectors of patch row 0 for the numpy cross-check
+      const char* ddir = std::getenv("SAGER_DBG_DIR");
+      char pth[256];
+      std::snprintf(pth, sizeof(pth), "%s/patch_g_x_%d.bin",
+                    ddir ? ddir : "/content/dmp", dump_cnt_g);
+      if (FILE* fp = std::fopen(pth, "wb")) {
+        std::fwrite(miss_x_.get(), 4, H, fp);
+        std::fclose(fp);
+      }
+      std::snprintf(pth, sizeof(pth), "%s/patch_g_y_%d.bin",
+                    ddir ? ddir : "/content/dmp", dump_cnt_g);
+      if (FILE* fp = std::fopen(pth, "wb")) {
+        std::fwrite(miss_y_.get(), 4, H, fp);
+        std::fclose(fp);
+      }
+      SLOG_W("moe", "gpatchdump L0 #%d meta: layer=%d e=%d r=%d kk=%d "
+             "cflat=%d rk=%d", dump_cnt_g, layer, patches[0].e, patches[0].r,
+             patches[0].kk, h_cflat_.get()[0], h_rk_.get()[0]);
     }
   }
   cudaMemcpyAsync(d_miss_y_.get(), miss_y_.get(),
@@ -3391,15 +3462,15 @@ void Session::build_decode_table() {
   // v0.6: per-layer absent-expert counts drive the full-graph replay gate
   // (a layer is only replayed from its captured graph when every expert is
   // resident, so the captured MoE body can never hit the mailbox).
-  // v0.12.6 FIX (root cause 12): the count indexed the flat table as
-  // [L][E], but the layout is [(L*3 + t)][E] - it read segments of OTHER
-  // layers and mis-gated the replay.
+  // v0.12.6/diag9 (root cause 12) fixed the L*E+e index but still assumed a
+  // [L][3][E] layout. v0.12.7: the flat table is [t][Lm][E] (see the writer
+  // above) - index it as (t*Lm + L)*E + e, matching every reader.
   for (int L = 0; L < Lm; ++L) {
     int cnt = 0;
     for (int e = 0; e < E; ++e) {
-      if (!h_ptr_table_.get()[(static_cast<size_t>(L) * 3 + 0) * E + e] ||
-          !h_ptr_table_.get()[(static_cast<size_t>(L) * 3 + 1) * E + e] ||
-          !h_ptr_table_.get()[(static_cast<size_t>(L) * 3 + 2) * E + e]) {
+      if (!h_ptr_table_.get()[(static_cast<size_t>(0) * Lm + L) * E + e] ||
+          !h_ptr_table_.get()[(static_cast<size_t>(1) * Lm + L) * E + e] ||
+          !h_ptr_table_.get()[(static_cast<size_t>(2) * Lm + L) * E + e]) {
         ++cnt;
       }
     }

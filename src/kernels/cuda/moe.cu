@@ -494,6 +494,12 @@ void gather_rows_f16_n(uint16_t* dst, const uint16_t* src,
 // CPU-pool patch: after the batched combine already ran (absent experts
 // contributed 0), add the late CPU results for the patched (row, slot) list.
 // rk[i] packs r * (n_used + 1) + kk.
+// v0.12.7: ONE tile loop over the whole patch list inside each thread. The
+// old grid.y = n_list launch issued all patches of a row CONCURRENTLY - a
+// classic read-modify-write race on out[row*hidden+i]: decode patches the
+// single token row with ~3-4 absent experts per layer, so most adds were
+// silently lost (the surviving add is often sub-ulp in fp16, which read as
+// "patch adds zero"). Serializing the list per thread makes the adds exact.
 __global__ void moe_combine_add_slots_kernel(uint16_t* out,
                                              const uint16_t* expert_y,
                                              const float* weight,
@@ -501,19 +507,20 @@ __global__ void moe_combine_add_slots_kernel(uint16_t* out,
                                              int hidden, int n_list) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= hidden) return;
-  const int li = blockIdx.y;
-  const size_t slot = static_cast<size_t>(rk[li]);
-  const size_t row = slot / (n_used + 1);
-  const float w = weight[slot];
-  const uint16_t* y = expert_y + slot * hidden + i;
-  float acc = ldh(out + row * hidden + i) + w * ldh(y);
-  sth(out + row * hidden + i, acc);
+  for (int li = 0; li < n_list; ++li) {
+    const size_t slot = static_cast<size_t>(rk[li]);
+    const size_t row = slot / (n_used + 1);
+    const float w = weight[slot];
+    const uint16_t* y = expert_y + slot * hidden + i;
+    const float acc = ldh(out + row * hidden + i) + w * ldh(y);
+    sth(out + row * hidden + i, acc);
+  }
 }
 
 void moe_combine_add_slots_f16(uint16_t* out, const uint16_t* expert_y,
                                const float* weight, const int* rk, int n_used,
                                int hidden, int n_list, cudaStream_t stream) {
-  dim3 block(256), grid((hidden + 255) / 256, n_list);
+  dim3 block(256), grid((hidden + 255) / 256);
   moe_combine_add_slots_kernel<<<grid, block, 0, stream>>>(
       out, expert_y, weight, rk, n_used, hidden, n_list);
 }
