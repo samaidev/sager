@@ -2802,6 +2802,26 @@ void Session::moe_dispatch_device(int layer, int n) {
       std::fclose(fp);
     }
     SLOG_W("moe", "diag2 L%d: dumped xq %d rows, %d ptr blobs", layer, R, nw);
+    // region identification: where do the routed pointers live?
+    const uint8_t* hot_base = reinterpret_cast<const uint8_t*>(hot_->pool.get());
+    const size_t hot_bytes = hot_->pool.count();
+    const uint8_t* pump_base = pump_ ? reinterpret_cast<const uint8_t*>(pump_->dev_base(0)) : nullptr;
+    for (int kk = 0; kk < K; ++kk) {
+      const int e = reinterpret_cast<const int*>(iw.data())[kk];
+      const uint64_t p = (layer == 0)
+          ? tab[(0 * d.n_moe_layer + layer) * E + e] : 0;
+      const char* where = p == 0 ? "null" :
+          ((reinterpret_cast<const uint8_t*>(p) >= hot_base &&
+            reinterpret_cast<const uint8_t*>(p) < hot_base + hot_bytes)
+               ? "hot" :
+          ((pump_base && reinterpret_cast<const uint8_t*>(p) >= pump_base &&
+            reinterpret_cast<const uint8_t*>(p) <
+                pump_base + static_cast<size_t>(pump_->slot_count()) *
+                                hot_->per_expert_bytes) ? "pump" : "UNKNOWN"));
+      SLOG_W("moe", "diag2 L%d kk%d e%d ptr=0x%lx %s hotslot=%ld",
+             layer, kk, e, (unsigned long)p, where,
+             (where[0] == 'h') ? (long)((reinterpret_cast<const uint8_t*>(p) - hot_base) / hot_->per_expert_bytes) : -1L);
+    }
   }
   cuda::moe_combine_batched_f16(x_.get(), expert_y_.get(), route_w_.get(),
                                 K, H, n, s);
