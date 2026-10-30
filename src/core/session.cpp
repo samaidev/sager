@@ -3123,7 +3123,11 @@ void Session::patch_graph_mailbox(int layer, int cnt) {
            layer, patches.size(), pf_cpu_cap_);
     patches.resize(static_cast<size_t>(pf_cpu_cap_));
   }
-  if (patches.empty()) return;
+  if (patches.empty()) {
+    SLOG_W("moe", "layer %d: graph mail cnt=%d but NO patch rows rebuilt",
+           layer, cnt);
+    return;
+  }
 
   std::vector<MissJob> mjobs;
   mjobs.reserve(patches.size());
@@ -3356,12 +3360,24 @@ void Session::build_decode_table() {
   // v0.6: per-layer absent-expert counts drive the full-graph replay gate
   // (a layer is only replayed from its captured graph when every expert is
   // resident, so the captured MoE body can never hit the mailbox).
+  // v0.12.6 FIX (root cause 12): the count indexed the flat table as
+  // [L][E], but the layout is [(L*3 + t)][E] - it read segments of OTHER
+  // layers and mis-gated the replay.
   for (int L = 0; L < Lm; ++L) {
     int cnt = 0;
     for (int e = 0; e < E; ++e) {
-      if (!h_ptr_table_.get()[static_cast<size_t>(L) * E + e]) ++cnt;
+      if (!h_ptr_table_.get()[(static_cast<size_t>(L) * 3 + 0) * E + e] ||
+          !h_ptr_table_.get()[(static_cast<size_t>(L) * 3 + 1) * E + e] ||
+          !h_ptr_table_.get()[(static_cast<size_t>(L) * 3 + 2) * E + e]) {
+        ++cnt;
+      }
     }
     absent_cnt_[static_cast<size_t>(L)] = cnt;
+  }
+  if (dbg_layers_) {
+    int tot = 0;
+    for (int L = 0; L < Lm; ++L) tot += absent_cnt_[static_cast<size_t>(L)];
+    SLOG_W("moe", "decode table: %d/%d experts absent (dbg)", tot, Lm * E);
   }
 }
 
@@ -3503,6 +3519,8 @@ const float* Session::decode_step(int last_id) {
       clean_decode_steps_ = 0;
       step_graph_allow_ = false;
     }
+    SLOG_W("moe", "decode step %d: whole mails=%d allow_next=%d",
+           perf.steps, step_mail_cnt_, (int)step_graph_allow_);
     dev_sample_k_ = dev_sample_ ? 32 : 0;
     dev_sample_valid_ = dev_sample_;
 
@@ -3752,6 +3770,8 @@ const float* Session::decode_step(int last_id) {
     } else {
       clean_decode_steps_ = 0;
     }
+    SLOG_W("moe", "decode step %d: layer mails=%d allow=%d",
+           perf.steps, step_mail_cnt_, (int)step_graph_allow_);
 
     const double ms = now_ms() - t0;
     perf.decode_tps = perf.decode_tps > 0
