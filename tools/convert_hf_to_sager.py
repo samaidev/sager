@@ -184,7 +184,13 @@ def quantize_q4_k_fast(w: np.ndarray) -> bytes:
 class GGUFWriter:
     def __init__(self):
         self.kv: List[Tuple[str, tuple]] = []   # (name, (ggml_type, payload))
+        # eager tensors: (name, dims, qtype, ready_bytes)
         self.tensors: List[Tuple[str, list, int, bytes]] = []
+        # deferred tensors: (name, dims, qtype, provider_fn) - quantized
+        # during write() so the big expert stacks never sit in RAM; the
+        # on_release hook frees the HF shards as they are fully consumed.
+        self.deferred: List[Tuple[str, list, int, object]] = []
+        self.on_release = None   # callable(name) or None
 
     def add(self, key: str, value) -> None:
         if isinstance(value, bool):
@@ -210,7 +216,8 @@ class GGUFWriter:
         else:
             raise ValueError(f"unsupported kv type for {key}")
 
-    def add_tensor(self, name: str, w: np.ndarray, qtype: int) -> None:
+    @staticmethod
+    def _encode(w: np.ndarray, qtype: int) -> Tuple[list, bytes]:
         if qtype == T_Q4_K:
             a = np.ascontiguousarray(w, dtype=np.float32)
             data = (quantize_q4_k_fast(a) if _QUANT_FAST else quantize_q4_k(a))
@@ -223,7 +230,18 @@ class GGUFWriter:
             dims = list(reversed(w.shape))
         else:
             raise ValueError(qtype)
+        return dims, data
+
+    def add_tensor(self, name: str, w: np.ndarray, qtype: int) -> None:
+        dims, data = self._encode(w, qtype)
         self.tensors.append((name, dims, qtype, data))
+
+    def add_tensor_deferred(self, name: str, shape: tuple, qtype: int,
+                            provider) -> None:
+        """provider() -> bytes (quantized lazily inside write())."""
+        dims = ([shape[1], shape[0]] if qtype == T_Q4_K
+                else list(reversed(shape)))
+        self.deferred.append((name, dims, qtype, provider))
 
     def write(self, path: str) -> None:
         align = 32
@@ -232,36 +250,66 @@ class GGUFWriter:
         for key, (t, payload) in self.kv:
             meta += struct.pack("<Q", len(key)) + key.encode()
             meta += struct.pack("<I", t) + payload
-        # tensor dir (names, dims, type, offset); offsets aligned
+        # tensor dir: names, dims, type, offset. Sizes of deferred tensors
+        # come from their shapes (deterministic for every quant we emit),
+        # so the whole directory is built before any data exists.
+        all_tensors = [(n, d, q) for n, d, q, _ in self.tensors] + \
+                      [(n, d, q) for n, d, q, _ in self.deferred]
         td = b""
         off = 0
-        offsets = []
-        for name, dims, qtype, data in self.tensors:
-            nb = len(data)
-            pad = (-off) % align
-            off += pad
-            offsets.append(pad)
+        for name, dims, qtype in all_tensors:
             td += struct.pack("<Q", len(name)) + name.encode()
             td += struct.pack("<I", len(dims))
             for dd in dims:
                 td += struct.pack("<Q", dd)
             td += struct.pack("<I", qtype)
             td += struct.pack("<Q", off)
-            off += nb
-        # ...but padding must live in the data section; simplest contract:
-        # no padding - align=32 respected by construction (sizes are multiples)
+            off += self._nbytes(dims, qtype)
+            pad = (-off) % align
+            off += pad
         header = GGUF_MAGIC + struct.pack("<I", 3)
-        header += struct.pack("<Q", len(self.tensors))
+        header += struct.pack("<Q", len(all_tensors))
         header += struct.pack("<Q", len(self.kv))
         with open(path, "wb") as f:
             f.write(header)
             f.write(meta)
             f.write(td)
-            for i, (name, dims, qtype, data) in enumerate(self.tensors):
+            pad = b"\0" * align
+            for name, dims, qtype, data in self.tensors:
                 f.write(data)
+                p = (-len(data)) % align
+                if p:
+                    f.write(pad[:p])
+                if self.on_release:
+                    self.on_release(name)
+            for i, (name, dims, qtype, provider) in enumerate(self.deferred):
+                data = provider()
+                assert len(data) == self._nbytes(dims, qtype), \
+                    f"{name}: {len(data)} != {self._nbytes(dims, qtype)}"
+                f.write(data)
+                p = (-len(data)) % align
+                if p:
+                    f.write(pad[:p])
+                del data
+                if self.on_release:
+                    self.on_release(name)
         print(f"[convert] wrote {path} "
               f"({os.path.getsize(path) / 2**30:.2f} GiB, "
-              f"{len(self.tensors)} tensors)")
+              f"{len(all_tensors)} tensors)")
+
+    @staticmethod
+    def _nbytes(dims: list, qtype: int) -> int:
+        # dims = gguf order (fastest first); elements = product
+        n = 1
+        for dd in dims:
+            n *= dd
+        if qtype == T_Q4_K:
+            return n // 256 * 144
+        if qtype == T_F16:
+            return n * 2
+        if qtype == T_F32:
+            return n * 4
+        raise ValueError(qtype)
 
 
 # ---------------------------------------------------------------------------
@@ -514,24 +562,53 @@ def convert(hf_dir: str, out_path: str, workers: int, fast: bool = False) -> Non
             w.add_tensor(f"blk.{layer}.ffn_up_shexp", src(m + "shared_expert.up_proj.weight"), T_Q4_K)
             w.add_tensor(f"blk.{layer}.ffn_down_shexp", src(m + "shared_expert.down_proj.weight"), T_Q4_K)
 
-    # experts in parallel (the expensive part)
-    print(f"[convert] quantizing {L} expert stacks with {workers} workers "
-          f"({'fast' if fast else 'searched'}) ...")
-    jobs = [(layer, mapping, cfg["n_expert"], exp_base(layer)) for layer in range(L)]
+    # ---- experts: DEFERRED providers (streamed during write()) ------------
+    # v0.12.8: the HF bf16 checkpoint (~67 GB) + the Q4 GGUF (~21 GB) + the
+    # pool do NOT fit on a 113 GB Colab disk simultaneously, so the expert
+    # stacks are quantized lazily inside write() and each shard is unlinked
+    # the moment its last consumed tensor is written (mmap of an unlinked
+    # file stays valid, so mid-write deletion is safe).
     qexp = quantize_q4_k_fast if fast else quantize_q4_k
-    if workers <= 1:
-        for j in jobs:
-            for name, arr, t in _convert_expert_layer(j):
-                print(f"[convert]   {name} {arr.shape}")
-                w.tensors.append((name, list(reversed(arr.shape)), t,
-                                  qexp(np.ascontiguousarray(arr, dtype=np.float32))))
-    else:
-        with ProcessPoolExecutor(max_workers=workers) as ex:
-            for res in ex.map(_convert_expert_layer, jobs):
-                for name, arr, t in res:
-                    print(f"[convert]   {name} {arr.shape}")
-                    w.tensors.append((name, list(reversed(arr.shape)), t,
-                                      qexp(np.ascontiguousarray(arr, dtype=np.float32))))
+    pending: Dict[str, int] = {}
+    for name, shard in mapping.items():
+        pending[shard] = pending.get(shard, 0) + 1
+    import os as _os
+
+    def release(name: str) -> None:
+        shard = mapping.get(name)
+        if shard is None:
+            return
+        pending[shard] -= 1
+        if pending[shard] == 0 and _os.path.exists(shard):
+            _os.unlink(shard)
+            print(f"[convert]   released {shard}")
+
+    w.on_release = release
+    for layer in range(L):
+        prefix = exp_base(layer)
+        for suffix, out_name in (("gate_proj.weight", "ffn_gate_exps"),
+                                 ("up_proj.weight", "ffn_up_exps"),
+                                 ("down_proj.weight", "ffn_down_exps")):
+            names = [f"{prefix}{e}.{suffix}" for e in range(cfg["n_expert"])]
+            shapes = []
+            for e in (0, cfg["n_expert"] - 1):
+                with safe_open(mapping[names[e]], framework="numpy") as pr:
+                    shapes.append(pr.get_slice(names[e]).get_shape())
+            assert shapes[0] == shapes[1], f"{out_name}: ragged experts"
+            rows, cols = shapes[0]
+            stack_shape = (cfg["n_expert"], rows, cols)
+
+            def provider(names=names, rows=rows, cols=cols,
+                         out_name=out_name):
+                mats = np.empty((len(names), rows, cols), dtype=np.float32)
+                for i, nm in enumerate(names):
+                    with safe_open(mapping[nm], framework="numpy") as f:
+                        mats[i] = f.get_tensor(nm).astype(np.float32)
+                return qexp(mats)
+
+            w.add_tensor_deferred(f"blk.{layer}.{out_name}", stack_shape,
+                                  T_Q4_K, provider)
+        print(f"[convert] layer {layer + 1}/{L}: experts deferred")
 
     w.write(out_path)
     print(f"[convert] done. Validate with: "
