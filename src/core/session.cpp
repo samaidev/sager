@@ -2769,6 +2769,39 @@ void Session::moe_dispatch_device(int layer, int n) {
     std::snprintf(path, sizeof(path), "%s/moeL%d_plan.bin",
                   ddir ? ddir : "/content/dmp", layer);
     if (FILE* fp = std::fopen(path, "wb")) { std::fwrite(plan.data(), 1, plan.size(), fp); std::fclose(fp); }
+    // v0.12.4 diag2: GEMV inputs - gathered Q8 rows + pointer-table entries
+    // (3 per routed expert) + 1 KB at each pointed weight (gate row 0 / down).
+    static std::vector<char> xq, pt;
+    xq.resize(static_cast<size_t>(R > 0 ? R : 1) * (H / 256) * 144);
+    cudaMemcpy(xq.data(), d_xqg_.get(), xq.size(), cudaMemcpyDeviceToHost);
+    std::snprintf(path, sizeof(path), "%s/moeL%d_xq.bin",
+                  ddir ? ddir : "/content/dmp", layer);
+    if (FILE* fp = std::fopen(path, "wb")) { std::fwrite(xq.data(), 1, xq.size(), fp); std::fclose(fp); }
+    const size_t tab_ptrs = 3 * static_cast<size_t>(d.n_moe_layer) * E;
+    pt.resize(tab_ptrs * sizeof(void*) + 8 * 1024);
+    cudaMemcpy(pt.data(), d_ptr_table_.get(), tab_ptrs * sizeof(void*),
+               cudaMemcpyDeviceToHost);
+    char* pv = pt.data() + tab_ptrs * sizeof(void*);
+    const void* const* tab = reinterpret_cast<const void* const*>(pt.data());
+    int nw = 0;
+    for (int kk = 0; kk < K && nw < 8; ++kk) {
+      const int e = reinterpret_cast<int*>(iw.data())[kk];
+      for (int t = 0; t < 3; ++t) {
+        const void* p = tab[(static_cast<size_t>(t) * d.n_moe_layer + layer) * E + e];
+        if (!p || nw >= 8) continue;
+        cudaMemcpy(pv + nw * 1024, p, 1024, cudaMemcpyDeviceToHost);
+        ++nw;
+      }
+    }
+    stream_.sync();
+    std::snprintf(path, sizeof(path), "%s/moeL%d_ptr.bin",
+                  ddir ? ddir : "/content/dmp", layer);
+    if (FILE* fp = std::fopen(path, "wb")) {
+      std::fwrite(pt.data(), 1, 3 * E * sizeof(void*) +
+                  static_cast<size_t>(nw) * 1024, fp);
+      std::fclose(fp);
+    }
+    SLOG_W("moe", "diag2 L%d: dumped xq %d rows, %d ptr blobs", layer, R, nw);
   }
   cuda::moe_combine_batched_f16(x_.get(), expert_y_.get(), route_w_.get(),
                                 K, H, n, s);
