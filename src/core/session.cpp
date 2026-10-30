@@ -3283,7 +3283,8 @@ void Session::head_launch_row(int row) {
                       dd ? dd : "/content/dmp");
         if (FILE* fp = std::fopen(pth, "wb")) {
           std::vector<uint16_t> xr(d.hidden);
-          cudaMemcpy(xr.data(), x_.get(), d.hidden * 2, cudaMemcpyDeviceToHost);
+          cudaMemcpy(xr.data(), x_.get() + static_cast<size_t>(row) * d.hidden,
+                     d.hidden * 2, cudaMemcpyDeviceToHost);
           std::fwrite(xr.data(), 2, d.hidden, fp);
           std::fclose(fp);
         }
