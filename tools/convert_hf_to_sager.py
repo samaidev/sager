@@ -673,7 +673,10 @@ def convert(hf_dir: str, out_path: str, workers: int, fast: bool = False) -> Non
                 mats = np.empty((len(names), rows, cols), dtype=np.float32)
                 for i, nm in enumerate(names):
                     mats[i] = _reader.get(nm)
-                return qexp(mats)
+                out = qexp(mats)
+                print(f"[dbg] {out_name}: mats={mats.shape} "
+                      f"bytes={len(out)}", flush=True)
+                return out
 
             w.add_tensor_deferred(f"blk.{layer}.{out_name}", stack_shape,
                                   T_Q4_K, provider)
