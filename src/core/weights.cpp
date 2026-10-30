@@ -219,9 +219,14 @@ const gguf::TensorInfo* find_tensor_w(gguf::File& f, const std::string& name) {
 Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
 #if defined(SAGER_HAVE_CUDA)
   const EngineDims& d = dims;
-  auto copyq4 = [&](void* dst, const gguf::TensorInfo* t) -> Status {
-    if (!t) return Status::kGgufParseError;
-    if (t->type != 12) return Status::kGgufParseError;
+  auto copyq4 = [&](void* dst, const gguf::TensorInfo* t,
+                    const char* what = "?") -> Status {
+    if (!t) { SLOG_E("weights", "copyq4: missing tensor %s", what);
+              return Status::kGgufParseError; }
+    if (t->type != 12) {
+      SLOG_E("weights", "copyq4: %s wrong type %u", what, t->type);
+      return Status::kGgufParseError;
+    }
     SAGER_CUDA_CHECK(cudaMemcpy(dst, f.tensor_data(*t), t->nbytes,
                                 cudaMemcpyHostToDevice));
     return Status::kOk;
@@ -229,7 +234,10 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
   // Requant a Q6_K tensor into a device Q4_K buffer, row by row.
   auto copyq6_as_q4 = [&](void* dst, const gguf::TensorInfo* t,
                           const char* what) -> Status {
-    if (!t || t->type != 14) return Status::kGgufParseError;
+    if (!t || t->type != 14) {
+      SLOG_E("weights", "copyq6: %s missing/wrong type", what);
+      return Status::kGgufParseError;
+    }
     const int rows = static_cast<int>(t->dims[1]);
     const int cols = static_cast<int>(t->dims[0]);
     const size_t row_bytes = static_cast<size_t>(t->row_bytes);
@@ -271,9 +279,11 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
   // Matrix copy that accepts Q4_K (direct) or Q6_K (dequant + requant).
   auto copymat = [&](void* dst, const gguf::TensorInfo* t,
                      const char* what) -> Status {
-    if (!t) return Status::kGgufParseError;
-    if (t->type == 12) return copyq4(dst, t);
+    if (!t) { SLOG_E("weights", "copymat: missing tensor %s", what);
+              return Status::kGgufParseError; }
+    if (t->type == 12) return copyq4(dst, t, what);
     if (t->type == 14) return copyq6_as_q4(dst, t, what);
+    SLOG_E("weights", "copymat: %s wrong type %u", what, t->type);
     return Status::kGgufParseError;
   };
   // fp32 -> fp16 upload
@@ -288,8 +298,10 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
     return Status::kOk;
   };
   // norms: fp16 native or fp32 -> fp16
-  auto copynorm = [&](void* dst, const gguf::TensorInfo* t) -> Status {
-    if (!t) return Status::kGgufParseError;
+  auto copynorm = [&](void* dst, const gguf::TensorInfo* t,
+                      const char* what = "?") -> Status {
+    if (!t) { SLOG_E("weights", "copynorm: missing tensor %s", what);
+              return Status::kGgufParseError; }
     if (t->type == 1) {
       SAGER_CUDA_CHECK(cudaMemcpy(dst, f.tensor_data(*t), t->nbytes,
                                   cudaMemcpyHostToDevice));
@@ -311,11 +323,14 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
     const std::string lp = "blk." + std::to_string(L) + ".";
     // ---- input + post-attention norms -----------------------------------
     if (const auto* t = find_tensor_w(f, lp + "attn_norm"))
-      if (copynorm(lw.attn_norm, t) != Status::kOk) return Status::kGgufParseError;
+      if (copynorm(lw.attn_norm, t, "attn_norm") != Status::kOk) {
+        SLOG_E("weights", "attn_norm copy failed");
+        return Status::kGgufParseError;
+      }
     const auto* ffn_t = find_tensor_w(f, lp + "ffn_norm");
     if (!ffn_t) ffn_t = find_tensor_w(f, lp + "post_attention_norm");
     if (ffn_t)
-      if (copynorm(lw.ffn_norm, ffn_t) != Status::kOk)
+      if (copynorm(lw.ffn_norm, ffn_t, "ffn_norm") != Status::kOk)
         return Status::kGgufParseError;
 
     Status s = Status::kOk;
