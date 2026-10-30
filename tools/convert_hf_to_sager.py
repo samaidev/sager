@@ -329,6 +329,9 @@ def find_weights(hf_dir: str) -> Dict[str, str]:
     mapping = {}
     for fn in sorted(files):
         p = os.path.join(hf_dir, fn)
+        if not os.path.exists(p):
+            print(f"[convert]   skipping missing shard {fn}")
+            continue
         with open(p, "rb") as f:
             n = struct.unpack("<Q", f.read(8))[0]
             h = json.loads(f.read(n))
