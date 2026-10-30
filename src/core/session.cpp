@@ -3836,6 +3836,22 @@ Status Session::forward_window(const std::vector<int>& window,
       fprintf(stderr,
               "[sager/dbg] post_embed row n=%d sum|x|=%.4f max|x|=%.4f\n",
               n, sabs, mx);
+      // v0.12.4 diag: dump the last row's post-embed values + token ids
+      const char* ddir2 = std::getenv("SAGER_DBG_DIR");
+      char pth2[256];
+      std::snprintf(pth2, sizeof(pth2), "%s/embed_row.bin",
+                    ddir2 ? ddir2 : "/content/dmp");
+      if (FILE* fp2 = std::fopen(pth2, "wb")) {
+        std::fwrite(dbg_emb.get(), 2, d.hidden, fp2);
+        std::fclose(fp2);
+      }
+      std::snprintf(pth2, sizeof(pth2), "%s/prompt_ids.txt",
+                    ddir2 ? ddir2 : "/content/dmp");
+      if (FILE* fp3 = std::fopen(pth2, "w")) {
+        for (int t = 0; t < n; ++t) fprintf(fp3, "%d ", window[t]);
+        fprintf(fp3, "\n");
+        std::fclose(fp3);
+      }
     }
   }
 
