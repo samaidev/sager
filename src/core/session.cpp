@@ -2772,23 +2772,24 @@ void Session::moe_dispatch_device(int layer, int n) {
     // v0.12.4 diag2: GEMV inputs - gathered Q8 rows + pointer-table entries
     // (3 per routed expert) + 1 KB at each pointed weight (gate row 0 / down).
     static std::vector<char> xq, pt;
-    xq.resize(static_cast<size_t>(R > 0 ? R : 1) * (H / 256) * 144);
+    xq.resize(static_cast<size_t>(R > 0 ? R : 1) * (H / 256) * sizeof(q4k::BlockQ8K));
     cudaMemcpy(xq.data(), d_xqg_.get(), xq.size(), cudaMemcpyDeviceToHost);
     std::snprintf(path, sizeof(path), "%s/moeL%d_xq.bin",
                   ddir ? ddir : "/content/dmp", layer);
     if (FILE* fp = std::fopen(path, "wb")) { std::fwrite(xq.data(), 1, xq.size(), fp); std::fclose(fp); }
     const size_t tab_ptrs = 3 * static_cast<size_t>(d.n_moe_layer) * E;
-    pt.resize(tab_ptrs * sizeof(void*) + 8 * 1024);
+    const int n_blob = 24;
+    pt.resize(tab_ptrs * sizeof(void*) + n_blob * 1024);
     cudaMemcpy(pt.data(), d_ptr_table_.get(), tab_ptrs * sizeof(void*),
                cudaMemcpyDeviceToHost);
     char* pv = pt.data() + tab_ptrs * sizeof(void*);
     const void* const* tab = reinterpret_cast<const void* const*>(pt.data());
     int nw = 0;
-    for (int kk = 0; kk < K && nw < 8; ++kk) {
-      const int e = reinterpret_cast<int*>(iw.data())[kk];
-      for (int t = 0; t < 3; ++t) {
+    for (int kk = 0; kk < K && nw < n_blob; ++kk) {
+      const int e = reinterpret_cast<const int*>(iw.data())[kk];
+      for (int t = 0; t < 3 && nw < n_blob; ++t) {
         const void* p = tab[(static_cast<size_t>(t) * d.n_moe_layer + layer) * E + e];
-        if (!p || nw >= 8) continue;
+        if (!p) continue;
         cudaMemcpy(pv + nw * 1024, p, 1024, cudaMemcpyDeviceToHost);
         ++nw;
       }
@@ -2797,10 +2798,23 @@ void Session::moe_dispatch_device(int layer, int n) {
     std::snprintf(path, sizeof(path), "%s/moeL%d_ptr.bin",
                   ddir ? ddir : "/content/dmp", layer);
     if (FILE* fp = std::fopen(path, "wb")) {
-      std::fwrite(pt.data(), 1, 3 * E * sizeof(void*) +
-                  static_cast<size_t>(nw) * 1024, fp);
+      std::fwrite(pt.data(), 1, pt.size(), fp);
       std::fclose(fp);
     }
+    // v0.12.4 diag5: post-GEMV stage dumps (silu output + requant rows) for
+    // the routed grouped rows - isolates which stage corrupts.
+    static std::vector<char> silu, hq;
+    silu.resize(static_cast<size_t>(R > 0 ? R : 1) * FFX * 2);
+    cudaMemcpy(silu.data(), expert_g2_.get(), silu.size(), cudaMemcpyDeviceToHost);
+    hq.resize(static_cast<size_t>(R > 0 ? R : 1) * (FFX / 256) * sizeof(q4k::BlockQ8K));
+    cudaMemcpy(hq.data(), d_hqg_.get(), hq.size(), cudaMemcpyDeviceToHost);
+    stream_.sync();
+    std::snprintf(path, sizeof(path), "%s/moeL%d_silu.bin",
+                  ddir ? ddir : "/content/dmp", layer);
+    if (FILE* fp = std::fopen(path, "wb")) { std::fwrite(silu.data(), 1, silu.size(), fp); std::fclose(fp); }
+    std::snprintf(path, sizeof(path), "%s/moeL%d_hq.bin",
+                  ddir ? ddir : "/content/dmp", layer);
+    if (FILE* fp = std::fopen(path, "wb")) { std::fwrite(hq.data(), 1, hq.size(), fp); std::fclose(fp); }
     SLOG_W("moe", "diag2 L%d: dumped xq %d rows, %d ptr blobs", layer, R, nw);
     // region identification: where do the routed pointers live?
     const uint8_t* hot_base = reinterpret_cast<const uint8_t*>(hot_->pool.get());
