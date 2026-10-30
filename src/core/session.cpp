@@ -1165,6 +1165,12 @@ static void dbg_dump_f32(const char* tag, const float* dev, size_t off,
           tag, sabs, mx, nans, buf[0], buf[1 % cnt], buf[2 % cnt],
           buf[3 % cnt], buf[4 % cnt], buf[5 % cnt]);
 }
+// v0.12.4 diag: read one device int synchronously (plan meta peek).
+static int dbg_host_int(const int* dev) {
+  int v = 0;
+  cudaMemcpy(&v, dev, sizeof(int), cudaMemcpyDeviceToHost);
+  return v;
+}
 #endif
 
 void Session::linear_layer_chunk(int layer, int n) {
@@ -2722,8 +2728,63 @@ void Session::moe_dispatch_device(int layer, int n) {
   }
 
   // 11) combine: x_ = residual + sum_k w * expert_y (absent experts add 0).
+  // v0.12.4 diag: full combine-input dump for the last row (numpy verification
+  // of the scatter/combine slot math). Files under SAGER_DBG_DIR (default
+  // /content/dmp): moeL<iw,yx,plan,post>.bin
+  if (dbg_layers_ && layer <= 1 && !capturing) {
+    const size_t rlast = static_cast<size_t>(n - 1);
+    static std::vector<char> iw, yx, plan, post;
+    iw.resize(2 * 4 * (K + 1));
+    cudaMemcpyAsync(iw.data(), route_idx_.get() + rlast * (K + 1),
+                    (K + 1) * sizeof(int), cudaMemcpyDeviceToHost, s);
+    cudaMemcpyAsync(iw.data() + 4 * (K + 1),
+                    route_w_.get() + rlast * (K + 1),
+                    (K + 1) * sizeof(float), cudaMemcpyDeviceToHost, s);
+    yx.resize(static_cast<size_t>(K + 2) * H * 2);
+    cudaMemcpyAsync(yx.data(),
+                    expert_y_.get() + rlast * (K + 1) * H,
+                    static_cast<size_t>(K + 1) * H * 2, cudaMemcpyDeviceToHost,
+                    s);
+    cudaMemcpyAsync(yx.data() + static_cast<size_t>(K + 1) * H * 2,
+                    x_.get() + rlast * H, static_cast<size_t>(H) * 2,
+                    cudaMemcpyDeviceToHost, s);
+    stream_.sync();
+    const int R = dbg_host_int(meta_l);
+    plan.resize(static_cast<size_t>(2 + (E + 1) + K + R) * 4);
+    int* pl = reinterpret_cast<int*>(plan.data());
+    cudaMemcpy(pl, meta_l, 2 * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(pl + 2, off_l, (E + 1) * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(pl + 2 + (E + 1), gslot_l + rlast * K, K * sizeof(int),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(pl + 2 + (E + 1) + K, grows_l, static_cast<size_t>(R) * 4,
+               cudaMemcpyDeviceToHost);
+    const char* ddir = std::getenv("SAGER_DBG_DIR");
+    char path[256];
+    std::snprintf(path, sizeof(path), "%s/moeL%d_iw.bin",
+                  ddir ? ddir : "/content/dmp", layer);
+    if (FILE* fp = std::fopen(path, "wb")) { std::fwrite(iw.data(), 1, iw.size(), fp); std::fclose(fp); }
+    std::snprintf(path, sizeof(path), "%s/moeL%d_yx.bin",
+                  ddir ? ddir : "/content/dmp", layer);
+    if (FILE* fp = std::fopen(path, "wb")) { std::fwrite(yx.data(), 1, yx.size(), fp); std::fclose(fp); }
+    std::snprintf(path, sizeof(path), "%s/moeL%d_plan.bin",
+                  ddir ? ddir : "/content/dmp", layer);
+    if (FILE* fp = std::fopen(path, "wb")) { std::fwrite(plan.data(), 1, plan.size(), fp); std::fclose(fp); }
+  }
   cuda::moe_combine_batched_f16(x_.get(), expert_y_.get(), route_w_.get(),
                                 K, H, n, s);
+  if (dbg_layers_ && layer <= 1 && !capturing) {
+    const size_t rlast = static_cast<size_t>(n - 1);
+    static std::vector<char> post;
+    post.resize(static_cast<size_t>(H) * 2);
+    cudaMemcpyAsync(post.data(), x_.get() + rlast * H,
+                    static_cast<size_t>(H) * 2, cudaMemcpyDeviceToHost, s);
+    stream_.sync();
+    const char* ddir = std::getenv("SAGER_DBG_DIR");
+    char path[256];
+    std::snprintf(path, sizeof(path), "%s/moeL%d_post.bin",
+                  ddir ? ddir : "/content/dmp", layer);
+    if (FILE* fp = std::fopen(path, "wb")) { std::fwrite(post.data(), 1, post.size(), fp); std::fclose(fp); }
+  }
   // v0.12 debug: combine health on the first MoE layer (SAGER_DUMP_LOGITS=2)
   if (dbg_layers_ && layer == 0 && !capturing) {
     dbg_dump_f32("router_W0", lw.router, 0, 16, s);
