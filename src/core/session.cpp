@@ -3269,6 +3269,33 @@ void Session::head_launch_row(int row) {
         fprintf(stderr, " (%d,%.3f)", top[k], tv[k]);
       }
       fprintf(stderr, "\n");
+      // v0.12.4 diag: dump the pre-norm residual row + post-norm row + logits
+      {
+        const char* dd = std::getenv("SAGER_DBG_DIR");
+        char pth[256];
+        std::snprintf(pth, sizeof(pth), "%s/step_logits.bin",
+                      dd ? dd : "/content/dmp");
+        if (FILE* fp = std::fopen(pth, "wb")) {
+          std::fwrite(lg, 4, nv, fp);
+          std::fclose(fp);
+        }
+        std::snprintf(pth, sizeof(pth), "%s/step_xrow.bin",
+                      dd ? dd : "/content/dmp");
+        if (FILE* fp = std::fopen(pth, "wb")) {
+          std::vector<uint16_t> xr(d.hidden);
+          cudaMemcpy(xr.data(), x_.get(), d.hidden * 2, cudaMemcpyDeviceToHost);
+          std::fwrite(xr.data(), 2, d.hidden, fp);
+          std::fclose(fp);
+        }
+        std::snprintf(pth, sizeof(pth), "%s/step_xnrow.bin",
+                      dd ? dd : "/content/dmp");
+        if (FILE* fp = std::fopen(pth, "wb")) {
+          std::vector<uint16_t> xr(d.hidden);
+          cudaMemcpy(xr.data(), xn_.get(), d.hidden * 2, cudaMemcpyDeviceToHost);
+          std::fwrite(xr.data(), 2, d.hidden, fp);
+          std::fclose(fp);
+        }
+      }
     }
   }
 }
