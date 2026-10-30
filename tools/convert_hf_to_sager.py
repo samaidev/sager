@@ -645,19 +645,20 @@ def convert(hf_dir: str, out_path: str, workers: int, fast: bool = False) -> Non
     # the moment its last consumed tensor is written (mmap of an unlinked
     # file stays valid, so mid-write deletion is safe).
     qexp = quantize_q4_k_fast if fast else quantize_q4_k
+    # Shard bookkeeping: a shard is unlinked when every DEFERRED key it
+    # holds has been written. Eager keys (dense tensors, embed, head) live
+    # in their own shards and simply never release - they are a few GB.
     pending: Dict[str, int] = {}
-    for name, shard in mapping.items():
-        pending[shard] = pending.get(shard, 0) + 1
+    gguf_keys: Dict[str, list] = {}
     import os as _os
 
     def release(name: str) -> None:
-        shard = mapping.get(name)
-        if shard is None:
-            return
-        pending[shard] -= 1
-        if pending[shard] == 0 and _os.path.exists(shard):
-            _os.unlink(shard)
-            print(f"[convert]   released {shard}")
+        for hf_name in gguf_keys.get(name, []):
+            shard = mapping[hf_name]
+            pending[shard] -= 1
+            if pending[shard] == 0 and _os.path.exists(shard):
+                _os.unlink(shard)
+                print(f"[convert]   released {shard}", flush=True)
 
     w.on_release = release
     for layer in range(L):
@@ -680,6 +681,10 @@ def convert(hf_dir: str, out_path: str, workers: int, fast: bool = False) -> Non
                       f"bytes={len(out)}", flush=True)
                 return out
 
+            gguf_keys[f"blk.{layer}.{out_name}"] = names
+            for nm in names:
+                shard = mapping[nm]
+                pending[shard] = pending.get(shard, 0) + 1
             w.add_tensor_deferred(f"blk.{layer}.{out_name}", stack_shape,
                                   T_Q4_K, provider)
         print(f"[convert] layer {layer + 1}/{L}: experts deferred")
