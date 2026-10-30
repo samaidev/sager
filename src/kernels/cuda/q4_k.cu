@@ -1913,9 +1913,14 @@ void quantize_q8_k_n(const uint16_t* x_f16, q4k::BlockQ8K* out,
   // (n_max = K * FFX/256 = 16) the grid rounded DOWN to 0 and the launch
   // failed with "invalid argument", silently leaving the routed experts'
   // quantized activations stale in d_hqg_ (v0.5 device-path corruption).
-  quantize_q8_k_n_kernel<<<(n_max + 255) / 256, 256, 0, stream>>>(x_f16, out,
-                                                                  d_rows,
-                                                                  row_mult);
+  // v0.12.5 FIX (word-soup root cause 10): `(n_max + 255) / 256` was still
+  // wrong - n_max is ALREADY denominated in Q8_K blocks (one thread-block
+  // quantizes exactly ONE 256-element block), so the extra /256 shrank the
+  // grid to 1 block at decode (15 of 16 routed rows kept stale activations)
+  // and to 129 blocks at chunk 2048 (rows 65+ of every chunk stale). The
+  // grid must simply be n_max; the kernel early-outs on the live row count.
+  quantize_q8_k_n_kernel<<<n_max, 256, 0, stream>>>(x_f16, out, d_rows,
+                                                    row_mult);
 }
 
 void gemv_grouped2_tab_q4_k_q8_f16out_mtok(
