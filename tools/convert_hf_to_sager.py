@@ -239,8 +239,7 @@ class GGUFWriter:
     def add_tensor_deferred(self, name: str, shape: tuple, qtype: int,
                             provider) -> None:
         """provider() -> bytes (quantized lazily inside write())."""
-        dims = ([shape[1], shape[0]] if qtype == T_Q4_K
-                else list(reversed(shape)))
+        dims = list(reversed(shape))   # gguf: fastest first (any rank)
         self.deferred.append((name, dims, qtype, provider))
 
     def write(self, path: str) -> None:
