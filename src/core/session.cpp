@@ -3036,7 +3036,7 @@ void Session::cpu_pool_patch_rows(int layer, int n, const int* uniq,
   pool_.submit(std::move(mjobs));
   pool_.wait_done(nullptr);
   // v0.12.6 diag: patch numerical verification (layer 0, eager mailbox path)
-  if (dbg_layers_ && layer == 0 && n_patch > 0) {
+  if (dbg_layers_ && n_patch > 0 && patches.size() > 0) {
     static int dump_cnt_e = 0;
     if (dump_cnt_e++ < 3) {
       float ys = 0.f, ymx = 0.f, xs = 0.f;
@@ -3167,7 +3167,7 @@ void Session::patch_graph_mailbox(int layer, int cnt) {
   pool_.submit(std::move(mjobs));
   pool_.wait_done(nullptr);
   // v0.12.6 diag: patch numerical verification (layer 0, graph mailbox path)
-  if (dbg_layers_ && layer == 0 && n_patch > 0) {
+  if (dbg_layers_ && n_patch > 0 && patches.size() > 0) {
     static int dump_cnt_g = 0;
     if (dump_cnt_g++ < 3) {
       float ys = 0.f, ymx = 0.f, xs = 0.f;
