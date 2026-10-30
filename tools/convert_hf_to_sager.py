@@ -482,8 +482,12 @@ def convert(hf_dir: str, out_path: str, workers: int, fast: bool = False) -> Non
             if la + "conv1d.bias" in mapping:
                 w.add_tensor(f"blk.{layer}.lin_conv_b",
                              src(la + "conv1d.bias").astype(np.float32), T_F16)
+            # v0.12.8: the engine expects the DECAY already pre-negated
+            # (A = -exp(A_log), see weights.hpp / C-GDN-3). The upstream GGUF
+            # stored this correctly, our converter wrote the raw log - fix.
             w.add_tensor(f"blk.{layer}.lin_A_log",
-                         src(la + "A_log").astype(np.float32), T_F32)
+                         (-np.exp(src(la + "A_log").astype(np.float64))
+                          ).astype(np.float32), T_F32)
             w.add_tensor(f"blk.{layer}.lin_dt_bias",
                          src(la + "dt_bias").astype(np.float32), T_F32)
             w.add_tensor(f"blk.{layer}.lin_q_norm",

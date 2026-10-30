@@ -1035,6 +1035,7 @@ void Session::linear_layer_launch(int layer, int n_tokens) {
                        lin_ab_.get(), nv, s);
     // per-head L2 normalization of q/k (C-GDN-1; no learnable weight)
     cuda::gdn_l2_norm_f16(lin_qn_.get(), lin_kn_.get(), lin_conv_.get(),
+                          lw.lin_q_norm, lw.lin_k_norm,
                           nk, K, mc_.norm_eps, s);
     // rank-1 gated delta update of the persistent state (C-GDN-4)
     cuda::gdn_delta_step_f16(delta_st, lin_y_.get(), lin_qn_.get(),
@@ -1336,7 +1337,8 @@ void Session::linear_layer_chunk(int layer, int n) {
   cuda::gdn_gate_chunk_f32(lin_ba_b_.get(), lw.lin_A_log, lw.lin_dt_bias,
                            lin_ab_b_.get(), g.n_v_heads, n, s);
   cuda::gdn_l2_norm_chunk_f16(lin_qn_b_.get(), lin_kn_b_.get(),
-                              lin_conv_b_.get(), g.conv_dim(), g.n_k_heads,
+                              lin_conv_b_.get(), lw.lin_q_norm,
+                              lw.lin_k_norm, g.conv_dim(), g.n_k_heads,
                               g.key_dim, mc_.norm_eps, n, s);
   // fused recurrence scan (state stays in shared memory across the chunk)
   if (gdn_ws_ && gdn_r4_) {

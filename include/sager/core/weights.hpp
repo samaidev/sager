@@ -76,6 +76,12 @@ struct LayerWeights {
   float*    lin_A_log   = nullptr;   // holds ssm_a (already -exp(A_log))
   float*    lin_dt_bias = nullptr;
   uint16_t* lin_o_norm  = nullptr;
+  // v0.12.8 (C-GDN-1): per-head RMSNorm weights applied before the L2
+  // normalize of q/k (the checkpoint's linear_attn.q_norm/k_norm, [K] fp16,
+  // one weight shared across heads). The v0.2-0.12 kernels skipped this
+  // stage entirely - latent until real (non-corrupt) weights arrived.
+  uint16_t* lin_q_norm  = nullptr;
+  uint16_t* lin_k_norm  = nullptr;
 };
 
 class Weights {

@@ -128,6 +128,7 @@ void gdn_conv_step_f16(uint16_t* conv_out, uint16_t* conv_state,
                        cudaStream_t stream);
 
 void gdn_l2_norm_f16(uint16_t* qn, uint16_t* kn, const uint16_t* conv_out,
+                     const uint16_t* qw, const uint16_t* kw,
                      int nk, int K, float eps, cudaStream_t stream);
 
 void gdn_delta_step_f16(float* state, uint16_t* y, const uint16_t* qn,
@@ -163,7 +164,8 @@ void gdn_gate_chunk_f32(const uint16_t* ba, const float* A,
 
 // Per-head L2 norm of q/k for every token: qn/kn [n x nk*K].
 void gdn_l2_norm_chunk_f16(uint16_t* qn, uint16_t* kn,
-                           const uint16_t* conv_out, int conv_dim, int nk,
+                           const uint16_t* conv_out, const uint16_t* qw,
+                           const uint16_t* kw, int conv_dim, int nk,
                            int K, float eps, int n, cudaStream_t stream);
 
 // Fused chunk recurrence: one kernel walks all n tokens; each block keeps

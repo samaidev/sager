@@ -109,6 +109,7 @@ __global__ void gdn_conv_step_kernel(uint16_t* conv_out, uint16_t* conv_state,
 // ---------------------------------------------------------------------------
 __global__ void gdn_l2_norm_kernel(uint16_t* qn, uint16_t* kn,
                                    const uint16_t* conv_out,
+                                   const uint16_t* qw, const uint16_t* kw,
                                    int K, float eps) {
   extern __shared__ float sm[];            // K (values) + 1 (reduction)
   float* vals = sm;
@@ -118,7 +119,7 @@ __global__ void gdn_l2_norm_kernel(uint16_t* qn, uint16_t* kn,
   const int tid = threadIdx.x;
   const int off_k = gridDim.x * K;         // k part starts after all q heads
 
-  // q part
+  // q part: C-GDN-1 = RMSNorm(q, w) then per-head L2 normalize
   const uint16_t* src_q = conv_out + static_cast<size_t>(h) * K;
   float ss = 0.f;
   for (int i = tid; i < K; i += blockDim.x) {
@@ -126,7 +127,16 @@ __global__ void gdn_l2_norm_kernel(uint16_t* qn, uint16_t* kn,
     vals[i] = v;
     ss += v * v;
   }
-  const float inv_q = rsqrtf(block_sum_reduce(red, ss) + eps);
+  const float rms_inv = rsqrtf(block_sum_reduce(red, ss) /
+                               static_cast<float>(K) + eps);
+  __syncthreads();
+  float ss2 = 0.f;
+  for (int i = tid; i < K; i += blockDim.x) {
+    const float n = vals[i] * rms_inv * ldh(qw + i);
+    vals[i] = n;
+    ss2 += n * n;
+  }
+  const float inv_q = rsqrtf(block_sum_reduce(red, ss2) + eps);
   for (int i = tid; i < K; i += blockDim.x) {
     sth(qn + static_cast<size_t>(h) * K + i, vals[i] * inv_q);
   }
@@ -140,7 +150,16 @@ __global__ void gdn_l2_norm_kernel(uint16_t* qn, uint16_t* kn,
     vals[i] = v;
     ss += v * v;
   }
-  const float inv_k = rsqrtf(block_sum_reduce(red, ss) + eps);
+  const float rms_invk = rsqrtf(block_sum_reduce(red, ss) /
+                                 static_cast<float>(K) + eps);
+  __syncthreads();
+  ss2 = 0.f;
+  for (int i = tid; i < K; i += blockDim.x) {
+    const float n = vals[i] * rms_invk * ldh(kw + i);
+    vals[i] = n;
+    ss2 += n * n;
+  }
+  const float inv_k = rsqrtf(block_sum_reduce(red, ss2) + eps);
   for (int i = tid; i < K; i += blockDim.x) {
     sth(kn + static_cast<size_t>(h) * K + i, vals[i] * inv_k);
   }
@@ -313,6 +332,8 @@ __global__ void gdn_gate_chunk_kernel(const uint16_t* ba, const float* A,
 // Per-head L2 norm of q and k for every token (block = (head), grid.y = t).
 __global__ void gdn_l2_norm_chunk_kernel(uint16_t* qn, uint16_t* kn,
                                          const uint16_t* conv_out,
+                                         const uint16_t* qw,
+                                         const uint16_t* kw,
                                          int conv_dim, int nk, int K,
                                          float eps) {
   extern __shared__ float sm[];            // K (values) + reduction scratch
@@ -325,7 +346,7 @@ __global__ void gdn_l2_norm_chunk_kernel(uint16_t* qn, uint16_t* kn,
   const int off_k = nk * K;
   const uint16_t* row = conv_out + static_cast<size_t>(t) * conv_dim;
 
-  // q part
+  // q part: C-GDN-1 = RMSNorm(q, w) then per-head L2 normalize
   const uint16_t* src_q = row + static_cast<size_t>(h) * K;
   float ss = 0.f;
   for (int i = tid; i < K; i += blockDim.x) {
@@ -333,7 +354,16 @@ __global__ void gdn_l2_norm_chunk_kernel(uint16_t* qn, uint16_t* kn,
     vals[i] = v;
     ss += v * v;
   }
-  const float inv_q = rsqrtf(block_sum_reduce(red, ss) + eps);
+  const float rms_inv = rsqrtf(block_sum_reduce(red, ss) /
+                               static_cast<float>(K) + eps);
+  __syncthreads();
+  float ss2 = 0.f;
+  for (int i = tid; i < K; i += blockDim.x) {
+    const float n = vals[i] * rms_inv * ldh(qw + i);
+    vals[i] = n;
+    ss2 += n * n;
+  }
+  const float inv_q = rsqrtf(block_sum_reduce(red, ss2) + eps);
   for (int i = tid; i < K; i += blockDim.x) {
     sth(qn + (static_cast<size_t>(t) * nk + h) * K + i, vals[i] * inv_q);
   }
@@ -347,7 +377,16 @@ __global__ void gdn_l2_norm_chunk_kernel(uint16_t* qn, uint16_t* kn,
     vals[i] = v;
     ss += v * v;
   }
-  const float inv_k = rsqrtf(block_sum_reduce(red, ss) + eps);
+  const float rms_invk = rsqrtf(block_sum_reduce(red, ss) /
+                                 static_cast<float>(K) + eps);
+  __syncthreads();
+  ss2 = 0.f;
+  for (int i = tid; i < K; i += blockDim.x) {
+    const float n = vals[i] * rms_invk * ldh(kw + i);
+    vals[i] = n;
+    ss2 += n * n;
+  }
+  const float inv_k = rsqrtf(block_sum_reduce(red, ss2) + eps);
   for (int i = tid; i < K; i += blockDim.x) {
     sth(kn + (static_cast<size_t>(t) * nk + h) * K + i, vals[i] * inv_k);
   }
@@ -484,13 +523,14 @@ void gdn_gate_chunk_f32(const uint16_t* ba, const float* A,
 }
 
 void gdn_l2_norm_chunk_f16(uint16_t* qn, uint16_t* kn,
-                           const uint16_t* conv_out, int conv_dim, int nk,
+                           const uint16_t* conv_out, const uint16_t* qw,
+                           const uint16_t* kw, int conv_dim, int nk,
                            int K, float eps, int n, cudaStream_t stream) {
   const int block = 128;   // MUST match the per-token kernel: same reduce tree
   const size_t smem = (static_cast<size_t>(K) + block) * sizeof(float);
   dim3 grid(nk, n);
   gdn_l2_norm_chunk_kernel<<<grid, block, smem, stream>>>(
-      qn, kn, conv_out, conv_dim, nk, K, eps);
+      qn, kn, conv_out, qw, kw, conv_dim, nk, K, eps);
 }
 
 void gdn_scan_chunk_f16(float* state, uint16_t* y, const uint16_t* qn,
@@ -751,11 +791,13 @@ void gdn_conv_step_f16(uint16_t* conv_out, uint16_t* conv_state,
 }
 
 void gdn_l2_norm_f16(uint16_t* qn, uint16_t* kn, const uint16_t* conv_out,
+                     const uint16_t* qw, const uint16_t* kw,
                      int nk, int K, float eps, cudaStream_t stream) {
   const int block = 128;
   // vals[K] + red[block]: block_sum_reduce writes red[tid] for every thread.
   const size_t smem = (static_cast<size_t>(K) + block) * sizeof(float);
-  gdn_l2_norm_kernel<<<nk, block, smem, stream>>>(qn, kn, conv_out, K, eps);
+  gdn_l2_norm_kernel<<<nk, block, smem, stream>>>(qn, kn, conv_out, qw, kw,
+                                                  K, eps);
 }
 
 void gdn_delta_step_f16(float* state, uint16_t* y, const uint16_t* qn,

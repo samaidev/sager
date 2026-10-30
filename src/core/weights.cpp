@@ -125,17 +125,22 @@ Status Weights::alloc_vram(const ModelConfig& cfg) {
     if (linear) {
       void* cw = nullptr; void* cb = nullptr; void* al = nullptr;
       void* db = nullptr; void* on = nullptr;
+      void* qn = nullptr; void* kn = nullptr;
       if (dmalloc(&cw, static_cast<size_t>(g.conv_dim()) * g.conv_kernel * 2) != Status::kOk ||
           dmalloc(&cb, static_cast<size_t>(g.conv_dim()) * 2) != Status::kOk ||
           dmalloc(&al, static_cast<size_t>(g.n_v_heads) * 4) != Status::kOk ||
           dmalloc(&db, static_cast<size_t>(g.n_v_heads) * 4) != Status::kOk ||
-          dmalloc(&on, static_cast<size_t>(g.value_dim) * 2) != Status::kOk)
+          dmalloc(&on, static_cast<size_t>(g.value_dim) * 2) != Status::kOk ||
+          dmalloc(&qn, static_cast<size_t>(g.key_dim) * 2) != Status::kOk ||
+          dmalloc(&kn, static_cast<size_t>(g.key_dim) * 2) != Status::kOk)
         return Status::kOomVram;
       lw.lin_conv_w  = static_cast<uint16_t*>(cw);
       lw.lin_conv_b  = static_cast<uint16_t*>(cb);
       lw.lin_A_log   = static_cast<float*>(al);   // holds ssm_a (pre-negated)
       lw.lin_dt_bias = static_cast<float*>(db);
       lw.lin_o_norm  = static_cast<uint16_t*>(on);
+      lw.lin_q_norm  = static_cast<uint16_t*>(qn);
+      lw.lin_k_norm  = static_cast<uint16_t*>(kn);
     }
   }
 
@@ -416,6 +421,27 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
       } else if (const auto* t = f.tensor((lp + "lin_o_norm").c_str())) {
         if (t->type != 1) return Status::kGgufParseError;
         SAGER_CUDA_CHECK(cudaMemcpy(lw.lin_o_norm, f.tensor_data(*t),
+                                    t->nbytes, cudaMemcpyHostToDevice));
+      }
+      // v0.12.8 (C-GDN-1): q/k RMSNorm weights ([K] fp16; the converter
+      // writes lin_q_norm/lin_k_norm; native checkpoints may use
+      // ssm_q_norm/ssm_k_norm fp32).
+      if (const auto* t = f.tensor((lp + "ssm_q_norm.weight").c_str())) {
+        s = copyf32_as_f16(lw.lin_q_norm, t);
+        if (s != Status::kOk) return s;
+      } else if (const auto* t =
+                     f.tensor((lp + "lin_q_norm").c_str())) {
+        if (t->type != 1) return Status::kGgufParseError;
+        SAGER_CUDA_CHECK(cudaMemcpy(lw.lin_q_norm, f.tensor_data(*t),
+                                    t->nbytes, cudaMemcpyHostToDevice));
+      }
+      if (const auto* t = f.tensor((lp + "ssm_k_norm.weight").c_str())) {
+        s = copyf32_as_f16(lw.lin_k_norm, t);
+        if (s != Status::kOk) return s;
+      } else if (const auto* t =
+                     f.tensor((lp + "lin_k_norm").c_str())) {
+        if (t->type != 1) return Status::kGgufParseError;
+        SAGER_CUDA_CHECK(cudaMemcpy(lw.lin_k_norm, f.tensor_data(*t),
                                     t->nbytes, cudaMemcpyHostToDevice));
       } else {
         return Status::kGgufParseError;
@@ -831,6 +857,8 @@ void Weights::unload() {
     if (lw.lin_A_log)   { cudaFree(lw.lin_A_log);   lw.lin_A_log = nullptr; }
     if (lw.lin_dt_bias) { cudaFree(lw.lin_dt_bias); lw.lin_dt_bias = nullptr; }
     if (lw.lin_o_norm)  { cudaFree(lw.lin_o_norm);  lw.lin_o_norm = nullptr; }
+    if (lw.lin_q_norm)  { cudaFree(lw.lin_q_norm);  lw.lin_q_norm = nullptr; }
+    if (lw.lin_k_norm)  { cudaFree(lw.lin_k_norm);  lw.lin_k_norm = nullptr; }
     if (lw.attn_q_norm) { cudaFree(lw.attn_q_norm); lw.attn_q_norm = nullptr; }
     if (lw.attn_k_norm) { cudaFree(lw.attn_k_norm); lw.attn_k_norm = nullptr; }
     if (lw.shared_gate_w) { cudaFree(lw.shared_gate_w); lw.shared_gate_w = nullptr; }
