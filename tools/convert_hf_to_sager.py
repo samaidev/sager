@@ -598,10 +598,16 @@ def convert(hf_dir: str, out_path: str, workers: int, fast: bool = False) -> Non
                           ).astype(np.float32), T_F32)
             w.add_tensor(f"blk.{layer}.lin_dt_bias",
                          src(la + "dt_bias").astype(np.float32), T_F32)
-            w.add_tensor(f"blk.{layer}.lin_q_norm",
-                         src(la + "q_norm.weight").astype(np.float32), T_F16)
-            w.add_tensor(f"blk.{layer}.lin_k_norm",
-                         src(la + "k_norm.weight").astype(np.float32), T_F16)
+            # Sage-A1.5 has NO linear-attn q/k norm weights (bare L2, the
+            # v0.2 engine behavior) - write them only if the checkpoint has.
+            if la + "q_norm.weight" in mapping:
+                w.add_tensor(f"blk.{layer}.lin_q_norm",
+                             src(la + "q_norm.weight").astype(np.float32),
+                             T_F16)
+            if la + "k_norm.weight" in mapping:
+                w.add_tensor(f"blk.{layer}.lin_k_norm",
+                             src(la + "k_norm.weight").astype(np.float32),
+                             T_F16)
             on_src = (la + "norm.weight") \
                 if (la + "norm.weight") in mapping \
                 else (la + "o_norm.weight")
