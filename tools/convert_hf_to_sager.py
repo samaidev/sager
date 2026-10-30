@@ -568,10 +568,22 @@ def convert(hf_dir: str, out_path: str, workers: int, fast: bool = False) -> Non
             # ---- gated delta net layer (v0.2) ----
             print(f"[convert] layer {layer + 1}/{L}: gated-delta ...")
             la = p + "linear_attn."
-            w.add_tensor(f"blk.{layer}.lin_in_qkvz",
-                         src(la + "in_proj_qkvz.weight"), T_Q4_K)
-            w.add_tensor(f"blk.{layer}.lin_in_ba",
-                         src(la + "in_proj_ba.weight"), T_Q4_K)
+            # v0.12.8: the Sage-A1.5 checkpoint splits the fused GDN input
+            # projections: in_proj_qkv [2*nk*K + ...? -> q|k|v] +
+            # in_proj_z (the gate) + in_proj_b / in_proj_a (beta / a).
+            # Rebuild the engine's fused [q|k|v|z] and [b|a] carves.
+            qkv = src(la + "in_proj_qkv.weight")
+            z = src(la + "in_proj_z.weight")
+            if qkv.ndim == 1:
+                qkv = qkv.reshape(-1, qkv.shape[-1] if qkv.ndim else 1)
+            qkvz = np.vstack([np.asarray(qkv, dtype=np.float32),
+                              np.asarray(z, dtype=np.float32)])
+            w.add_tensor(f"blk.{layer}.lin_in_qkvz", qkvz, T_Q4_K)
+            ba = np.vstack([np.asarray(src(la + "in_proj_b.weight"),
+                                       dtype=np.float32),
+                            np.asarray(src(la + "in_proj_a.weight"),
+                                       dtype=np.float32)])
+            w.add_tensor(f"blk.{layer}.lin_in_ba", ba, T_Q4_K)
             conv_w = src(la + "conv1d.weight")
             conv_w = np.asarray(conv_w).reshape(conv_w.shape[0], -1)  # [D,1,ck] -> [D,ck]
             w.add_tensor(f"blk.{layer}.lin_conv_w", conv_w, T_F16)
@@ -590,8 +602,11 @@ def convert(hf_dir: str, out_path: str, workers: int, fast: bool = False) -> Non
                          src(la + "q_norm.weight").astype(np.float32), T_F16)
             w.add_tensor(f"blk.{layer}.lin_k_norm",
                          src(la + "k_norm.weight").astype(np.float32), T_F16)
+            on_src = (la + "norm.weight") \
+                if (la + "norm.weight") in mapping \
+                else (la + "o_norm.weight")
             w.add_tensor(f"blk.{layer}.lin_o_norm",
-                         src(la + "o_norm.weight").astype(np.float32), T_F16)
+                         src(on_src).astype(np.float32), T_F16)
             w.add_tensor(f"blk.{layer}.lin_out",
                          src(la + "out_proj.weight"), T_Q4_K)
         else:
@@ -601,6 +616,11 @@ def convert(hf_dir: str, out_path: str, workers: int, fast: bool = False) -> Non
             w.add_tensor(f"blk.{layer}.attn_k.weight", src(p + "self_attn.k_proj.weight"), T_Q4_K)
             w.add_tensor(f"blk.{layer}.attn_v.weight", src(p + "self_attn.v_proj.weight"), T_Q4_K)
             w.add_tensor(f"blk.{layer}.attn_output.weight", src(p + "self_attn.o_proj.weight"), T_Q4_K)
+            if p + "self_attn.q_norm.weight" in mapping:
+                w.add_tensor(f"blk.{layer}.attn_q_norm",
+                             src(p + "self_attn.q_norm.weight").astype(np.float32), T_F16)
+                w.add_tensor(f"blk.{layer}.attn_k_norm",
+                             src(p + "self_attn.k_norm.weight").astype(np.float32), T_F16)
         print(f"[convert] layer {layer + 1}/{L}: router + shared ...")
         m = moe_of(layer)
         w.add_tensor(f"blk.{layer}.ffn_gate_inp",

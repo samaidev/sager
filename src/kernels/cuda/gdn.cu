@@ -127,14 +127,19 @@ __global__ void gdn_l2_norm_kernel(uint16_t* qn, uint16_t* kn,
     vals[i] = v;
     ss += v * v;
   }
-  const float rms_inv = rsqrtf(block_sum_reduce(red, ss) /
-                               static_cast<float>(K) + eps);
-  __syncthreads();
-  float ss2 = 0.f;
-  for (int i = tid; i < K; i += blockDim.x) {
-    const float n = vals[i] * rms_inv * ldh(qw + i);
-    vals[i] = n;
-    ss2 += n * n;
+  float ss2;
+  if (qw) {
+    const float rms_inv = rsqrtf(block_sum_reduce(red, ss) /
+                                 static_cast<float>(K) + eps);
+    __syncthreads();
+    ss2 = 0.f;
+    for (int i = tid; i < K; i += blockDim.x) {
+      const float n = vals[i] * rms_inv * ldh(qw + i);
+      vals[i] = n;
+      ss2 += n * n;
+    }
+  } else {
+    ss2 = ss;   // checkpoint without linear q/k norms: bare L2 (v0.2)
   }
   const float inv_q = rsqrtf(block_sum_reduce(red, ss2) + eps);
   for (int i = tid; i < K; i += blockDim.x) {
@@ -150,14 +155,18 @@ __global__ void gdn_l2_norm_kernel(uint16_t* qn, uint16_t* kn,
     vals[i] = v;
     ss += v * v;
   }
-  const float rms_invk = rsqrtf(block_sum_reduce(red, ss) /
-                                 static_cast<float>(K) + eps);
-  __syncthreads();
-  ss2 = 0.f;
-  for (int i = tid; i < K; i += blockDim.x) {
-    const float n = vals[i] * rms_invk * ldh(kw + i);
-    vals[i] = n;
-    ss2 += n * n;
+  if (kw) {
+    const float rms_invk = rsqrtf(block_sum_reduce(red, ss) /
+                                   static_cast<float>(K) + eps);
+    __syncthreads();
+    ss2 = 0.f;
+    for (int i = tid; i < K; i += blockDim.x) {
+      const float n = vals[i] * rms_invk * ldh(kw + i);
+      vals[i] = n;
+      ss2 += n * n;
+    }
+  } else {
+    ss2 = ss;   // checkpoint without linear k norms: bare L2 (v0.2)
   }
   const float inv_k = rsqrtf(block_sum_reduce(red, ss2) + eps);
   for (int i = tid; i < K; i += blockDim.x) {
@@ -354,14 +363,19 @@ __global__ void gdn_l2_norm_chunk_kernel(uint16_t* qn, uint16_t* kn,
     vals[i] = v;
     ss += v * v;
   }
-  const float rms_inv = rsqrtf(block_sum_reduce(red, ss) /
-                               static_cast<float>(K) + eps);
-  __syncthreads();
-  float ss2 = 0.f;
-  for (int i = tid; i < K; i += blockDim.x) {
-    const float n = vals[i] * rms_inv * ldh(qw + i);
-    vals[i] = n;
-    ss2 += n * n;
+  float ss2;
+  if (qw) {
+    const float rms_inv = rsqrtf(block_sum_reduce(red, ss) /
+                                 static_cast<float>(K) + eps);
+    __syncthreads();
+    ss2 = 0.f;
+    for (int i = tid; i < K; i += blockDim.x) {
+      const float n = vals[i] * rms_inv * ldh(qw + i);
+      vals[i] = n;
+      ss2 += n * n;
+    }
+  } else {
+    ss2 = ss;   // checkpoint without linear q/k norms: bare L2 (v0.2)
   }
   const float inv_q = rsqrtf(block_sum_reduce(red, ss2) + eps);
   for (int i = tid; i < K; i += blockDim.x) {
@@ -377,14 +391,18 @@ __global__ void gdn_l2_norm_chunk_kernel(uint16_t* qn, uint16_t* kn,
     vals[i] = v;
     ss += v * v;
   }
-  const float rms_invk = rsqrtf(block_sum_reduce(red, ss) /
-                                 static_cast<float>(K) + eps);
-  __syncthreads();
-  ss2 = 0.f;
-  for (int i = tid; i < K; i += blockDim.x) {
-    const float n = vals[i] * rms_invk * ldh(kw + i);
-    vals[i] = n;
-    ss2 += n * n;
+  if (kw) {
+    const float rms_invk = rsqrtf(block_sum_reduce(red, ss) /
+                                   static_cast<float>(K) + eps);
+    __syncthreads();
+    ss2 = 0.f;
+    for (int i = tid; i < K; i += blockDim.x) {
+      const float n = vals[i] * rms_invk * ldh(kw + i);
+      vals[i] = n;
+      ss2 += n * n;
+    }
+  } else {
+    ss2 = ss;   // checkpoint without linear k norms: bare L2 (v0.2)
   }
   const float inv_k = rsqrtf(block_sum_reduce(red, ss2) + eps);
   for (int i = tid; i < K; i += blockDim.x) {
