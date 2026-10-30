@@ -2637,6 +2637,17 @@ void Session::moe_dispatch_device(int layer, int n) {
   cuda::quantize_q8_k_n(expert_g2_.get(), d_hqg_.get(), meta_l, FFX,
                         static_cast<int>(Rmax) * (FFX / q4k::kQK_K), s);
   MOE_DBG("requant_n");
+  // v0.12.4 diag: d_hqg_ right after the requant (before the down GEMM).
+  if (dbg_layers_ && layer <= 1 && !capturing) {
+    static std::vector<char> hq0;
+    hq0.resize(static_cast<size_t>(Rmax) * (FFX / 256) * sizeof(q4k::BlockQ8K));
+    cudaMemcpy(hq0.data(), d_hqg_.get(), hq0.size(), cudaMemcpyDeviceToHost);
+    stream_.sync();
+    const char* dd = std::getenv("SAGER_DBG_DIR");
+    char pth[256];
+    std::snprintf(pth, sizeof(pth), "%s/moeL%d_hq0.bin", dd ? dd : "/content/dmp", layer);
+    if (FILE* fp = std::fopen(pth, "wb")) { std::fwrite(hq0.data(), 1, hq0.size(), fp); std::fclose(fp); }
+  }
 
   // 7) down projection (last reader of the ring slots; absent experts'
   //    output rows are zeroed in-kernel so the combine adds 0).
