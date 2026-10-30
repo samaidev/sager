@@ -20,28 +20,28 @@ GH_TOKEN = os.environ.get("GHTOKEN", "")
 HF_TOKEN = os.environ.get("HFTOKEN", "")
 MS_TOKEN = os.environ.get("MSTOKEN", "")
 GH_REPO = "samaidev/sager"
-TAG = "sager-v0.12.0-t4"
-TITLE = "sager v0.12.0 - T4 CUDA binaries (ggml Q4_K fix + GDN R4 + TC paths)"
+TAG = "sager-v0.12.4-t4"
+TITLE = "sager v0.12.4 - T4 CUDA binaries (word-soup root causes 5-8 fixed)"
 HF_REPO = "tchbcb/sager-t4-cuda-artifacts"
 MS_REPO = "luoyunlan168/sager-t4-cuda-artifacts"
 
-BODY = """v0.12 patchset (T4 / sm_75, CUDA 13.0 build):
+BODY = """v0.12.4 patchset (T4 / sm_75, CUDA 13.0 build):
 
-Correctness (word-soup fix chain, all CRITICAL):
-- Q4_K nibble order adopted ggml official order across the whole stack
-- Q6_K dequant block-scale byte offset (208, not 192)
-- gdn_ffn_norm defaults ON (qwen35moe post_attention_norm)
-- GDN chunked conv fp16 taps through ldh()
-- Q6_K head GEMV includes the Q8 activation block scale
-- GDN chunk conv/state-commit uses the real proj row stride
-
-Performance vs v0.11: pp512 1.2-1.3x, pp2048 1.25-1.8x, tg128 1.18-1.2x
-(re-measured post-fix numbers in BENCH_RESULTS_v012.md).
+Correctness (word-soup root-cause chain, all CRITICAL - see WORKLOG.md):
+- RC6: q8 KV cache scale bytes were stored via __half->uint16 implicit
+  truncation - scale always 0, attention output exactly zero (d999de7)
+- RC7: d_wtc_ dense TC scratch overlapped the MoE TC fp16 expert ring;
+  pump stream-all queueing clobbered every qkvz dequant (5120e0c)
+- RC8: shared-expert combine weight (route_w_[row][K]) never written on the
+  device paths - decode steps and device-prefill rows >= 1 dropped the
+  shared expert entirely (the main word-soup culprit) (640c016)
+- plus RC1-5: Q4_K nibble order, Q6_K scale offsets, fused q|gate
+  deinterleave, GDN conv stride, per-head q|gate of fused q_proj
 
 Contents: sager_engine binary (sm_75), BUILD_INFO_v12.txt, raw bench JSON.
-The expert-pool artifact (HF/MS only, 18.1 GB) was rebuilt with the FIXED
-requant pipeline - the previous published pool contains garbage down
-segments and must not be used with SAGER_EXPERT_POOL_REUSE=1.
+The expert-pool artifact (HF/MS only, 18.1 GB) is rebuilt with the FIXED
+requant pipeline - the pre-v012 pool contains garbage down segments and must
+not be used with SAGER_EXPERT_POOL_REUSE=1.
 """
 
 
