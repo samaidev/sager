@@ -1,6 +1,6 @@
 // gguf.cpp - GGUF v3 reader implementation (mmap based).
 #include "sager/core/gguf.hpp"
-#include "sager/core/log.hpp"
+#include "sager/log.hpp"
 
 #include <cerrno>
 #include <cstring>

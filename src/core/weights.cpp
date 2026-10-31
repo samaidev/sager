@@ -222,10 +222,10 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
   auto copyq4 = [&](void* dst, const gguf::TensorInfo* t,
                     const char* what = "?") -> Status {
     if (!t) { SLOG_E("weights", "copyq4: missing tensor %s", what);
-              return Status::kGgufParseError; }
+              SLOG_E("weights", "parse-fail weights.cpp:%d", int(225)); return Status::kGgufParseError; }
     if (t->type != 12) {
       SLOG_E("weights", "copyq4: %s wrong type %u", what, t->type);
-      return Status::kGgufParseError;
+      SLOG_E("weights", "parse-fail weights.cpp:%d", int(228)); return Status::kGgufParseError;
     }
     SAGER_CUDA_CHECK(cudaMemcpy(dst, f.tensor_data(*t), t->nbytes,
                                 cudaMemcpyHostToDevice));
@@ -236,7 +236,7 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
                           const char* what) -> Status {
     if (!t || t->type != 14) {
       SLOG_E("weights", "copyq6: %s missing/wrong type", what);
-      return Status::kGgufParseError;
+      SLOG_E("weights", "parse-fail weights.cpp:%d", int(239)); return Status::kGgufParseError;
     }
     const int rows = static_cast<int>(t->dims[1]);
     const int cols = static_cast<int>(t->dims[0]);
@@ -280,15 +280,15 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
   auto copymat = [&](void* dst, const gguf::TensorInfo* t,
                      const char* what) -> Status {
     if (!t) { SLOG_E("weights", "copymat: missing tensor %s", what);
-              return Status::kGgufParseError; }
+              SLOG_E("weights", "parse-fail weights.cpp:%d", int(283)); return Status::kGgufParseError; }
     if (t->type == 12) return copyq4(dst, t, what);
     if (t->type == 14) return copyq6_as_q4(dst, t, what);
     SLOG_E("weights", "copymat: %s wrong type %u", what, t->type);
-    return Status::kGgufParseError;
+    SLOG_E("weights", "parse-fail weights.cpp:%d", int(287)); return Status::kGgufParseError;
   };
   // fp32 -> fp16 upload
   auto copyf32_as_f16 = [&](void* dst, const gguf::TensorInfo* t) -> Status {
-    if (!t) return Status::kGgufParseError;
+    if (!t) { SLOG_E("weights", "parse-fail weights.cpp:%d", int(291)); return Status::kGgufParseError; }
     const size_t n = t->nbytes / 4;
     std::vector<float> tmp(n);
     std::memcpy(tmp.data(), f.tensor_data(*t), n * 4);
@@ -301,14 +301,14 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
   auto copynorm = [&](void* dst, const gguf::TensorInfo* t,
                       const char* what = "?") -> Status {
     if (!t) { SLOG_E("weights", "copynorm: missing tensor %s", what);
-              return Status::kGgufParseError; }
+              SLOG_E("weights", "parse-fail weights.cpp:%d", int(304)); return Status::kGgufParseError; }
     if (t->type == 1) {
       SAGER_CUDA_CHECK(cudaMemcpy(dst, f.tensor_data(*t), t->nbytes,
                                   cudaMemcpyHostToDevice));
       return Status::kOk;
     }
     if (t->type == 0) return copyf32_as_f16(dst, t);
-    return Status::kGgufParseError;
+    SLOG_E("weights", "parse-fail weights.cpp:%d", int(311)); return Status::kGgufParseError;
   };
   const GdnParams g = cfg.gdn();
   const int nk = g.n_k_heads;
@@ -325,13 +325,14 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
     if (const auto* t = find_tensor_w(f, lp + "attn_norm"))
       if (copynorm(lw.attn_norm, t, "attn_norm") != Status::kOk) {
         SLOG_E("weights", "attn_norm copy failed");
-        return Status::kGgufParseError;
+        SLOG_E("weights", "parse-fail weights.cpp:%d", int(328)); return Status::kGgufParseError;
       }
     const auto* ffn_t = find_tensor_w(f, lp + "ffn_norm");
     if (!ffn_t) ffn_t = find_tensor_w(f, lp + "post_attention_norm");
     if (ffn_t)
-      if (copynorm(lw.ffn_norm, ffn_t, "ffn_norm") != Status::kOk)
-        return Status::kGgufParseError;
+      if (copynorm(lw.ffn_norm, ffn_t, "ffn_norm") != Status::kOk) {
+  SLOG_E("weights", "parse-fail weights.cpp:%d", int(334)); return Status::kGgufParseError;
+        }
 
     Status s = Status::kOk;
     if (cfg.is_linear(L)) {
@@ -388,15 +389,15 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
       // conv taps: native ssm_conv1d is fp32 [ck x conv_dim] (row = taps);
       // legacy lin_conv_w is fp16.
       if (const auto* t = f.tensor((lp + "ssm_conv1d.weight").c_str())) {
-        if (t->type != 0) return Status::kGgufParseError;
+        if (t->type != 0) { SLOG_E("weights", "parse-fail weights.cpp:%d", int(391)); return Status::kGgufParseError; }
         s = copyf32_as_f16(lw.lin_conv_w, t);
         if (s != Status::kOk) return s;
       } else if (const auto* t = f.tensor((lp + "lin_conv_w").c_str())) {
-        if (t->type != 1) return Status::kGgufParseError;
+        if (t->type != 1) { SLOG_E("weights", "parse-fail weights.cpp:%d", int(395)); return Status::kGgufParseError; }
         SAGER_CUDA_CHECK(cudaMemcpy(lw.lin_conv_w, f.tensor_data(*t),
                                     t->nbytes, cudaMemcpyHostToDevice));
       } else {
-        return Status::kGgufParseError;
+        SLOG_E("weights", "parse-fail weights.cpp:%d", int(399)); return Status::kGgufParseError;
       }
       if (const auto* t = f.tensor((lp + "ssm_conv1d.bias").c_str())) {
         s = copyf32_as_f16(lw.lin_conv_b, t);
@@ -418,7 +419,7 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
         SAGER_CUDA_CHECK(cudaMemcpy(lw.lin_A_log, f.tensor_data(*t),
                                     t->nbytes, cudaMemcpyHostToDevice));
       } else {
-        return Status::kGgufParseError;
+        SLOG_E("weights", "parse-fail weights.cpp:%d", int(421)); return Status::kGgufParseError;
       }
       if (const auto* t = f.tensor((lp + "ssm_dt.bias").c_str())) {
         SAGER_CUDA_CHECK(cudaMemcpy(lw.lin_dt_bias, f.tensor_data(*t),
@@ -427,14 +428,14 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
         SAGER_CUDA_CHECK(cudaMemcpy(lw.lin_dt_bias, f.tensor_data(*t),
                                     t->nbytes, cudaMemcpyHostToDevice));
       } else {
-        return Status::kGgufParseError;
+        SLOG_E("weights", "parse-fail weights.cpp:%d", int(430)); return Status::kGgufParseError;
       }
       // output-gate norm: native ssm_norm fp32; legacy lin_o_norm fp16
       if (const auto* t = f.tensor((lp + "ssm_norm.weight").c_str())) {
         s = copyf32_as_f16(lw.lin_o_norm, t);
         if (s != Status::kOk) return s;
       } else if (const auto* t = f.tensor((lp + "lin_o_norm").c_str())) {
-        if (t->type != 1) return Status::kGgufParseError;
+        if (t->type != 1) { SLOG_E("weights", "parse-fail weights.cpp:%d", int(437)); return Status::kGgufParseError; }
         SAGER_CUDA_CHECK(cudaMemcpy(lw.lin_o_norm, f.tensor_data(*t),
                                     t->nbytes, cudaMemcpyHostToDevice));
       }
@@ -446,7 +447,7 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
         if (s != Status::kOk) return s;
       } else if (const auto* t =
                      f.tensor((lp + "lin_q_norm").c_str())) {
-        if (t->type != 1) return Status::kGgufParseError;
+        if (t->type != 1) { SLOG_E("weights", "parse-fail weights.cpp:%d", int(449)); return Status::kGgufParseError; }
         SAGER_CUDA_CHECK(cudaMemcpy(lw.lin_q_norm, f.tensor_data(*t),
                                     t->nbytes, cudaMemcpyHostToDevice));
       }
@@ -455,16 +456,16 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
         if (s != Status::kOk) return s;
       } else if (const auto* t =
                      f.tensor((lp + "lin_k_norm").c_str())) {
-        if (t->type != 1) return Status::kGgufParseError;
+        if (t->type != 1) { SLOG_E("weights", "parse-fail weights.cpp:%d", int(458)); return Status::kGgufParseError; }
         SAGER_CUDA_CHECK(cudaMemcpy(lw.lin_k_norm, f.tensor_data(*t),
                                     t->nbytes, cudaMemcpyHostToDevice));
-      } else {
-        return Status::kGgufParseError;
       }
+      // else: no q/k RMSNorm weights - bare L2 is correct for Sage-A1.5
+      // (WORKLOG root cause 14); kernels branch on null weights.
     } else {
       // ---- full attention (GQA) layer -----------------------------------
       const auto* q = f.tensor((lp + "attn_q.weight").c_str());
-      if (!q) return Status::kGgufParseError;
+      if (!q) { SLOG_E("weights", "parse-fail weights.cpp:%d", int(467)); return Status::kGgufParseError; }
       const int q_rows = q->dims.size() >= 2
                              ? static_cast<int>(q->dims[1]) : Qrows;
       lw.attn_gated = (q_rows == 2 * Qrows);
@@ -512,7 +513,7 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
                                       out.size() * q4k::kBlockBytes,
                                       cudaMemcpyHostToDevice));
         } else {
-          return Status::kGgufParseError;
+          SLOG_E("weights", "parse-fail weights.cpp:%d", int(515)); return Status::kGgufParseError;
         }
       } else {
         s = copymat(lw.wq, q, "attn_q");
@@ -551,15 +552,15 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
     // shared experts (Q4_K; down may be Q6_K in Q4_K_M builds)
     if (d.shared_expert > 0) {
       s = copymat(lw.shared_gate,
-                  f.tensor((lp + "ffn_gate_shexp.weight").c_str()),
+                  find_tensor_w(f, lp + "ffn_gate_shexp"),
                   "ffn_gate_shexp");
       if (s != Status::kOk) return s;
       s = copymat(lw.shared_up,
-                  f.tensor((lp + "ffn_up_shexp.weight").c_str()),
+                  find_tensor_w(f, lp + "ffn_up_shexp"),
                   "ffn_up_shexp");
       if (s != Status::kOk) return s;
       s = copymat(lw.shared_out,
-                  f.tensor((lp + "ffn_down_shexp.weight").c_str()),
+                  find_tensor_w(f, lp + "ffn_down_shexp"),
                   "ffn_down_shexp");
       if (s != Status::kOk) return s;
     }
@@ -609,7 +610,7 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
     }
   }
   if (const auto* t = f.tensor("output_norm.weight")) {
-    if (copynorm(output_norm, t) != Status::kOk) return Status::kGgufParseError;
+    if (copynorm(output_norm, t) != Status::kOk) { SLOG_E("weights", "parse-fail weights.cpp:%d", int(612)); return Status::kGgufParseError; }
   }
   // output head: Q4_K native, Q6_K native (v0.6 raw upload), or Q6_K
   // dequantized to fp16 (legacy path, SAGER_HEAD_F16=1).
@@ -662,10 +663,10 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
       head_rows_ = rows;
       }
     } else {
-      return Status::kGgufParseError;
+      SLOG_E("weights", "parse-fail weights.cpp:%d", int(665)); return Status::kGgufParseError;
     }
   } else {
-    return Status::kGgufParseError;    // untied head required
+    SLOG_E("weights", "parse-fail weights.cpp:%d", int(668)); return Status::kGgufParseError;    // untied head required
   }
   (void)cfg;
   return Status::kOk;
@@ -786,9 +787,9 @@ Status Weights::load_expert_pool(gguf::File& f, const ModelConfig& cfg) {
       const auto* g = find_tensor_w(f, "blk." + std::to_string(L) + ".ffn_gate_exps");
       const auto* u = find_tensor_w(f, "blk." + std::to_string(L) + ".ffn_up_exps");
       const auto* dnw = find_tensor_w(f, "blk." + std::to_string(L) + ".ffn_down_exps");
-      if (!g || !u || !dnw) GPE()
-      if (g->type != 12 || u->type != 12) GPE()
-      if (dnw->type != 12 && dnw->type != 14) GPE()
+      if (!g || !u || !dnw) GPE();
+      if (g->type != 12 || u->type != 12) GPE();
+      if (dnw->type != 12 && dnw->type != 14) GPE();
       // expert-major slices of the 3D stacked tensors [n_expert, rows, cols]
       const uint8_t* gb = f.tensor_data(*g) + static_cast<size_t>(e) * gu;
       const uint8_t* ub = f.tensor_data(*u) + static_cast<size_t>(e) * gu;
