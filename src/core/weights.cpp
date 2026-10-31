@@ -527,11 +527,11 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
                   "attn_output");
       if (s != Status::kOk) return s;
       // per-head q/k norms (fp32 in the file -> fp16)
-      if (const auto* t = f.tensor((lp + "attn_q_norm.weight").c_str())) {
+      if (const auto* t = find_tensor_w(f, lp + "attn_q_norm")) {
         s = copynorm(lw.attn_q_norm, t);
         if (s != Status::kOk) return s;
       }
-      if (const auto* t = f.tensor((lp + "attn_k_norm.weight").c_str())) {
+      if (const auto* t = find_tensor_w(f, lp + "attn_k_norm")) {
         s = copynorm(lw.attn_k_norm, t);
         if (s != Status::kOk) return s;
       }
