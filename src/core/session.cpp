@@ -915,6 +915,15 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
         wrf("attn_L3_v.bin", v_.get(), (size_t)n_tokens * KVd * 2);
         wrf("attn_L3_out.bin", attn_out_.get(), (size_t)n_tokens * Q * 2);
         wrf("attn_L3_gate.bin", d_gate_.get(), (size_t)n_tokens * Q * 2);
+        {
+          const int kvrowb = kv_.q8() ? (KVd / 32) * 34 : KVd * 2;
+          wrf("attn_L3_kvK.bin", kv_.k_slab(kv_slot_of_layer_[
+                                  static_cast<size_t>(layer)]),
+              (size_t)n_tokens * kvrowb);
+          wrf("attn_L3_kvV.bin", kv_.v_slab(kv_slot_of_layer_[
+                                  static_cast<size_t>(layer)]),
+              (size_t)n_tokens * kvrowb);
+        }
         fprintf(stderr,
                 "[sager/dbg] attn L3 prefill rows dumped n=%d gated=%d\n",
                 n_tokens, (int)lw.attn_gated);
