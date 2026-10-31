@@ -4231,6 +4231,27 @@ Status Session::forward_window(const std::vector<int>& window,
                     lwin.get() + static_cast<size_t>(n - 1) * d.n_vocab,
                     d.n_vocab * sizeof(float), cudaMemcpyDeviceToHost, s);
     stream_.sync();
+    if (dbg_layers_) {
+      static bool head_dumped = false;
+      if (!head_dumped) {
+        head_dumped = true;
+        std::vector<uint8_t> tx(static_cast<size_t>(d.hidden) * 2);
+        cudaMemcpy(tx.data(), xf_.get(), tx.size(), cudaMemcpyDeviceToHost);
+        if (FILE* fp = std::fopen("/content/dmp/xf_prefill.bin", "wb")) {
+          std::fwrite(tx.data(), 1, tx.size(), fp);
+          std::fclose(fp);
+        }
+        std::vector<float> tl(d.n_vocab);
+        cudaMemcpy(tl.data(),
+                   lwin.get() + static_cast<size_t>(n - 1) * d.n_vocab,
+                   d.n_vocab * sizeof(float), cudaMemcpyDeviceToHost);
+        if (FILE* fp = std::fopen("/content/dmp/logits_prefill.bin", "wb")) {
+          std::fwrite(tl.data(), sizeof(float), d.n_vocab, fp);
+          std::fclose(fp);
+        }
+        fprintf(stderr, "[sager/dbg] head dumped xf+logits n=%d\n", n);
+      }
+    }
     if (prof.on) {
       cudaEventRecord(fw_ev_[fw_ev_pe_++], s);   // head done (synced above)
       prof_accum_fw();
