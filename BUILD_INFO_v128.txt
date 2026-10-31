@@ -1,0 +1,47 @@
+SAGER v0.12.8 T4 CUDA build info
+=================================
+repo:        samaidev/sager
+base commit: 768e5039a9b29e662563cbdeb4e3c9c01893e67f (diag-kv tip = v0.12.8
+             + converter load-blocker fixes, root causes 15-16)
+branch:      rel-v0.12.8
+built on:    Linux x86_64 sandbox (NO GPU on the build host - binaries are
+             compiled for sm_75 and must be exercised on a Tesla T4)
+toolchain:   nvcc CUDA 13.4.92 (V13.4.r13.4), cmake 3.31.10, GCC 14.2.0
+flags:       cmake -B build -DCMAKE_BUILD_TYPE=Release
+             -DCMAKE_CUDA_ARCHITECTURES=75
+link:        libcudart/libcublas dynamic (needs CUDA 13.4 runtime libs at
+             execution; driver 580+ for CUDA 13.x)
+
+Test status on the build host (GPU-less):
+  - CPU-only build (SAGER_ENABLE_CUDA=OFF): ctest 3/3 PASS
+      q4_host_roundtrip ALL PASSED
+      gdn_host_reference ALL OK
+      expert_pump_policy ALL OK
+  - CUDA build: sager_engine + sager_test_cuda_q4 compile clean; the three
+    host tests must be run from the CPU-only build on GPU-less hosts
+    (the CUDA-built pump test does real DMAs and segfaults without a GPU);
+    sager_test_cuda_q4 requires a real GPU and MUST pass on the T4 before
+    release use (colab_v128_run.sh enforces this).
+
+Contents of the release tarball (sager_v0128_t4_cuda.tar.gz):
+  build/sager_engine        resident JSON-lines engine (v0.12.8, sm_75)
+  build/sager_test_q4       ctest: Q4_K roundtrip (host)
+  build/sager_test_gdn      ctest: GDN golden vectors (host)
+  build/sager_test_pump     ctest: expert pump policy (host)
+  build/sager_test_cuda_q4  ctest: CUDA-vs-host Q4/Q6 matmul stack (needs T4)
+  build/libsager_core.a
+  build/libsager_cuda.a
+  BUILD_INFO.txt            this file
+  BENCH_RESULTS_v012.md     v0.12 measured T4 numbers (commit 40d86c0)
+  WORKLOG.md                full word-soup root-cause chain 1-16
+  scripts/dl_sage.sh        model + pool download helper
+  scripts/colab_v128_run.sh one-shot T4 pipeline (reconvert -> pool -> gate
+                            -> bench -> publish)
+  scripts/publish_v128.py   GH release + HF/MS mirror publisher
+
+Versioning note: the perf numbers in BENCH_RESULTS_v012.md were measured at
+commit 40d86c0 (v0.12, pre-12.1..12.8 correctness fixes). Those fixes repair
+correctness (roots 5-16) and are intended to be perf-neutral; re-measure on
+the T4 with the reconverted weights (colab_v128_run.sh) before quoting new
+numbers. The pre-v0.12.8 published GGUF (InternScience) and pools built from
+it are corrupt (ssm_conv1d/ssm_a/ssm_out) - do not use them for quality runs.
