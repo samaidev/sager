@@ -453,8 +453,8 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
         if (t) {
           if (!lw.lin_q_norm) {
             void* q = nullptr;
-            if (dmalloc(&q, static_cast<size_t>(g.key_dim) * 2)
-                != Status::kOk) return Status::kOomVram;
+            if (cudaMalloc(&q, static_cast<size_t>(g.key_dim) * 2)
+                != cudaSuccess) return Status::kOomVram;
             lw.lin_q_norm = static_cast<uint16_t*>(q);
           }
           if (f32) {
@@ -474,8 +474,8 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
         if (t) {
           if (!lw.lin_k_norm) {
             void* k = nullptr;
-            if (dmalloc(&k, static_cast<size_t>(g.key_dim) * 2)
-                != Status::kOk) return Status::kOomVram;
+            if (cudaMalloc(&k, static_cast<size_t>(g.key_dim) * 2)
+                != cudaSuccess) return Status::kOomVram;
             lw.lin_k_norm = static_cast<uint16_t*>(k);
           }
           if (f32) {
