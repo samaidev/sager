@@ -71,3 +71,44 @@ checkpoint layout differs from what the converter assumed:
 `linear_attn.{in_proj_qkv, in_proj_z, in_proj_a, in_proj_b, norm}` -
 rebuilt into the engine's fused `[q|k|v|z]` / `[b|a]` carves at convert
 time; A is stored pre-negated (`-exp(A_log)`).
+
+## Session 2026-10-31 (VM reset -> full re-derive): roots 15-20
+
+Colab VM was recycled mid-hunt. Rebuilt from scratch (repo@diag-kv, T4 build,
+model re-download) and re-ran the whole ladder. Three NEW fatal bugs found,
+each masked by the next one down the stack:
+
+| # | commit | bug | verification |
+|---|--------|-----|--------------|
+| 15 | 768e503 | load blockers for converter GGUF: (a) `#include "sager/core/log.hpp"` typo (file is `sager/log.hpp`), (b) `GPE()` macro without trailing `;` x3, (c) `lin_k_norm` required by an else-branch although Sage-A1.5 has no GDN q/k norms (root 14 said kernels branch on null, the loader didn't). | engine loads converter GGUF |
+| 16 | 768e503 | shared-expert lookups used hardcoded `ffn_*_shexp.weight` while the converter writes `ffn_*_shexp`; switched to `find_tensor_w` (both spellings accepted). | load passes L0..L39 |
+| 17 | 95b3e10 | **THE converter wrote the data section without aligning it to `general.alignment` (32)** while every tensor offset in the directory assumes an aligned data_start. Every weight read was shifted by (32 - header_len % 32) = 4 bytes. corr vs HF was -0.05; after pad corr=1.000000 on every probed tensor (A_log -exp relation exact, dt_bias bitwise, conv1d 1.000000, lm_head rows 11/12 >0.99). **This is the actual soup cause in the v0.1 GGUF lineage too**: any engine read of a converter-produced file was garbage-but-self-consistent (the pool copies what it reads, so numpy cross-checks agreed with the engine - corr 1.0 against the same wrong bytes). | tools/conv_verify-style numpy audit vs HF shard 00012 |
+| 18 | 5d8c3ca | attention per-head q/k norms: engine looked up `attn_q_norm.weight`, converter writes `attn_q_norm` -> never loaded -> rmsnorm fed uninitialised VRAM -> q/k activations exactly 0 on every full-attention layer. | attn.q/k sum 0 -> 22.3/21.4 after fix |
+| 20 | e398f6e | GDN q/k norm POINTERS were unconditionally dmalloc'd in alloc() (comment even says "full-attention layers"), so `lw.lin_q_norm/lin_k_norm` were non-null with never-written VRAM for a checkpoint that has no such tensors. The L2-norm kernel's `if (qw)` RMSNorm branch multiplied by zeros: qn/kn exactly 0 -> scan output exactly 0 -> **every GDN layer contributed nothing since v0.1**. Alloc now leaves them null (kernels branch on null per root 14); load dmallocs on demand when a checkpoint does carry them. | qn/kn 0 -> 69.6/94.0, scan_y 0 -> 0.715 (prefill) and 1.06-5.78 per decode step |
+| - | 5de501f | dbg: f32 row writer overread 4x (16B/item on 4B arrays) -> segfault with SAGER_DBG_DUMP_ROW. | fixed, but a new segfault appeared after it (see open items) |
+
+### Verified-correct chain (numpy vs engine, clean weights)
+embed->rmsnorm->qkvz GEMV corr=1.000000; causal conv (ch-major [ck x conv_dim]
+taps) t0 corr=0.998 fp16-accurate; gate ab = {exp(A*dt), sigmoid(b)} sane;
+L2 qn/kn healthy; scan (gated delta rule) nonzero and token-varying; MoE
+patch path (gpatch) corr=1.000000/0.999999/1.000000; L3 attention q/k/v/out
+all live after root 18. Prefill: all 40 layers post/moe nan=0.
+
+### Open items (next session)
+1. **Segfault in eager prefill right after the L3 dbg block** (attn.oproj dbg
+   prints, then engine EOF, no stderr). Repro: graphs=false,
+   SAGER_DUMP_LOGITS=2, any generate. Started after roots 18/20 changed
+   values; may be a latent race exposed by new timing. Note: graphs=true runs
+   DO NOT crash (diag10b completes 48 tokens).
+2. **Residual growth**: decode x_after (L0) grows 118 -> 1149 over 48 steps
+   (~+20/step). Either a real scale bug left (root 21?) or downstream of
+   something still off. Prefill L39 post is ~700 with per-layer increments
+   that look large but finite.
+3. **step_logits.bin dump reads NaN** while the live pipeline shows nan=0
+   everywhere - dump path suspicious, not necessarily the model. Greedy still
+   picks tokens, so the NaN is probably a dump artifact; needs a proper
+   logits cross-check (dump x_final row + numpy head GEMV vs sampled token).
+4. Text is still soup-like (paired repeats + multilingual). All layer dbg is
+   healthy; next differential is decode-path numpy cross-check (conv state
+   roll, scan n=1) and the L3+ MoE/attention decode path.
+
