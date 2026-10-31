@@ -130,10 +130,14 @@ Status Weights::alloc_vram(const ModelConfig& cfg) {
           dmalloc(&cb, static_cast<size_t>(g.conv_dim()) * 2) != Status::kOk ||
           dmalloc(&al, static_cast<size_t>(g.n_v_heads) * 4) != Status::kOk ||
           dmalloc(&db, static_cast<size_t>(g.n_v_heads) * 4) != Status::kOk ||
-          dmalloc(&on, static_cast<size_t>(g.value_dim) * 2) != Status::kOk ||
-          dmalloc(&qn, static_cast<size_t>(g.key_dim) * 2) != Status::kOk ||
-          dmalloc(&kn, static_cast<size_t>(g.key_dim) * 2) != Status::kOk)
+          dmalloc(&on, static_cast<size_t>(g.value_dim) * 2) != Status::kOk)
         return Status::kOomVram;
+      // root 20: lin_q_norm/lin_k_norm stay null unless the checkpoint
+      // actually carries them (allocated on demand during load below);
+      // a non-null pointer with unwritten memory fed the L2 kernel's
+      // RMSNorm branch with zeros and zeroed the entire scan output.
+      qn = nullptr;
+      kn = nullptr;
       lw.lin_conv_w  = static_cast<uint16_t*>(cw);
       lw.lin_conv_b  = static_cast<uint16_t*>(cb);
       lw.lin_A_log   = static_cast<float*>(al);   // holds ssm_a (pre-negated)
@@ -442,23 +446,47 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
       // v0.12.8 (C-GDN-1): q/k RMSNorm weights ([K] fp16; the converter
       // writes lin_q_norm/lin_k_norm; native checkpoints may use
       // ssm_q_norm/ssm_k_norm fp32).
-      if (const auto* t = f.tensor((lp + "ssm_q_norm.weight").c_str())) {
-        s = copyf32_as_f16(lw.lin_q_norm, t);
-        if (s != Status::kOk) return s;
-      } else if (const auto* t =
-                     f.tensor((lp + "lin_q_norm").c_str())) {
-        if (t->type != 1) { SLOG_E("weights", "parse-fail weights.cpp:%d", int(449)); return Status::kGgufParseError; }
-        SAGER_CUDA_CHECK(cudaMemcpy(lw.lin_q_norm, f.tensor_data(*t),
-                                    t->nbytes, cudaMemcpyHostToDevice));
+      {
+        const auto* t = f.tensor((lp + "ssm_q_norm.weight").c_str());
+        bool f32 = t != nullptr;
+        if (!t) t = f.tensor((lp + "lin_q_norm").c_str());
+        if (t) {
+          if (!lw.lin_q_norm) {
+            void* q = nullptr;
+            if (dmalloc(&q, static_cast<size_t>(g.key_dim) * 2)
+                != Status::kOk) return Status::kOomVram;
+            lw.lin_q_norm = static_cast<uint16_t*>(q);
+          }
+          if (f32) {
+            s = copyf32_as_f16(lw.lin_q_norm, t);
+            if (s != Status::kOk) return s;
+          } else {
+            if (t->type != 1) { SLOG_E("weights", "parse-fail weights.cpp:%d", int(449)); return Status::kGgufParseError; }
+            SAGER_CUDA_CHECK(cudaMemcpy(lw.lin_q_norm, f.tensor_data(*t),
+                                        t->nbytes, cudaMemcpyHostToDevice));
+          }
+        }
       }
-      if (const auto* t = f.tensor((lp + "ssm_k_norm.weight").c_str())) {
-        s = copyf32_as_f16(lw.lin_k_norm, t);
-        if (s != Status::kOk) return s;
-      } else if (const auto* t =
-                     f.tensor((lp + "lin_k_norm").c_str())) {
-        if (t->type != 1) { SLOG_E("weights", "parse-fail weights.cpp:%d", int(458)); return Status::kGgufParseError; }
-        SAGER_CUDA_CHECK(cudaMemcpy(lw.lin_k_norm, f.tensor_data(*t),
-                                    t->nbytes, cudaMemcpyHostToDevice));
+      {
+        const auto* t = f.tensor((lp + "ssm_k_norm.weight").c_str());
+        bool f32 = t != nullptr;
+        if (!t) t = f.tensor((lp + "lin_k_norm").c_str());
+        if (t) {
+          if (!lw.lin_k_norm) {
+            void* k = nullptr;
+            if (dmalloc(&k, static_cast<size_t>(g.key_dim) * 2)
+                != Status::kOk) return Status::kOomVram;
+            lw.lin_k_norm = static_cast<uint16_t*>(k);
+          }
+          if (f32) {
+            s = copyf32_as_f16(lw.lin_k_norm, t);
+            if (s != Status::kOk) return s;
+          } else {
+            if (t->type != 1) { SLOG_E("weights", "parse-fail weights.cpp:%d", int(458)); return Status::kGgufParseError; }
+            SAGER_CUDA_CHECK(cudaMemcpy(lw.lin_k_norm, f.tensor_data(*t),
+                                        t->nbytes, cudaMemcpyHostToDevice));
+          }
+        }
       }
       // else: no q/k RMSNorm weights - bare L2 is correct for Sage-A1.5
       // (WORKLOG root cause 14); kernels branch on null weights.
