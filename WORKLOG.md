@@ -112,3 +112,41 @@ all live after root 18. Prefill: all 40 layers post/moe nan=0.
    healthy; next differential is decode-path numpy cross-check (conv state
    roll, scan n=1) and the L3+ MoE/attention decode path.
 
+
+## Session 2026-10-31 II (5th VM rebuild): root 21 + full numpy verification chain
+
+VM recycled again (5th tunnel). Full recovery: clone@diag-kv, T4 build, HF
+shards 0-12 re-download (69.8 GB), converter rerun -> Sage-fixed.gguf
+(18.91 GiB, 633 tensors, CONV_EXIT=0), pool cold-build. CUDA toolchain had
+to be restored from pypi.nvidia.com wheels + NVIDIA apt repo (nvcc 13.0.88,
+libnvvm for cicc, cudart/cublas/culibos-dev) after the disk-crunch deletions.
+
+### Verification chain (numpy vs engine, converter GGUF, all PASS)
+embed row sums bit-exact; attn_norm/ffn_norm/lin_o_norm corr=1.000000 vs HF
+shard 00012 (the small norms ARE the trained values); L0 GDN full-prefill
+31-token numpy reference matches every stage (qkvz 0.26%, conv 0.66%, scan
+0.7%, o_proj 2.7%); L3 attention full numpy (neox rope, GQA h//8, gated)
+corr=1.0000 all 31 rows, norms 0.99998; KV slab == fresh k/v (corr 1.0);
+patch path (pool AVX2) corr=0.998; head GEMV corr=1.000000 top-5 identical.
+Prefill top-1 token is 'alise' -> soup starts in prefill (not decode-only).
+
+### Root 21 (fixed, 0d733e6)
+rmsnorm_quant_f16_kernel had NO row offset: grid = n_rows blocks but every
+block reduced/wrote x[0..n). Decode (n_rows=1) was fine, so it hid through
+every decode-focused test. The MoE ffn-norm calls it with n_rows=n tokens ->
+rows 1..N-1 of xn_/d_xq_ stale -> MoE input garbage -> every layer's MoE
+collapsed. Pre-fix direct delta |moe-post| at L0 row 30 = 0.117 (expected
+~5.8); post-fix = 3.58. Text STILL soup after the fix.
+
+### Where the hunt stands (next session)
+1. y-slab probe (c418f1d) says all 31 rows x 9 slots are populated with
+   healthy-magnitude values (shared 3.5-4.6, experts 0.5-1.1) but a few
+   slots show ~7.0 outliers in varying slots/rows - verify per-slot y against
+   numpy with SELF-CONSISTENT pairing (probe #1 dumps y for the prefill but
+   w_routew/routeidx get overwritten by probe #2, the n=2 window; gate the
+   dbg_write_row_f32 hooks on the same counter as the probe).
+2. If y content verifies, the remaining suspects are the combine route_w_
+   row mapping and the decode-path conv state roll (open item from roots
+   15-20 list).
+3. SAGER_STEP_GRAPH=0 does NOT de-graph the MoE dumps (layer graphs still
+   capture); the batched-path probe is the working window into real MoE.
