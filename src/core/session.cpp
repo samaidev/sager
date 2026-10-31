@@ -2383,10 +2383,66 @@ void Session::moe_dispatch_batched(int layer, int n) {
       }
       SLOG_W("moe", "batchprobe L0: n=%d R_gpu=%d n_cpu=%d jobs=%zu", n,
              R_gpu, n_cpu, jobs.size());
+      // diag11: pairing-critical state of the SAME batched call. Every file
+      // below carries the probe id, so numpy can pair rows<->routes<->y
+      // self-consistently (the row-(n-1) hooks elsewhere get overwritten).
+      std::vector<uint8_t> tri(static_cast<size_t>(n) * (K + 1) * sizeof(int));
+      cudaMemcpy(tri.data(), route_idx_.get(), tri.size(),
+                 cudaMemcpyDeviceToHost);
+      std::snprintf(pth, sizeof(pth), "/content/dmp/batched_ridx_%d.bin",
+                    batched_probes);
+      if (FILE* fp = std::fopen(pth, "wb")) {
+        std::fwrite(tri.data(), 1, tri.size(), fp);
+        std::fclose(fp);
+      }
+      std::vector<uint8_t> trw(static_cast<size_t>(n) * (K + 1) *
+                               sizeof(float));
+      cudaMemcpy(trw.data(), route_w_.get(), trw.size(),
+                 cudaMemcpyDeviceToHost);
+      std::snprintf(pth, sizeof(pth), "/content/dmp/batched_rw_%d.bin",
+                    batched_probes);
+      if (FILE* fp = std::fopen(pth, "wb")) {
+        std::fwrite(trw.data(), 1, trw.size(), fp);
+        std::fclose(fp);
+      }
+      std::vector<uint8_t> trl(static_cast<size_t>(n) * E * sizeof(float));
+      cudaMemcpy(trl.data(), route_logits_.get(), trl.size(),
+                 cudaMemcpyDeviceToHost);
+      std::snprintf(pth, sizeof(pth), "/content/dmp/batched_rlogits_%d.bin",
+                    batched_probes);
+      if (FILE* fp = std::fopen(pth, "wb")) {
+        std::fwrite(trl.data(), 1, trl.size(), fp);
+        std::fclose(fp);
+      }
+      std::vector<uint8_t> txp(static_cast<size_t>(H) * 2);
+      cudaMemcpy(txp.data(), x_.get(), txp.size(), cudaMemcpyDeviceToHost);
+      std::snprintf(pth, sizeof(pth), "/content/dmp/batched_xpre_%d.bin",
+                    batched_probes);
+      if (FILE* fp = std::fopen(pth, "wb")) {
+        std::fwrite(txp.data(), 1, txp.size(), fp);
+        std::fclose(fp);
+      }
     }
   }
   cuda::moe_combine_batched_f16(x_.get(), expert_y_.get(), route_w_.get(),
                                 K, H, n, s);
+  if (dbg_layers_ && layer == 0) {
+    // diag11: post-combine residual row 0, locked to the same call sequence
+    // as the pre-combine probe above (both counters advance per call).
+    static int batched_probes_post = 0;
+    if (batched_probes_post < 2) {
+      ++batched_probes_post;
+      std::vector<uint8_t> txq(static_cast<size_t>(H) * 2);
+      cudaMemcpy(txq.data(), x_.get(), txq.size(), cudaMemcpyDeviceToHost);
+      char pth[256];
+      std::snprintf(pth, sizeof(pth), "/content/dmp/batched_xpost_%d.bin",
+                    batched_probes_post);
+      if (FILE* fp = std::fopen(pth, "wb")) {
+        std::fwrite(txq.data(), 1, txq.size(), fp);
+        std::fclose(fp);
+      }
+    }
+  }
 
   // 14) session progress: every slot owned by a pair of an EARLIER layer is
   // reclaimable now (consumed ones once their event completes; parked ones
