@@ -1147,14 +1147,14 @@ static void dbg_write_row_f32(const char* tag, const void* dev, size_t off,
   const char* prefix = std::getenv("SAGER_DBG_DUMP_ROW");
   if (!prefix || layer != 0) return;
   static std::vector<char> buf;
-  if (buf.size() < static_cast<size_t>(cnt) * 16) buf.resize(static_cast<size_t>(cnt) * 16);
-  cudaMemcpyAsync(buf.data(), static_cast<const char*>(dev) + off,
-                  static_cast<size_t>(cnt) * 16, cudaMemcpyDeviceToHost, s);
+  if (buf.size() < static_cast<size_t>(cnt) * 4) buf.resize(static_cast<size_t>(cnt) * 4);
+  cudaMemcpyAsync(buf.data(), static_cast<const char*>(dev) + off * 4,
+                  static_cast<size_t>(cnt) * 4, cudaMemcpyDeviceToHost, s);
   cudaStreamSynchronize(s);
   char path[256];
   std::snprintf(path, sizeof(path), "%s_%s_L%d.bin", prefix, tag, layer);
   if (FILE* fp = std::fopen(path, "wb")) {
-    std::fwrite(buf.data(), 16, cnt, fp);
+    std::fwrite(buf.data(), 4, cnt, fp);
     std::fclose(fp);
   }
 }
