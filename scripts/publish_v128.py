@@ -110,7 +110,12 @@ def gh_release(path):
         data = f.read()
     resp = gh_req(url, "POST", data, headers={"Content-Length": str(size)},
                   ctype="application/octet-stream")
-    print("GH asset:", resp.get("browser_download_url"))
+    if isinstance(resp, bytes):
+        try:
+            resp = json.loads(resp)
+        except Exception:
+            resp = {}
+    print("GH asset:", resp.get("browser_download_url", "(state check via API)"))
     return rel.get("html_url", "")
 
 
