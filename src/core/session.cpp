@@ -895,6 +895,31 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
                  static_cast<size_t>(n_tokens - 1) * Q, 64, s);
     dbg_dump_f16("attn.oproj", o_proj_.get(),
                  static_cast<size_t>(n_tokens - 1) * H, 64, s);
+    if (n_tokens > 1) {
+      static bool pf_rows_dumped = false;
+      if (!pf_rows_dumped) {
+        pf_rows_dumped = true;
+        auto wrf = [&](const char* nm, const void* dev, size_t bytes) {
+          std::vector<uint8_t> tmp(bytes);
+          cudaMemcpy(tmp.data(), dev, bytes, cudaMemcpyDeviceToHost);
+          char pth[256];
+          std::snprintf(pth, sizeof(pth), "/content/dmp/%s", nm);
+          if (FILE* fp = std::fopen(pth, "wb")) {
+            std::fwrite(tmp.data(), 1, bytes, fp);
+            std::fclose(fp);
+          }
+        };
+        wrf("attn_L3_xin.bin", x_.get(), (size_t)n_tokens * H * 2);
+        wrf("attn_L3_q.bin", q_.get(), (size_t)n_tokens * Q * 2);
+        wrf("attn_L3_k.bin", k_.get(), (size_t)n_tokens * KVd * 2);
+        wrf("attn_L3_v.bin", v_.get(), (size_t)n_tokens * KVd * 2);
+        wrf("attn_L3_out.bin", attn_out_.get(), (size_t)n_tokens * Q * 2);
+        wrf("attn_L3_gate.bin", d_gate_.get(), (size_t)n_tokens * Q * 2);
+        fprintf(stderr,
+                "[sager/dbg] attn L3 prefill rows dumped n=%d gated=%d\n",
+                n_tokens, (int)lw.attn_gated);
+      }
+    }
   }
   if (n_tokens == 1) {
     cuda::quantize_q8_k(attn_out_.get(), d_hq_.get(), Q, s);
@@ -931,6 +956,25 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
   }
   if (!(n_tokens == 1 && dec_fuse_)) {
     cuda::add_f16(x_.get(), o_proj_.get(), n_tokens * H, s);
+  }
+  if (dbg_layers_ && layer == 3 && n_tokens > 1) {
+    static bool pf_oproj_dumped = false;
+    if (!pf_oproj_dumped) {
+      pf_oproj_dumped = true;
+      std::vector<uint8_t> tmp1((size_t)n_tokens * H * 2);
+      cudaMemcpy(tmp1.data(), o_proj_.get(), tmp1.size(),
+                 cudaMemcpyDeviceToHost);
+      if (FILE* fp = std::fopen("/content/dmp/attn_L3_oproj.bin", "wb")) {
+        std::fwrite(tmp1.data(), 1, tmp1.size(), fp);
+        std::fclose(fp);
+      }
+      std::vector<uint8_t> tmp2((size_t)n_tokens * H * 2);
+      cudaMemcpy(tmp2.data(), x_.get(), tmp2.size(), cudaMemcpyDeviceToHost);
+      if (FILE* fp = std::fopen("/content/dmp/attn_L3_xout.bin", "wb")) {
+        std::fwrite(tmp2.data(), 1, tmp2.size(), fp);
+        std::fclose(fp);
+      }
+    }
   }
   // v0.12 debug: full-row dump of the post-attention residual (attention
   // layers; same contract as the GDN chunk dump above).
