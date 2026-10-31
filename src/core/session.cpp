@@ -2359,6 +2359,32 @@ void Session::moe_dispatch_batched(int layer, int n) {
   }
 
   // 13) combine: x_ = residual + sum_k w * expert_y (shared slot folded in).
+  if (dbg_layers_ && layer == 0) {
+    static int batched_probes = 0;
+    if (batched_probes < 2) {
+      ++batched_probes;
+      std::vector<uint8_t> tx(static_cast<size_t>(H) * 2);
+      cudaMemcpy(tx.data(), xn_.get(), tx.size(), cudaMemcpyDeviceToHost);
+      char pth[256];
+      std::snprintf(pth, sizeof(pth), "/content/dmp/batched_xn_%d.bin",
+                    batched_probes);
+      if (FILE* fp = std::fopen(pth, "wb")) {
+        std::fwrite(tx.data(), 1, tx.size(), fp);
+        std::fclose(fp);
+      }
+      std::vector<uint8_t> ty(static_cast<size_t>(n) * (K + 1) * H * 2);
+      cudaMemcpy(ty.data(), expert_y_.get(), ty.size(),
+                 cudaMemcpyDeviceToHost);
+      std::snprintf(pth, sizeof(pth), "/content/dmp/batched_y_%d.bin",
+                    batched_probes);
+      if (FILE* fp = std::fopen(pth, "wb")) {
+        std::fwrite(ty.data(), 1, ty.size(), fp);
+        std::fclose(fp);
+      }
+      SLOG_W("moe", "batchprobe L0: n=%d R_gpu=%d n_cpu=%d jobs=%zu", n,
+             R_gpu, n_cpu, jobs.size());
+    }
+  }
   cuda::moe_combine_batched_f16(x_.get(), expert_y_.get(), route_w_.get(),
                                 K, H, n, s);
 
