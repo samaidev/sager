@@ -276,6 +276,14 @@ class GGUFWriter:
             f.write(header)
             f.write(meta)
             f.write(td)
+            # ROOT CAUSE 17 (the soup): the data section must start at an
+            # align-boundary because every tensor offset in td assumes a
+            # data_start rounded up to `align`. Without this pad every
+            # tensor read was shifted by (align - header_len % align) bytes
+            # and ALL weights were garbage - with corr=1.0 self-consistent
+            # garbage inside the engine (pool copies what it reads).
+            used = len(header) + len(meta) + len(td)
+            f.write(b"\0" * ((-used) % align))
             pad = b"\0" * align
             for name, dims, qtype, provider in self.deferred:
                 data = provider()
