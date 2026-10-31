@@ -538,11 +538,18 @@ __global__ void rmsnorm_quant_f16_kernel(uint16_t* out, const uint16_t* x,
   __shared__ float qd[8], qid[8];
   const int tid = threadIdx.x;
   const int stride = blockDim.x;
+  // v0.12.9 fix (root 21): the grid is n_rows blocks - each block must
+  // offset x/out/xq by its OWN row. The old code indexed [0..n) in every
+  // block, so with n_rows > 1 rows 1..N-1 of out/xq were never written
+  // (stale) and the MoE consumed garbage - every layer's MoE collapsed.
+  const size_t row = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(n);
+  const int nblocks = n / 256;
 
   // ---- phase 1: rmsnorm reduction (exact rmsnorm_kernel order) ----
   float acc = 0.f;
   for (int i = tid; i < n; i += stride) {
-    const float v = __half2float(*reinterpret_cast<const __half*>(&x[i]));
+    const float v = __half2float(
+        *reinterpret_cast<const __half*>(&x[row + i]));
     acc += v * v;
   }
   const int lane = tid & 31, warp = tid >> 5;
@@ -558,14 +565,14 @@ __global__ void rmsnorm_quant_f16_kernel(uint16_t* out, const uint16_t* x,
   }
   __syncthreads();
   for (int i = tid; i < n; i += stride) {
-    *reinterpret_cast<__half*>(&out[i]) =
-        __float2half(__half2float(*reinterpret_cast<const __half*>(&x[i])) *
+    *reinterpret_cast<__half*>(&out[row + i]) =
+        __float2half(__half2float(
+                         *reinterpret_cast<const __half*>(&x[row + i])) *
                      red[0] *
                      __half2float(*reinterpret_cast<const __half*>(&w[i])));
   }
 
   // ---- phase 2: per-256 quantize groups (exact quantize_q8_k_kernel) ----
-  const int nblocks = n / 256;
   if (nblocks <= 0 || blockDim.x < 256) return;   // launcher guarantees both
   const int ngroups = blockDim.x / 256;
   const int g0 = tid >> 8;                        // 256 threads per group
@@ -580,7 +587,8 @@ __global__ void rmsnorm_quant_f16_kernel(uint16_t* out, const uint16_t* x,
     if (live) {
       // recompute the normalized value exactly as phase 1 wrote it
       const float vq =
-          __half2float(*reinterpret_cast<const __half*>(&x[idx])) * red[0] *
+          __half2float(*reinterpret_cast<const __half*>(&x[row + idx])) *
+          red[0] *
           __half2float(*reinterpret_cast<const __half*>(&w[idx]));
       v = __half2float(__float2half(vq));          // the fp16 xn value
     }
@@ -601,15 +609,18 @@ __global__ void rmsnorm_quant_f16_kernel(uint16_t* out, const uint16_t* x,
     __syncthreads();
     if (live && idx < n) {
       const int q = static_cast<int>(rintf(v * qid[g0]));
-      xq[bb].qs[tid_l] =
-          static_cast<int8_t>(max(-127, min(127, q)));
-      xq[bb].d = qd[g0];
+      q4k::BlockQ8K& blk =
+          xq[static_cast<size_t>(blockIdx.x) * nblocks + bb];
+      blk.qs[tid_l] = static_cast<int8_t>(max(-127, min(127, q)));
+      blk.d = qd[g0];
     }
     __syncthreads();
     if (live && tid_l < 8) {
+      q4k::BlockQ8K& blk =
+          xq[static_cast<size_t>(blockIdx.x) * nblocks + bb];
       int sum = 0;
-      for (int i = 0; i < 32; ++i) sum += xq[bb].qs[tid_l * 32 + i];
-      xq[bb].bsums[tid_l] = static_cast<int16_t>(sum);
+      for (int i = 0; i < 32; ++i) sum += blk.qs[tid_l * 32 + i];
+      blk.bsums[tid_l] = static_cast<int16_t>(sum);
     }
     __syncthreads();
   }
