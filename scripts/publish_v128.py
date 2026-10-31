@@ -138,9 +138,15 @@ def ms_upload(path, name=None):
     api.login(MS_TOKEN)
     name = name or os.path.basename(path)
     print(f"MS: uploading {path} -> {MS_REPO}/{name}")
-    api.upload_file(repo_id=MS_REPO,
-                    src_path=path, dest_path=name,
-                    commit_message=f"v0.12.8 artifacts: {name}")
+    try:
+        # modelscope >= 1.34: huggingface-style signature
+        api.upload_file(repo_id=MS_REPO, path_or_fileobj=path,
+                        path_in_repo=name,
+                        commit_message=f"v0.12.8 artifacts: {name}")
+    except TypeError:
+        # older SDKs: (repository_id, src_path, dest_path)
+        api.upload_file(MS_REPO, path, name,
+                        commit_message=f"v0.12.8 artifacts: {name}")
     return f"https://www.modelscope.cn/models/{MS_REPO}/resolve/master/{name}"
 
 
