@@ -150,3 +150,69 @@ collapsed. Pre-fix direct delta |moe-post| at L0 row 30 = 0.117 (expected
    15-20 list).
 3. SAGER_STEP_GRAPH=0 does NOT de-graph the MoE dumps (layer graphs still
    capture); the batched-path probe is the working window into real MoE.
+
+## Session 2026-10-31 III (6th VM, tunnel UA43ZAGZ): attention chain fully verified; no new engine root cause; IMA = pump/warmup interaction
+
+VM died with the previous tunnel mid-MoE-verify. Full rebuild (clone@diag-kv,
+T4, HF shards 69.8 GB re-download, converter with **--fast** [the slow path
+per-sub-block grid search never finishes - ~2.5 h wasted without the flag],
+Sage-fixed.gguf 20.32 GB = 18.91 GiB CONV_RC=0, pool 16.9 GB fresh fill).
+
+### Verified clean (numpy vs engine dumps, this VM, clean weights)
+- q4k.py numpy Q4_K mirror == gguf-py official dequantize (corr 1.0, bitwise).
+- L3 attention FULL chain, all 31 prefill rows, corr **1.000000** per row:
+  xin(residual) -> attn_norm -> fused q|gate GEMV with **per-head interleave**
+  (head h owns q rows [h*2*hd, h*2*hd+hd), gate rows [h*2*hd+hd, (h+1)*2*hd))
+  -> per-head RMSNorm (f16 store) -> NeoX partial rope (theta 1e7, 64 dims,
+  pairs (j, j+32), positions 0..30) -> GQA h//8 -> causal softmax (1/16)
+  -> q8 KV slab (kv_append matches fresh k/v, corr 0.99996; slab layout:
+  16 groups x [2B f16 scale | 32 int8], scale FIRST) -> sigmoid gate mult
+  -> o_proj -> residual. [ATT] with kernel-exact slab dequant = 1.000000.
+- v0.11 flash-tile prefill attention is **CORRECT** (an earlier "progressive
+  per-row corruption" was the numpy reference feeding pre-quantization k/v;
+  with the slab dequant the flash-tile path is bit-exact too).
+- LM head + decode logits: corr 0.99999641, top-12 overlap 12/12. The
+  step_logits NaN from earlier sessions was an IMA-poisoned-run artifact
+  (clean runs: nan=0).
+- Engine ctest 4/4 on the T4 (incl. cuda_q4_stack) after the diag11 patch.
+
+### NEW BUG (not the soup): IMA at capture warmup with pump ON
+`capture_graphs()` warmup launches dense/GDN layers + the MoE device warmup
+(moe_dispatch_device(0,1) with zeroed routes, stream ring not armed) ->
+"capture warmup left error: an illegal memory access" -> sticky error poisons
+TC prefill (dp4a fallback, all-zero tokens in one run) and kills some runs.
+Workaround that keeps the engine usable: `SAGER_EXPERT_PUMP=0` (pump off ->
+graphs capture fine, everything eager-clean). Did NOT reproduce on the 5th VM
+(reused pool) - fresh-pool fill vs reuse is the suspected delta. Fix idea:
+guard the warmup MoE device call on stream_active()/loader_count, or arm the
+ring before warmup.
+
+### Consequence for the MoE hunt (IMPORTANT, cost us an hour)
+`moe_dispatch_batched` is gated on `pump_ != nullptr` - with the pump off the
+prefill MoE silently runs the **per-row walk** (moe_dispatch_row), so the
+batched probe never fires on pump-off runs, and the earlier "pump-off clean"
+runs were exercising the ROW path, not batched/device. The batched/device MoE
+paths remain numpy-UNVERIFIED; the per-row path is now the best-covered one
+(it produced the same soup, so the soup lives in SHARED code: router,
+expert GEMVs, combine weights, or upstream GDN/residual).
+
+### Tooling (pushed to branch diag11-probe = 7562972)
+- diag11 engine patch: self-consistent batched-MoE probe - per call dumps
+  batched_{ridx,rw,rlogits,xpre,y,xn}_<probe>.bin locked to the same static
+  counter (fixes the probe #1/#2 pairing ambiguity from c418f1d).
+- q4k.py (numpy Q4_K/Q6_K/Q8_K mirrors, validated vs gguf-py), l3_verify.py,
+  head_verify.py, moe_verify.py (metadata-driven, probe-id arg), rexec.py
+  (Samai envelope executor), payloads/ with probe/setup/chain scripts.
+- Colab quirks re-learned: pypi nvidia-cuda-nvcc wheel 13.0.88 has a broken
+  cicc/ptxas pairing - use nvidia-cuda-nvcc==13.4.92; converter REQUIRES
+  --fast; payload functions cannot see module-level imports; python -u for
+  all drivers; driver stdin JSONL must use chr(10) not escaped \\n literals.
+
+### Next session
+1. conv_verify: MY GGUF vs HF shard 00012 (script ready; q/k/v/o/router/
+   shared/expert0-1 row corr) - the --fast converter output has NOT yet been
+   checked against HF directly.
+2. Re-run with SAGER_PF_DEVICE=0 + pump ON (no EXPERT_PUMP=0): batched probe
+   fires, run moe_verify 1/2 -> the combine/route_w verdict. If the IMA
+   bites, fix the warmup first (small guard patch).
+3. Then GDN L1+ / residual-growth / prefill-logits 4x-scale dump timing.
