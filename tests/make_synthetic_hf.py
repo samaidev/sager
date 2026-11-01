@@ -110,6 +110,7 @@ def main(out_dir, hybrid=False):
             add(p + "self_attn.q_norm.weight", (HD,), 0.5)
             add(p + "self_attn.k_norm.weight", (HD,), 0.5)
         add(p + "mlp.gate.weight", (E, H), 0.05)
+        add(p + "mlp.shared_expert_gate.weight", (1, H), 0.006)
         add(p + "mlp.shared_expert.gate_proj.weight", (FFE, H))
         add(p + "mlp.shared_expert.up_proj.weight", (FFE, H))
         add(p + "mlp.shared_expert.down_proj.weight", (H, FFE))

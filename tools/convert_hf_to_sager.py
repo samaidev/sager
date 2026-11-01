@@ -648,6 +648,14 @@ def convert(hf_dir: str, out_path: str, workers: int, fast: bool = False) -> Non
             w.add_tensor(f"blk.{layer}.ffn_gate_shexp", src(m + "shared_expert.gate_proj.weight"), T_Q4_K)
             w.add_tensor(f"blk.{layer}.ffn_up_shexp", src(m + "shared_expert.up_proj.weight"), T_Q4_K)
             w.add_tensor(f"blk.{layer}.ffn_down_shexp", src(m + "shared_expert.down_proj.weight"), T_Q4_K)
+            # ROOT 23 (2026-11-01): the shared expert's per-token scalar gate
+            # (HF mlp.shared_expert_gate.weight, [1, hidden] -> sigmoid).
+            # The loader looks this up as ffn_gate_inp_shexp.weight and the
+            # engine dmallocs the slot UNCONDITIONALLY - omitting the tensor
+            # left uninitialized VRAM there (fresh pages read as 0 -> a
+            # constant 0.5 gate instead of the trained sigmoid).
+            w.add_tensor(f"blk.{layer}.ffn_gate_inp_shexp.weight",
+                         src(m + "shared_expert_gate.weight").astype(np.float32).reshape(-1), T_F32)
 
     # ---- experts: DEFERRED providers (streamed during write()) ------------
     # v0.12.8: the HF bf16 checkpoint (~67 GB) + the Q4 GGUF (~21 GB) + the
