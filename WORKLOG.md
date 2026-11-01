@@ -320,3 +320,40 @@ quality-gated to decide.
   (2) attn_verify on the existing attn_L3_* dumps;
   (3) GDN layer differential with real inputs; (4) full 40-layer numpy
   forward vs step_logits if the per-layer diffs stay clean.
+
+## Session 2026-11-01 III (8th VM, tunnel 3RRLBA3M): root 24 - the word-soup master cause
+
+Fresh-VM full rebuild with root-22+23 (Sage-fixed.gguf regenerated, shgate
+tensor verified present, engine rebuilt) STILL produced soup (heuristic
+gate 3/3 "PASS" is meaningless - manual read = soup).
+
+### L3 full-attention differential (attn_verify_v2, file-layout fixed)
+q/k/v/gate projections ALL cos=1.000000 vs GGUF reference (post norm+rope);
+KV q8 cache clean (0.99998); attention OUTPUT wrong for tok1..4
+(cos 0.13-0.42) while tok0 is perfect - single-position softmax masks any
+score corruption. Hypothesis grid (temperature/masking/GQA/shifts/uniform)
+matched nothing -> kernel-level probe.
+
+### Isolated kernel replay (attn_probe.cu)
+Replaying the dumped q/kv-cache through attention_prefill_f16 reproduces
+the engine output EXACTLY (per-token cos 1.000000) -> the engine faithfully
+runs attn_prefill_v2 and the KERNEL is wrong on the same inputs numpy gets
+right. Instrumented copy (attn_probe2/3) printed the smoking gun:
+
+  kernel qr[0..7] = [16848, 48256, 13440, ...]
+  raw uint16 q[4,0,c*32] = [16852, 48269, 13441, ...]  (= f16 bits of 2.91, -1.14, ...)
+
+### ROOT 24: __half2float(q[i]) on uint16_t STORAGE
+attention.cu:232 (attn_prefill_v2) and :346 (attn_decode_partial) passed the
+uint16_t ELEMENT to __half2float, which takes __half - the implicit
+uint16_t->__half constructor converts the INTEGER VALUE (16852 -> half
+16852.0), not the bit pattern. Every q register became a 5-digit integer;
+scores q.k collapsed to ~-1e5 garbage; softmax degenerated to a
+single-position pick; every full-attention layer emitted near-random
+mixtures -> word soup since v0.11. tok0 (and any single-token softmax)
+looked correct, which is why decode-only spot checks and the earlier
+"flash-tile correct" verification missed it. Staging used
+reinterpret_cast (correct); the v0.10 fallback kernel used ldh() (correct);
+a whole-codebase audit found NO other __half2float(<raw uint16>) sites.
+
+Fix: qr[c] = ldh(q + q_off + c*32 + lane) in both kernels.

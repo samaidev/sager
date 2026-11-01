@@ -224,12 +224,16 @@ attn_prefill_v2(uint16_t* out, const uint16_t* q, const uint8_t* kc,
   __shared__ float w_sh[8][kTileRows];   // final weights exp(s - m_new)
 
   // per-lane q registers: dims {c*32 + lane}
+  // ROOT 24 FIX: q is uint16_t STORAGE - __half2float(q[i]) went through
+  // __half's VALUE-converting constructor (integer 16852 -> half 16852.0),
+  // not a bit reinterpretation, so every score was ~1e4-1e5 garbage and the
+  // softmax collapsed to a single position (word soup). ldh() reinterprets.
   const size_t q_off = static_cast<size_t>(tok) * n_head * (CH * 32) +
                        static_cast<size_t>(head) * (CH * 32);
   float qr[CH];
   #pragma unroll
   for (int c = 0; c < CH; ++c)
-    qr[c] = __half2float(q[q_off + c * 32 + lane]);
+    qr[c] = ldh(q + q_off + c * 32 + lane);
 
   float m = -1e30f, l = 0.f;
   float acc[CH];
@@ -343,7 +347,7 @@ attn_decode_partial(const uint16_t* q, const uint8_t* kc, const uint8_t* vc,
   float qr[CH];
   #pragma unroll
   for (int c = 0; c < CH; ++c)
-    qr[c] = __half2float(q[q_off + c * 32 + lane]);
+    qr[c] = ldh(q + q_off + c * 32 + lane);  // ROOT 24: bit reinterpret, see prefill
 
   float m = -1e30f, l = 0.f;
   float acc[CH];
