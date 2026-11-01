@@ -302,17 +302,36 @@ Status Weights::copy_attention(gguf::File& f, const ModelConfig& cfg) {
     return Status::kOk;
   };
   // norms: fp16 native or fp32 -> fp16
+  // ROOT 22 (2026-11-01): Qwen3.5-MoE uses a ZERO-CENTERED RMSNorm
+  // (Qwen3_5MoeRMSNorm, Gemma-style): the checkpoint stores DELTAS and the
+  // effective gain is (1 + w) - verified against the HF safetensors
+  // (layers.0.input_layernorm: mean 0.031 std 0.049; attn q/k_norm: mean
+  // ~0.32; final norm: mean 1.63). The rmsnorm kernels multiply w directly,
+  // so every normalized activation was crushed ~20-30x (attention logits
+  // ~1000x -> uniform attention -> word soup since v0.1). Bake +1 into the
+  // uploaded fp16 weights; the GGUF itself stays faithful to HF.
+  // lin_o_norm (RMSNormGated: standard w*x, values ~0.88) and the weightless
+  // GDN q/k l2norm do NOT go through this helper.
   auto copynorm = [&](void* dst, const gguf::TensorInfo* t,
                       const char* what = "?") -> Status {
     if (!t) { SLOG_E("weights", "copynorm: missing tensor %s", what);
               SLOG_E("weights", "parse-fail weights.cpp:%d", int(304)); return Status::kGgufParseError; }
-    if (t->type == 1) {
-      SAGER_CUDA_CHECK(cudaMemcpy(dst, f.tensor_data(*t), t->nbytes,
-                                  cudaMemcpyHostToDevice));
-      return Status::kOk;
+    if (t->type != 1 && t->type != 0) {
+      SLOG_E("weights", "parse-fail weights.cpp:%d", int(311)); return Status::kGgufParseError;
     }
-    if (t->type == 0) return copyf32_as_f16(dst, t);
-    SLOG_E("weights", "parse-fail weights.cpp:%d", int(311)); return Status::kGgufParseError;
+    const size_t n = t->nbytes / (t->type == 0 ? 4 : 2);
+    std::vector<float> tmp(n);
+    if (t->type == 1) {
+      auto* src = reinterpret_cast<const uint16_t*>(f.tensor_data(*t));
+      for (size_t i = 0; i < n; ++i) tmp[i] = q4k::half_to_float(src[i]) + 1.0f;
+    } else {
+      auto* src = reinterpret_cast<const float*>(f.tensor_data(*t));
+      for (size_t i = 0; i < n; ++i) tmp[i] = src[i] + 1.0f;
+    }
+    std::vector<uint16_t> h(n);
+    f32_to_f16_rows(tmp.data(), h.data(), n);
+    SAGER_CUDA_CHECK(cudaMemcpy(dst, h.data(), n * 2, cudaMemcpyHostToDevice));
+    return Status::kOk;
   };
   const GdnParams g = cfg.gdn();
   const int nk = g.n_k_heads;
