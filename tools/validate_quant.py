@@ -217,10 +217,11 @@ def _map_back(name: str, row: int, per_expert: int | None = None):
     files = sorted(glob.glob(os.path.join(hf, "*.safetensors")))
     # blk.{L}.ffn_{gate,up,down}_exps row r -> experts.{r}.{proj}
     parts = name.split(".")
-    if len(parts) < 4 or parts[3] not in ("ffn_gate_exps", "ffn_up_exps",
+    # "blk.{L}.ffn_{gate,up,down}_exps" -> parts = [blk, L, kind]
+    if len(parts) < 3 or parts[2] not in ("ffn_gate_exps", "ffn_up_exps",
                                           "ffn_down_exps"):
         return None  # lin_* / attn_* tensors: not expert rows, skip quietly
-    L, kind = parts[1], parts[3]  # ffn_gate_exps -> gate
+    L, kind = parts[1], parts[2]
     proj = {"ffn_gate_exps": "gate_proj",
             "ffn_up_exps": "up_proj",
             "ffn_down_exps": "down_proj"}[kind]
