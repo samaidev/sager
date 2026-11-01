@@ -87,24 +87,28 @@ def main(out_dir, hybrid=False):
         add(p + "input_layernorm.weight", (H,), 0.01)
         add(p + "post_attention_layernorm.weight", (H,), 0.01)
         if is_linear[l]:
-            # fused qkvz: [q nk*KD | k nk*KD | v nv*VD | z nv*VD]
-            proj_rows = 2 * NK_GDN * KD_GDN + 2 * NV_GDN * VD_GDN
+            # v0.12.8 split layout (matches the real Sage-A1.5 checkpoint):
+            # in_proj_qkv [q|k|v] (conv_dim) + in_proj_z + in_proj_b/a
+            # (per v-head) + per-head norm over VD. No q/k norms (bare L2).
             conv_dim = 2 * NK_GDN * KD_GDN + NV_GDN * VD_GDN
-            add(p + "linear_attn.in_proj_qkvz.weight", (proj_rows, H))
-            add(p + "linear_attn.in_proj_ba.weight", (2 * NK_GDN, H))
+            add(p + "linear_attn.in_proj_qkv.weight", (conv_dim, H))
+            add(p + "linear_attn.in_proj_z.weight", (NV_GDN * VD_GDN, H))
+            add(p + "linear_attn.in_proj_b.weight", (NV_GDN, H), 0.05)
+            add(p + "linear_attn.in_proj_a.weight", (NV_GDN, H), 0.05)
             add(p + "linear_attn.conv1d.weight", (conv_dim, 1, CK_GDN))
             add(p + "linear_attn.conv1d.bias", (conv_dim,), 0.01)
-            add(p + "linear_attn.A_log", (NK_GDN,), 0.05, f16=False)
-            add(p + "linear_attn.dt_bias", (NK_GDN,), 0.05, f16=False)
-            add(p + "linear_attn.q_norm.weight", (KD_GDN,), 0.5)
-            add(p + "linear_attn.k_norm.weight", (KD_GDN,), 0.5)
-            add(p + "linear_attn.o_norm.weight", (VD_GDN,), 0.5)
+            add(p + "linear_attn.A_log", (NV_GDN,), 0.05, f16=False)
+            add(p + "linear_attn.dt_bias", (NV_GDN,), 0.05, f16=False)
+            add(p + "linear_attn.norm.weight", (VD_GDN,), 0.5)
             add(p + "linear_attn.out_proj.weight", (H, NV_GDN * VD_GDN))
         else:
-            add(p + "self_attn.q_proj.weight", (NH * HD, H))
+            # gated attention: fused per-head [q|gate] q_proj (2*NH*HD rows)
+            add(p + "self_attn.q_proj.weight", (NH * HD * 2, H))
             add(p + "self_attn.k_proj.weight", (NKV * HD, H))
             add(p + "self_attn.v_proj.weight", (NKV * HD, H))
             add(p + "self_attn.o_proj.weight", (H, NH * HD))
+            add(p + "self_attn.q_norm.weight", (HD,), 0.5)
+            add(p + "self_attn.k_norm.weight", (HD,), 0.5)
         add(p + "mlp.gate.weight", (E, H), 0.05)
         add(p + "mlp.shared_expert.gate_proj.weight", (FFE, H))
         add(p + "mlp.shared_expert.up_proj.weight", (FFE, H))

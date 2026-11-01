@@ -89,35 +89,37 @@ def read_gguf_dir(path: str):
         off = struct.unpack("<Q", f.read(8))[0]
         tensors[name] = (dims, ttype, off)
     # data section starts at current pos (aligned per writer)
-    data_start = f.tell()
+    # GGUF v3: round up to the general.alignment boundary (default 32) -
+    # the writer pads the tensor dir (root-17 fix); f.tell() may be unaligned.
+    data_start = (f.tell() + 31) & ~31
     return kv, tensors, data_start
 
 
 def dequant_q4_k_row(raw: bytes, n: int) -> np.ndarray:
-    d, dmin = struct.unpack_from("<HH", raw, 0)
-    d = np.float16(d).item()
-    dmin = np.float16(dmin).item()
-    scales = raw[4:16]
-    qs = raw[16:16 + 128]
-    out = np.empty(n, dtype=np.float32)
-    # ggml Q4_K order (v0.12 fix): group g's 32 bytes - LOW nibbles are
-    # sub-block 2g (weights 64g..64g+31), HIGH nibbles are sub-block 2g+1.
+    """Dequantize n//256 consecutive Q4_K blocks (144 B each) of one row.
+    Vectorized over blocks; nibble order matches the engine kernels:
+    group g byte l: LOW nibble = sub-block 2g weight l, HIGH = 2g+1."""
+    nb = len(raw) // 144
+    a = np.frombuffer(raw, dtype=np.uint8).reshape(nb, 144)
+    d = a[:, 0:2].copy().view("<f2").astype(np.float32).reshape(nb)
+    dmin = a[:, 2:4].copy().view("<f2").astype(np.float32).reshape(nb)
+    sc, qs = a[:, 4:16], a[:, 16:144]
+    d6 = np.empty((nb, 8), np.float32); m6 = np.empty((nb, 8), np.float32)
+    for s in range(8):
+        if s < 4:
+            d6[:, s] = sc[:, s] & 63; m6[:, s] = sc[:, s + 4] & 63
+        else:
+            d6[:, s] = (sc[:, s + 4] & 0xF) | ((sc[:, s - 4] >> 6) << 4)
+            m6[:, s] = ((sc[:, s + 4] >> 4) & 0xF) | ((sc[:, s] >> 6) << 4)
+    out = np.empty((nb, 256), np.float32)
     for g in range(4):
-        d6 = {}
-        m6 = {}
-        for s in (2 * g, 2 * g + 1):
-            if s < 4:
-                d6[s] = scales[s] & 63
-                m6[s] = scales[s + 4] & 63
-            else:
-                d6[s] = (scales[s + 4] & 0xF) | ((scales[s - 4] >> 6) << 4)
-                m6[s] = (scales[s + 4] >> 4) | ((scales[s] >> 6) << 4)
-        sd0, sm0 = d * d6[2 * g], dmin * m6[2 * g]
-        sd1, sm1 = d * d6[2 * g + 1], dmin * m6[2 * g + 1]
-        for l in range(32):
-            out[g * 64 + l] = sd0 * (qs[g * 32 + l] & 0xF) - sm0
-            out[g * 64 + 32 + l] = sd1 * (qs[g * 32 + l] >> 4) - sm1
-    return out
+        qsg = qs[:, g * 32:(g + 1) * 32]
+        lo, hi = qsg & 0xF, qsg >> 4
+        out[:, g * 64:g * 64 + 32] = \
+            (d * d6[:, 2 * g])[:, None] * lo - (dmin * m6[:, 2 * g])[:, None]
+        out[:, g * 64 + 32:g * 64 + 64] = \
+            (d * d6[:, 2 * g + 1])[:, None] * hi - (dmin * m6[:, 2 * g + 1])[:, None]
+    return out.reshape(-1)
 
 
 def tensor_nbytes(dims: List[int], ttype: int) -> int:
