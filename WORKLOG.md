@@ -216,3 +216,57 @@ expert GEMVs, combine weights, or upstream GDN/residual).
    fires, run moe_verify 1/2 -> the combine/route_w verdict. If the IMA
    bites, fix the warmup first (small guard patch).
 3. Then GDN L1+ / residual-growth / prefill-logits 4x-scale dump timing.
+
+## Session 2026-11-01 (7th VM, tunnel 2TZVJCB2): ROOT 22 = zero-centered RMSNorm
+
+VM was fresh again (6th tunnel's VM gone; /content empty). Full rebuild
+launched (diag-kv @ c437ab7, build+ctest 4/4 clean, shards re-downloaded,
+converter --fast rerun). While it ran, the hunt went STATIC against the
+ground truth - the transformers reference implementation
+(models/qwen3_5_moe/modeling_qwen3_5_moe.py, fetched from HF transformers
+main) plus HTTP-range reads of the actual checkpoint values.
+
+### Reference audit - everything else verified CORRECT
+- RoPE: text path = NeoX half-split pairs (j, j+32), partial 64/256, theta
+  1e7 (recomposition_frequencies -> cat(freqs,freqs) + rotate_half; the
+  mrope_interleaved section mix only affects vision grids). Engine matches.
+- Full attention: per-head q|gate interleave, sigmoid output gate, GQA
+  h//8, softmax 1/16 fp32, q_norm/k_norm (per-head 256) BEFORE rope.
+- GDN: conv over fused q|k|v (8192 ch) + SiLU; q/k weightless l2norm;
+  v-head j uses k-head j//2 (engine scan: vh = h*2 + j/V - identical to
+  repeat_interleave); g = -exp(A_log)*softplus(a+dt_bias), beta =
+  sigmoid(b); delta rule s <- a*s - a*b*(s.k)k + b*v*k, y = s.q (FLA-exact);
+  o = RMSNormGated_w(o) * silu(z) (STANDARD w*x - engine gdn_out_norm
+  matches).
+- MoE: router softmax -> topk8 -> renormalize-to-1 (engine has it);
+  shared expert gated per-token by sigmoid(shared_expert_gate.x) (engine
+  layer.cpp matches); silu(gate)*up experts.
+
+### ROOT 22 (commit 9e7b9df remote / aa3c298 local)
+Qwen3_5MoeRMSNorm is ZERO-CENTERED (Gemma-style): gain = (1 + w), weights
+init to zeros. Checkpoint values prove it (HTTP range reads, shard 00012):
+  layers.0.input_layernorm   mean +0.031 std 0.049  (all |w| < 0.35)
+  layers.3 q_norm / k_norm   mean +0.33 / +0.31
+  final model.norm           mean +1.63 std 0.23
+  linear_attn.norm (o_norm)  mean +0.88  <- RMSNormGated, STANDARD w*x
+The engine's rmsnorm kernels multiply w directly, so EVERY normalized
+activation ran at ~0.03-0.33x gain since v0.1: attention logits crushed
+~1000x (uniform attention), MoE inputs crushed, final logits ~1.6x short.
+This is THE word soup. It survived every numpy cross-check because the
+numpy references encoded the same w*x mistake (engine-vs-my-numpy = 1.0
+corr against the same wrong formula).
+Fix: copynorm() in weights.cpp bakes +1.0 into the uploaded fp16 weights
+(attn_norm / ffn_norm / attn_q_norm / attn_k_norm / output_norm all load
+through it). lin_o_norm (RMSNormGated) is NOT touched. Kernels unchanged
+(graph-safe); GGUF stays faithful; pool unaffected (norms are not experts).
+
+### Ops notes this session
+- tunnel 502 EOF: a payload that raises SystemExit kills the Flask handler
+  thread -> relay reports 502. Use RuntimeError in payloads. Related trap:
+  `git add` succeeded on a broken patch before `git commit` failed (no
+  identity), so `git checkout -- file` restored from the INDEX, not HEAD;
+  use `git reset --hard HEAD` when re-patching.
+- Tooling (q4k.py etc.) from session III was NEVER in git (only the
+  session.cpp engine patch was pushed on diag11-probe). Rewrite as needed;
+  gguf reader + Q4_K dequant are being rebuilt locally from the converter
+  contract.
