@@ -218,11 +218,15 @@ def _map_back(name: str, row: int):
     proj = {"ffn_gate_exps": "gate_proj",
             "ffn_up_exps": "up_proj",
             "ffn_down_exps": "down_proj"}[kind]
-    key = f"model.layers.{L}.mlp.experts.{row}.{proj}.weight"
-    fn = wm.get(key) or next((f for f in files if key in _keys_of(f)), None)
-    if not fn:
-        return None
-    return os.path.join(hf, fn) if not os.path.isabs(fn) else fn, key
+    for pref in ("model.language_model.layers.", "model.layers."):
+        key = f"{pref}{L}.mlp.experts.{row}.{proj}.weight"
+        fn = wm.get(key)
+        if not fn:
+            fn = next((f for f in files
+                       if key in _keys_of(os.path.join(hf, f))), None)
+        if fn:
+            return (os.path.join(hf, fn) if not os.path.isabs(fn) else fn), key
+    return None
 
 
 def _keys_of(fn: str) -> set:
