@@ -162,7 +162,10 @@ def main() -> None:
         if ttype != 12:
             continue
         cols = dims[0]                  # gguf order: fastest = cols
-        nrows = dims[1] if len(dims) > 1 else 1
+        nrows = 1
+        for d in dims[1:]:              # 2D: [cols, rows]; 3D experts: [cols, rows, n_exp]
+            nrows *= d
+        per_expert = dims[1] if len(dims) == 3 else None
         base = data_start + off
         picked = rng.sample(range(nrows), min(a.rows, nrows))
         se, sr = 0.0, 0.0
@@ -175,12 +178,13 @@ def main() -> None:
             if a.hf:
                 from safetensors import safe_open  # type: ignore
                 # row-matched comparison against the HF original
-                hf_name = _map_back(name, r)
+                hf_name = _map_back(name, r, per_expert)
                 if hf_name is None:
                     continue
-                fn, key = hf_name
+                fn, key, erow = hf_name
                 with safe_open(fn, framework="numpy") as g:
-                    orig = g.get_tensor(key)[r].astype(np.float32)
+                    orig = g.get_tensor(key)[erow if erow is not None
+                                             else r].astype(np.float32)
                 e = orig - x
                 se += float((e * e).sum()) - float((x * x).sum())  # replace prior
                 sr += float((orig * orig).sum())
@@ -195,8 +199,10 @@ def main() -> None:
           f"({'OK' if worst < 0.08 else 'REVIEW: above the iid-gaussian floor'} )")
 
 
-def _map_back(name: str, row: int):
-    """Map (sager tensor, expert row) -> (file, hf_key) via cwd listing."""
+def _map_back(name: str, row: int, per_expert: int | None = None):
+    """Map (sager tensor, flat row) -> (file, hf_key) via cwd listing.
+    For 3D expert stacks per_expert = rows per expert: expert = row // per_expert,
+    within-expert row = row % per_expert."""
     import os
     import glob
     import json
@@ -218,14 +224,17 @@ def _map_back(name: str, row: int):
     proj = {"ffn_gate_exps": "gate_proj",
             "ffn_up_exps": "up_proj",
             "ffn_down_exps": "down_proj"}[kind]
+    expert, erow = (row // per_expert, row % per_expert) \
+        if per_expert else (row, None)
     for pref in ("model.language_model.layers.", "model.layers."):
-        key = f"{pref}{L}.mlp.experts.{row}.{proj}.weight"
+        key = (f"{pref}{L}.mlp.experts.{expert}.{proj}.weight")
         fn = wm.get(key)
         if not fn:
             fn = next((f for f in files
                        if key in _keys_of(os.path.join(hf, f))), None)
         if fn:
-            return (os.path.join(hf, fn) if not os.path.isabs(fn) else fn), key
+            fn = os.path.join(hf, fn) if not os.path.isabs(fn) else fn
+            return (fn, key, erow) if erow is not None else (fn, key, None)
     return None
 
 
