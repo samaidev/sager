@@ -270,3 +270,53 @@ through it). lin_o_norm (RMSNormGated) is NOT touched. Kernels unchanged
   session.cpp engine patch was pushed on diag11-probe). Rewrite as needed;
   gguf reader + Q4_K dequant are being rebuilt locally from the converter
   contract.
+
+## Session 2026-11-01 II (7th VM cont.): root 23 + full verification sweep
+
+Root-22 fix deployed (remote commit 9e7b9df) and the quality gate STILL
+produces soup (heuristic PASS, manual read = soup; raw completions: 2/3
+prompts emit EOS immediately). The hunt then went exhaustive:
+
+### conv_verify (GGUF vs HF, HTTP ranges) - WEIGHTS FULLY CLEAN
+All f16/f32 anchors bit-exact (norms, dt_bias, A_log->-exp, conv_w,
+router, embedding rows incl. token alignment); all Q4_K surfaces
+cos 0.989-0.996 (lm_head, fused [q|k|v|z] all four carves, [b|a],
+out_proj, shexp, attn q/k/v/o, experts of L0/L20 x4 experts x3 mats).
+The --fast encoder is EXONERATED on real data.
+
+### moe_verify (diag11 batched probe vs GGUF reference) - MoE CHAIN CLEAN
+Router: top-8 sets + renormalized weights EXACT (5/5 tokens).
+ffn_norm with the root-22 (1+w) fix: cos=1.000000 live.
+Routed expert GEMV chain (Q8 quant -> grouped gemv -> silu -> requant ->
+down -> scatter): cos 0.9996-0.9998 across all 8 slots.
+Combine: cos=1.000000, maxdiff 1e-4.
+EXCEPT the shared expert: implied gate = 0.5031 = sigmoid(0).
+
+### ROOT 23 (commit 80b624a): converter never wrote
+blk.L.ffn_gate_inp_shexp.weight (HF mlp.shared_expert_gate.weight).
+The engine dmallocs lw.shared_gate_w UNCONDITIONALLY and silently skips
+the load when the tensor is absent -> uninitialised VRAM (fresh pages
+read 0) -> every layer's shared expert ran with a CONSTANT 0.5 gate.
+Fix: converter writes it (f32 [2048]); the existing GGUF can be patched
+by append-surgery (scripts/gguf_shgate_surgery.py - offsets are
+data-section-relative, the data blob moves as a whole, so old offsets
+stay UNCHANGED; first attempt wrongly added the dir-growth delta).
+CAVEAT: the true gate vectors are tiny (L0 std 0.0063 ->
+sigmoid ~ 0.5 +/- 0.07), so the constant-0.5 may be nearly right -
+root 24 may still be at large. The surgically-fixed GGUF must be
+quality-gated to decide.
+
+### Ops
+- Tunnel 2TZVJCB2 died ~02:52 mid-surgery (7th tunnel death). VM state
+  unknown; the corrected surgery may or may not have completed
+  (/content/Sage-fixed.gguf.fixed).
+- repo state: local sandbox has root-22 + worklog + 4 validate_quant/
+  make_synthetic_hf fixes + root-23 (unpushed - no GitHub PAT in this
+  session); the dead VM held 9e7b9df + d4d208f likewise unpushed.
+- Engine-side tooling this session (in the sandbox scripts/ dir):
+  conv_verify.py, moe_verify.py, attn_verify.py (L3 layer differential,
+  ready to fire), gguf_shgate_surgery.py, norm_stats.py, cmdbus.py.
+- NEXT: (1) complete surgery + quality gate (root-23 verdict);
+  (2) attn_verify on the existing attn_L3_* dumps;
+  (3) GDN layer differential with real inputs; (4) full 40-layer numpy
+  forward vs step_logits if the per-layer diffs stay clean.
