@@ -357,3 +357,52 @@ reinterpret_cast (correct); the v0.10 fallback kernel used ldh() (correct);
 a whole-codebase audit found NO other __half2float(<raw uint16>) sites.
 
 Fix: qr[c] = ldh(q + q_off + c*32 + lane) in both kernels.
+
+## Session 2026-11-03 IV (9th VM, tunnel E5MC8O94): root 24 verified fixed but soup persists -> root 25/26 (artifact persistence)
+
+Fresh-VM full rebuild (v3 driver: diag-kv + session patch r22+r23+r24, ctest
+4/4, SHGATE_TENSOR_PRESENT=True, pool cold-fill) STILL produced soup in the
+quality gate (all three prompts incoherent CJK/EN token salad). Root 24 was
+real but not the whole story.
+
+### Layer-1 differential ladder (full_ref.py + l0_fine*.py, 5-tok prefill)
+- embed row: cos=1.000000; L0 GDN internals (r_proj/r_conv/r_scan): cos=1.000000
+  (all 5 tokens) - delta-rule scan, causal conv, qkvz projection exact.
+- L0 residual r_post: eng-cos=0.91770 (FIRST divergence); L1 0.59, L2 0.53.
+- l0_fine2 per-(token,head) cos matrix: on and y are 5x32 ALL 1.000000 ->
+  gdn_out_norm_chunk_f16 kernel EXACT; w_on device bits == GGUF bits.
+- Clean-on o recompute: o_eng vs on_ref@Wout.T cos=0.9168, rel-err 62%,
+  |eng o| 39% too large, diff argmax 1269, ALL 16 dim-segments polluted ->
+  the lin_out GEMM consumes corrupted weights. PF_TC=0 (dp4a) reproduced the
+  SAME statistics -> GEMM kernels innocent; device weight bytes innocent for
+  rows 0-7 (blind box: device == GGUF byte-exact, TC dequant scratch cos=1.0).
+
+### ROOT 25: the GGUF on disk is not what the engine loaded
+Full NaN-scale scan (every Q4_K block's d/dmin f16 bits): ~2% of blocks carry
+NaN-pattern scales spread over EVERY big tensor (lin_out, attn_*, ffn_*_exps,
+output.weight; 371 tensors) - yet the engine (loaded from the same file 40
+minutes earlier) produced NaN-free outputs and cos=1.0 internals. md5 of the
+region was stable across reads AND matched the v8-era extract, i.e. the disk
+content had been garbage since long before. First bad block = row 20; raw
+bytes are high-entropy junk, not Q4_K. quantize_q4_k_fast cannot emit
+mantissa-nonzero sNaN d bits -> the NaN blocks are garbage bytes on disk that
+the converter never wrote.
+
+### ROOT 26: hf_transfer downloads are not fsynced; evicted pages resurface as garbage
+- converter write() had no fsync either; on Colab's overlay disk the written
+  pages lived in the page cache only. Every read 07:55-10:26 hit cache and
+  looked perfect (hence all cos=1.0 differentials); after eviction the disk
+  showed junk. pool.bin tail showed the same 2.26% NaN fingerprint.
+- Control: single shard downloaded with HF_HUB_ENABLE_HF_TRANSFER=0 +
+  os.sync() -> md5 stable, disk good.
+- fsync-only rebuild (v4) still failed the NaN gate (371 tensors): the shards
+  themselves were downloaded with hf_transfer (no fsync) and the converter
+  quantized garbage bytes into NaN scales deterministically.
+
+### Fixes
+- tools/convert_hf_to_sager.py: f.flush() + os.fsync(f.fileno()) before
+  write() returns.
+- Rebuild driver v5: HF_HUB_ENABLE_HF_TRANSFER=0 for the shard download,
+  os.sync() at every persistence boundary (after download, after convert,
+  after pool fill), and a hard NaN-scale gate (nan-ratio must be 0.0 over
+  every Q4_K tensor / pool sample) before the quality gate can run.
