@@ -303,6 +303,11 @@ class GGUFWriter:
                     f.write(pad[:p])
                 if self.on_release:
                     self.on_release(name)
+            # ROOT 26: without fsync the written pages lived only in the VM
+            # page cache; after eviction Colab's overlay disk showed garbage
+            # for the tail regions of every big tensor (NaN-scale blocks).
+            f.flush()
+            os.fsync(f.fileno())
         print(f"[convert] wrote {path} "
               f"({os.path.getsize(path) / 2**30:.2f} GiB, "
               f"{len(all_tensors)} tensors)")
