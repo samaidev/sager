@@ -547,3 +547,48 @@ depends on input, or logits are drowned by a constant term.
 Artifacts on VM (tunnel LAQUTFHI): /content/Sage-fixed.gguf (clean),
 /content/pool.bin (clean, aligned-scan verified), /content/rebuild6.log,
 stage markers s1-s5 (s6 marker not set - gate bug, not a real failure).
+
+## 2026-11-04 (audit round): full source audit vs the TRUE Qwen3.5 reference - all layer math VERIFIED, soup cause narrowed to runtime glue
+
+Context: v6 verdict (soup survives r22-24/26) + tunnel LAQUTFHI died mid-audit.
+Reference obtained: transformers main modeling_qwen3_5.py + modeling_qwen3_5_moe.py
+(fetched raw to /tmp; Sage-A1.5 = Qwen3_5MoeForConditionalGeneration, hidden_act=silu,
+attn_output_gate=true, full_attention_interval=4, tie_word_embeddings=false).
+
+### Verified CORRECT (engine vs reference, line by line)
+- GDN conv: applies to [q|k|v] only (conv_dim = 2*key_dim + value_dim), silu,
+  z/b/a bypass. Engine carve [q|k|v|z] and [b|a] matches converter vstack.
+- GDN gate: beta=sigmoid(b); alpha=exp(-exp(A_log)*softplus(a+dt_bias));
+  converter pre-negates A_log correctly.
+- GDN l2 norm: bare L2 (no weights) - correct, Sage-A1.5 has no linear q/k norm.
+- GDN delta recurrence: engine s_new = a*s - a*b*(S k)k + b*v*k is ALGEBRAICALLY
+  IDENTICAL to reference (decay-first + correction-on-decayed-state + un-decayed
+  v-term). v-head sharing (2 consecutive v-heads per k-head) matches
+  repeat_interleave. (Ref q *= 1/sqrt(K) is normalized away by o_norm.)
+- GDN out: RMSNorm(y)*w_on*silu(z) per v-head = Qwen3_5RMSNormGated. Standard
+  (non-zero-centered) w - root-22 correctly left it alone.
+- Attention: q_proj is heads*hd*2 with PER-HEAD [q|gate] interleave (view
+  (..., -1, hd*2).chunk(2)); engine v0.12.1 deinterleave + sigmoid_mul_rows
+  matches exactly. Buffer layout [wq|attn_gate] contiguous carve verified.
+- Attention norms: Qwen3_5RMSNorm zero-centered (1+w) on q/k per head = root-22.
+- MoE router: softmax->topk->renorm == topk->softmax (Z cancels). SwiGLU silu.
+- Shared expert: sigmoid(shared_expert_gate(h)) * shared(h) + routed. r23 tensor
+  now written by converter.
+- Decoder layer: standard pre-norm residual x + mixer(norm(x)); x + mlp(norm(x)).
+- conv weight layout [D,ck] channel-major matches kernel w[d*ck+j]; converter
+  reshapes [D,1,ck]->[D,ck].
+
+### Remaining suspects (ordered)
+1. RUNTIME GLUE, not math: decode CUDA graphs ("captured 40 per-layer decode
+   graphs", graphs=on) - stale-state/pointer bugs on replay; dev_sampler=1.
+   Test: graphs:false eager rerun (launch_eager96.py infra exists) + greedy
+   first-token (check_logits.py vs numpy ref "Paris 18.572").
+2. Kernels not yet line-audited: norm_rotary.cu (rope partial 0.25 theta 1e7),
+   moe.cu routing execution, q4_k.cu dequant paths used by mmq/tc_gemm,
+   sampling.cu.
+3. Embedding / output head load path (fixed token cloud across prompts is
+   consistent with constant-ish final hidden state OR scrambled head rows).
+
+Note for next session: prior numpy references may encode the same engine bug
+(root-22 lesson) - validate reference code against the fetched HF source, not
+against the engine.
