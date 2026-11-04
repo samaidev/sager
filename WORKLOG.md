@@ -455,3 +455,47 @@ with all four ROOT markers. Default tunnel PXY314IH (AITUN_CODE overrides).
    clean tree (`git checkout`) for the release build -> publish.
 4. Quality gate still soup -> re-run the o-vs-ref differential on the
    clean data (o cos=0.917 / 62% err was measured on poisoned data).
+
+## 2026-11-04 (later): ROOT 27 - the NaN gates were scanner false positives
+
+### The v6 run
+Fresh VM (tunnel IQD7BK9A), v6 driver: s1 patch(4 roots)+build+ctest 4/4 clean,
+s4 shard gate 14/14 clean (hf_transfer OFF), s5 converter RC=0 (18.91 GiB,
+673 tensors) -> NaN gate FAILED with DAMAGED_TENSORS=371 - the SAME count
+as the v4 run built from (allegedly garbage) hf_transfer shards.
+
+### The contradiction that cracked it
+Clean shards in, fsync'd write, sync before scan - yet identical 371. Both
+quantizers write d == dmin (same f16 bits twice: `block[:,0:2]=d16;
+block[:,2:4]=d16`), so ANY correctly-aligned scan must report bad_d == bad_m.
+v4/v6 reported 2241 vs 2251, 733 vs 792, 39748 vs 38572 -> the scan was
+reading bytes the converter never wrote as scales.
+
+### Root cause
+gguf_scan_nan.py computed `DATA = (f.tell()+31) & ~31` AFTER the KV loop but
+BEFORE the tensor-directory loop - i.e. data_start = align32(end-of-KV),
+~len(td) bytes short of the real data section. Every tensor read landed
+inside the directory/f16/f32 region: "NaN scales" were names/dims/weight
+bytes at a fixed wrong offset. Deterministic per model -> identical 371
+across runs/VMs/shard sources. validate_quant.py (fixed in bf70353) always
+parsed in the correct order - which is why it validated cos ~0.995 while
+the NaN scanner screamed.
+
+Local proof (scripts/scan_check.py + /tmp/synth.gguf synthetic chain):
+- broken order: d_ne_dmin=5,728,029 of 5,728,256 blocks, first "bad block"
+  hexdump spells "ffn_down_exps" (directory bytes!), VERDICT A
+- fixed order (DATA after td loop): d_ne_dmin=0, nan_d=0, VERDICT C_CLEAN
+
+### Consequences
+- The GGUF conversions were NEVER damaged. The root-25/26 "disk garbage"
+  narrative was an artifact of this scanner bug (the engine's own C++ reader
+  was always right - hence cos=1.0 internals "despite" disk NaNs).
+- fsync discipline (r26) retained as hygiene, but it was never the soup cause.
+- The S5 NaN gate blocked every rebuild since v4 for nothing; the S6 quality
+  gate has NEVER actually run on an r22+r23+r24 build. Launched it directly
+  (scripts/launch_s6_v2.py -> /content/s6run.log): fixed scan first, then
+  pool cold-fill + v12_quality max-tokens 96 - the first real word-soup
+  verdict on a fully-patched engine.
+
+Fixes applied locally: scripts/gguf_scan_nan.py + scripts/scan_check.py now
+compute data_start after the tensor directory.
