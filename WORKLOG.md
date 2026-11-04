@@ -406,3 +406,52 @@ the converter never wrote.
   os.sync() at every persistence boundary (after download, after convert,
   after pool fill), and a hard NaN-scale gate (nan-ratio must be 0.0 over
   every Q4_K tensor / pool sample) before the quality gate can run.
+
+## 2026-11-04 session (post tunnel-loss): v6 driver staged, awaiting VM
+
+### VM loss confirmed
+Both tunnels offline (`E5MC8O94` and `PXY314IH` -> "Tunnel offline" from
+aitun.cc /health). The Colab VM behind them was recycled: the v4 rebuild
+(converter shard 8/13 in flight) and all /content assets (tree, GGUF,
+pool, shards) are gone. Memory reads at 10.8% via the new tunnel had
+already suggested a fresh VM.
+
+### Loss is smaller than it looks
+WORKLOG post-mortem (recorded just before the loss): the fsync-only v4 was
+DOOMED anyway - it still failed the NaN gate with 371 damaged tensors
+because the SHARDS themselves were hf_transfer downloads (never fsynced),
+and the converter quantized garbage bytes into NaN scales deterministically.
+v5's remedy (HF_HUB_ENABLE_HF_TRANSFER=0 + os.sync() at every persistence
+boundary) was designed but the VM died before it could run end-to-end.
+
+### Remote base pinned
+`git ls-remote origin diag-kv` -> c437ab7 (local origin/diag-kv ref was
+stale at 86a5ddc; c437ab7 is its descendant and exactly our patch base).
+
+### v6 driver (launch_rebuild_v6.py, local scripts/) - READY, not yet run
+Merge of v3 + v4 + v5, one-shot for a FRESH VM:
+  S1  clone -> checkout c437ab7 -> apply patch (roots 22+23+24+26 in one
+      diff; fsync is COMMITTED locally in eda63d7, so NO runtime anchor
+      patch - v4's would assert-fail) -> grep-verify all four root markers
+  S2  shard download with HF_HUB_ENABLE_HF_TRANSFER=0, os.sync() inside the
+      downloader before SNAP_OK
+  S3  cmake build + ctest (recorded)
+  S4  wait for shards + os.sync() + NEW shard health gate (f16 nan-ratio
+      < 1e-4 over 3x4MB samples per shard) - catches root-25 BEFORE the
+      40-60min converter run instead of after
+  S5  os.sync() -> converter --fast (fsync baked in) -> sync -> size gate
+      + SHGATE_TENSOR_PRESENT + full Q4_K NaN scan (DAMAGED_TENSORS=0)
+  S6  disk cleanup (keep shard 00012) -> pool cold-fill PUMP=0 -> sync ->
+      pool size gate -> pool NaN gate (POOL_GATE_OK) -> v12_quality output
+      (+ v3's direct-load fallback fill if PUMP=0 leaves no pool)
+Local verification: bash -n OK; 14/14 strategy checks; patch 15262 bytes
+with all four ROOT markers. Default tunnel PXY314IH (AITUN_CODE overrides).
+
+### Next
+1. User restarts the Colab VM + tunnel client (tunnel code may change).
+2. `AITUN_CODE=<code> python3 scripts/launch_rebuild_v6.py`, then poll
+   `/content/rebuild6.log` via fetch_log.py.
+3. Gates green -> root-26 case closed -> re-run bench (pp512/tg128) ->
+   clean tree (`git checkout`) for the release build -> publish.
+4. Quality gate still soup -> re-run the o-vs-ref differential on the
+   clean data (o cos=0.917 / 62% err was measured on poisoned data).
