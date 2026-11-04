@@ -499,3 +499,51 @@ Local proof (scripts/scan_check.py + /tmp/synth.gguf synthetic chain):
 
 Fixes applied locally: scripts/gguf_scan_nan.py + scripts/scan_check.py now
 compute data_start after the tensor directory.
+
+## 2026-11-04 (final): v6 VERDICT on fresh VM (tunnel LAQUTFHI) - soup survives all four roots; S6 pool gate is another false positive
+
+### Run timeline (all UTC)
+13:59 start (T4 16GB, 113G free) -> 13:59:15 s1 done (patch e9f27a7 on
+c437ab7, four markers) -> 14:03:37 s3 done (BUILD_RC=0, ctest 4/4) ->
+14:11:44 s4 done (14/14 shards worst_f16_nan=0.000000, SHARD_GATE_OK,
+hf_transfer OFF) -> 14:39:07 s5 done (CONV_RC=0, GGUF_SIZE=20301730496,
+SHGATE_TENSOR_PRESENT=True, DAMAGED_TENSORS=0 with the root-27-fixed
+scanner - first conversion EVER past the NaN gate) -> s6: quality ran,
+QUALITY_RC=0, POOL_SIZE=18119393280 = exactly 10240 x 1769472
+(3 mats x 589824B Q4_K per expert), then POOL_GATE_FAILED.
+
+### ROOT 28 (candidate): pool gate sampled at unaligned offsets
+The s6 pool gate seeks int(sz*frac) WITHOUT 144-byte block alignment.
+Misaligned u16 pairs from Q4_K quant payload hit f16 NaN exponent bits at
+~1/32 = 3.1% (observed 2.1-2.5% at frac 0.955-0.999). Re-probed at
+144-ALIGNED offsets: ratio = 0.0 at every fraction 0.90-0.999.
+The pool is CLEAN. Same bug class as root 27 (readers sampling at wrong
+offsets). Fix when reused: off = (int(sz*frac)//144)*144.
+
+### THE VERDICT: word soup SURVIVES roots 22+23+24+26
+v12_quality 3 prompts (96 tok each), statistical gates pass (letter/CJK
+0.86-0.89, 8-gram max run 1) but every output is soup, e.g. prompt
+"What is the capital of France?":
+  !历史股东RWRW"_tuples襲 single h0feefee#比普通,1emersawnacusò口的olntag伪...
+CRITICAL PATTERN: the SAME token cloud recurs across all three prompts
+(fee / 襲 / _tuples / 历史股东 / RWRW / single / domestic / prezi / casin /
+awn / eder / 不見 / 国家一级 / second / listed / ó / ò) - generation is
+dominated by a prompt-INDEPENDENT token distribution: hidden state barely
+depends on input, or logits are drowned by a constant term.
+
+### Where to hunt next (in order)
+1. o-vs-ref differential on CLEAN data (planned in root-27 entry; previous
+   cos=0.917 / 62% err was measured on "poisoned" data = untrustworthy).
+   Layer ladder: full_ref.py / l0_fine*.py already exist locally.
+2. GDN / linear-attention path: 30 of 40 layers are linear (gated delta
+   net, conv_kernel=4, k_heads=16, v_heads=32, kdim=128, vdim=128,
+   RMSNormGated o_norm). Root 24 only fixed the 10 FULL-attention layers
+   (attn_prefill_v2 / attn_decode_partial). The GDN kernels have never
+   been implicated or audited - and 30/40 layers is plenty to soup output.
+3. Re-audit any remaining raw-storage -> __half conversions in the GDN
+   kernels (root-24's audit covered attention.cu only).
+4. Final logits path: output_norm (copynorm +1.0), output head Q4_K.
+
+Artifacts on VM (tunnel LAQUTFHI): /content/Sage-fixed.gguf (clean),
+/content/pool.bin (clean, aligned-scan verified), /content/rebuild6.log,
+stage markers s1-s5 (s6 marker not set - gate bug, not a real failure).
