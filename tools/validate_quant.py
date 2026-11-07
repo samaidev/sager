@@ -182,15 +182,12 @@ def main() -> None:
             x = dequant_q4_k_row(raw, cols)
             se += float((x * x).sum())
             if a.hf:
-                from safetensors import safe_open  # type: ignore
                 # row-matched comparison against the HF original
                 hf_name = _map_back(name, r, per_expert)
                 if hf_name is None:
                     continue
                 fn, key, erow = hf_name
-                with safe_open(fn, framework="numpy") as g:
-                    orig = g.get_tensor(key)[erow if erow is not None
-                                             else r].astype(np.float32)
+                orig = _hf_row(fn, key, erow if erow is not None else r)
                 e = orig - x
                 se += float((e * e).sum()) - float((x * x).sum())  # replace prior
                 sr += float((orig * orig).sum())
@@ -203,6 +200,33 @@ def main() -> None:
 
     print(f"\nworst relRMSE: {worst:.4f} "
           f"({'OK' if worst < 0.08 else 'REVIEW: above the iid-gaussian floor'} )")
+
+
+_PT_CACHE = {}
+
+
+def _hf_row(fn: str, key: str, row: int) -> np.ndarray:
+    """One float32 row from an HF safetensors file; bf16-safe (Sage-A1.5
+    stores bf16, which the numpy framework cannot materialize -> falls back
+    to the torch framework, cached per file)."""
+    from safetensors import safe_open  # type: ignore
+    fw = _PT_CACHE.get((fn, "fw"))
+    if fw is None:
+        try:
+            with safe_open(fn, framework="numpy") as g:
+                g.get_tensor(key)
+            fw = "numpy"
+        except TypeError:
+            fw = "pt"
+        _PT_CACHE[(fn, "fw")] = fw
+    if fw == "numpy":
+        with safe_open(fn, framework="numpy") as g:
+            return g.get_tensor(key)[row].astype(np.float32)
+    import torch  # bf16 path (Colab has torch)
+    if fn not in _PT_CACHE:
+        _PT_CACHE[fn] = safe_open(fn, framework="pt")
+    t = _PT_CACHE[fn].get_tensor(key)[row]
+    return t.to(torch.float32).numpy()
 
 
 def _map_back(name: str, row: int, per_expert: int | None = None):
@@ -293,8 +317,12 @@ def _map_back(name: str, row: int, per_expert: int | None = None):
                 resolved.append((os.path.join(hf, fn), f"{pref}{L}.{key}"))
             if len(resolved) == len(segs):
                 from safetensors import safe_open  # type: ignore
-                with safe_open(resolved[0][0], framework="numpy") as g:
-                    n_first = g.get_slice(resolved[0][1]).get_shape()[0]
+                try:
+                    with safe_open(resolved[0][0], framework="numpy") as g:
+                        n_first = g.get_slice(resolved[0][1]).get_shape()[0]
+                except TypeError:  # bf16 file
+                    with safe_open(resolved[0][0], framework="pt") as g:
+                        n_first = g.get_slice(resolved[0][1]).get_shape()[0]
                 if row < n_first:
                     return (resolved[0][0], resolved[0][1], row)
                 return (resolved[1][0], resolved[1][1], row - n_first)
