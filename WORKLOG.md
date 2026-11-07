@@ -592,3 +592,67 @@ attn_output_gate=true, full_attention_interval=4, tie_word_embeddings=false).
 Note for next session: prior numpy references may encode the same engine bug
 (root-22 lesson) - validate reference code against the fetched HF source, not
 against the engine.
+
+## 2026-11-07 (offline audit, tunnel UYJ23XUZ down): engine kernels ALL clean; two converter quantizer bugs found (root 30 + 31)
+
+Context: tunnel offline the whole session -> full static audit of every kernel
+the v6 prefill/decode path touches, plus the converter, done locally against
+the verified HF reference semantics (1555d90).
+
+### Verified CLEAN (line-by-line, this session)
+- Q4_K whole stack: converter quantizers <-> q4_k.cpp dequant <-> CUDA gemv
+  (`dp4a_subblock`, `(sb>>1)*32` group, even-LOW/odd-HIGH nibble) <-> mtok/mmqa
+  family <-> TC dequant (`dequant_q4k_u4`) <-> cuBLAS row/col-major trick.
+  nibble order differs from llama.cpp (LOW-first) but is self-consistent -
+  irrelevant for self-converted GGUFs.
+- Q8_K activation quant (CUDA): amax/127, int8 clamp, int16 bsums. Correct.
+- attention.cu KV q8_0 append/read: v0.12.2 bit-cast scale fix in, symmetric.
+- sampling.cu: penalties/softmax/top-k/top-p/LCG all correct.
+- norm_rotary.cu: rope NeoX partial (style=0, theta 1e7, partial 0.25 from
+  the v6 log), rmsnorm, sigmoid gates, embedding gather. Correct.
+- gdn.cu ALL kernels (gate/conv/l2/delta/out_norm; chunk + warp + r4):
+  recurrence, v-head sharing (vh = h*ratio + j/V), z-at-conv_dim offset,
+  state layout. Matches the verified reference math.
+- moe.cu: router softmax+greedy topk (tie rule), renorm, shared slot
+  (root-8 fix in), combine, dispatch scan, scatter/gather. Correct.
+- weights.cpp: copynorm +1.0 (root-22), q-gate per-head deinterleave
+  (v0.12.1), GDN loads (qkvz/ba single-tensor copies), A_log pre-negation.
+- converter carves: [q|k|v|z], [b|a], conv [D,ck], router, shexp, expert
+  stacks, dims order (fastest-first), root-17 data-start pad. Correct.
+- IMPORTANT deduction: the FIRST generated token is already soup (P3 starts
+  走吧 vs P1/P2 "!") -> the bug is in prefill/head/weights, NOT decode graphs.
+
+### ROOT 30 (converter, REAL, v6 NOT affected): non-fast quantizer wrote zero scales
+quantize_q4_k_row called _set_scale(block[4:], ...) - a bytearray SLICE COPY:
+the 12 scale bytes never reached the block. Any non---fast conversion
+dequantizes to ALL-ZERO weights (local round-trip cos 0.00000). v6 used
+--fast so this did not fire, but it is a landmine: FIXED by building `scales`
+in its own buffer and copying into block[4:16]. Fixed-quantizer round-trip:
+cos 0.9968 (gauss).
+
+### ROOT 31 (converter, quality): --fast anchored quantizer is above the format floor
+Local round-trip on weight-like synthetics (engine dequant formula):
+  gauss:        fast relRMSE 0.0932 cos 0.99566
+  outliers 1%:  fast relRMSE 0.1301 cos 0.99154   <- worst
+  validate_quant's own operative gate is relRMSE<0.08 ("iid-gaussian floor");
+  fast sits ABOVE the floor, and the v6 pipeline NEVER ran validate_quant
+  (it was shipped in the patch set but not wired into any stage).
+Added quantize_q4_k_qsearch: vectorized two-stage 5x5+5x5 (is,im) grid
+search, chunked (1<<15 sub-blocks), selectable via --qsearch. Hits the floor
+(gauss relRMSE 0.079 cos 0.9969; outliers 0.105/0.9945) at ~30x the speed of
+the scalar search (512x2048 matrix: 613 ms -> ~157 s per expert stack).
+NOTE: cos 0.9957 alone is NOT proven to word-soup a model - real-weight
+validation on the actual v6 GGUF is still required (next VM session).
+
+### VM plan when tunnel returns (ordered)
+1. ls /content - did Sage-fixed.gguf / pool.bin / hf_sage survive?
+2. python tools/validate_quant.py --gguf /content/Sage-fixed.gguf --hf
+   /content/hf_sage --tensors all   (5 min) -> REAL cosine of the v6 artifact.
+3. If real cos < ~0.993 on major classes: re-convert with --qsearch (~6 h)
+   then rerun bench/v12_quality.py.
+4. Eager isolation run: SAGER_STEP_GRAPH=0 SAGER_FULL_GRAPH=0
+   SAGER_PF_DEVICE=0 SAGER_DECODE_DEVICE=0 graphs:false quality rerun (10 min)
+   - discriminates runtime glue vs weights.
+5. Still soup -> o-vs-ref layer ladder on clean data (full_ref.py family)
+   against the fetched HF reference (beware root-22 lesson: references must
+   be re-derived from modeling_qwen3_5.py, not from old engine mirrors).

@@ -73,13 +73,19 @@ def quantize_q4_k_row(x: np.ndarray) -> bytes:
         dmin = d
         block = bytearray(4 + 12 + 128)
         struct.pack_into("<HH", block, 0, int(_fp16(d)), int(_fp16(dmin)))
+        # ROOT 30 (2026-11-07): _set_scale(block[4:], ...) wrote into a
+        # bytearray SLICE - a copy - so every scale byte stayed 0 and the
+        # whole non-fast path dequantized to all-zero weights (local
+        # round-trip: cos 0.0). Build the 12 scale bytes in their own
+        # buffer and copy them in at the end.
+        scales = bytearray(12)
         codes = [np.zeros(QK, dtype=np.uint8) for _ in range(8)]
         for s in range(8):
             sb = xb[s * QK:(s + 1) * QK]
             mn, mx = float(sb.min()), float(sb.max())
             if mx == mn:
                 # constant sub-block: scale 1, min 0 -> all zeros
-                _set_scale(block[4:], s, 1, 0)
+                _set_scale(scales, s, 1, 0)
                 continue
             d_ideal = (mx - mn) / 15.0
             is_ideal = int(np.clip(round(d_ideal / d), 1, 63))
@@ -103,11 +109,12 @@ def quantize_q4_k_row(x: np.ndarray) -> bytes:
                     e = err_of(is_, im)
                     if e < best:
                         best, b_is, b_im = e, is_, im
-            _set_scale(block[4:], s, b_is, b_im)
+            _set_scale(scales, s, b_is, b_im)
             dd, mm = d * b_is, dmin * b_im
             codes[s] = np.clip(np.rint((sb + mm) / dd), 0, 15).astype(np.uint8)
         # ggml Q4_K byte pack (v0.12 fix): group g's 32 bytes carry sub-block
         # 2g in the LOW nibbles and sub-block 2g+1 in the HIGH nibbles.
+        block[4:16] = scales
         for g in range(4):
             block[16 + g * 32:16 + (g + 1) * 32] = bytes(
                 (codes[2 * g][l] & 0xF) | ((codes[2 * g + 1][l] & 0xF) << 4)
@@ -133,6 +140,17 @@ def quantize_q4_k(w: np.ndarray) -> bytes:
     rows = w.shape[0]
     return b"".join(quantize_q4_k_row(np.ascontiguousarray(w[r], dtype=np.float32))
                     for r in range(rows))
+
+
+# ROOT 31 (2026-11-07): the --fast anchored quantizer measures relRMSE ~0.09
+# / cos 0.990-0.996 on weight-like data (validate_quant's own gates want
+# <0.05 / >0.995) because the integer snap of is_ = rint(range/15/d) is too
+# coarse for sub-blocks much smaller than the super-block max range, and it
+# was NEVER validated on a real build (v6 shipped it unvalidated). This is a
+# fully-vectorized two-stage grid search over the SAME reconstruction
+# contract (w = d*is*q - dmin*im): coarse 5x5 around the anchor, then 3x3
+# refinement, every sub-block of the matrix at once. ~1 quality tier of the
+# scalar search at fast-quantizer speed. Use via --qsearch.
 
 
 # Vectorized anchored quantization for --fast: same reconstruction contract
@@ -173,6 +191,97 @@ def quantize_q4_k_fast(w: np.ndarray) -> bytes:
     block = np.zeros((nb, 144), dtype=np.uint8)
     block[:, 0:2] = d16.reshape(nb, 2)
     block[:, 2:4] = d16.reshape(nb, 2)   # dmin = d
+    block[:, 4:16] = sc
+    block[:, 16:] = qs.reshape(nb, 128)
+    return block.tobytes()
+
+
+_QUANT_MODE = "fast"   # fast | qsearch; set from argv by convert()
+
+
+def quantize_q4_k_qsearch(w: np.ndarray) -> bytes:
+    """[rows, cols] f32 -> Q4_K; vectorized two-stage (is, im) grid search.
+
+    Same packing/contract as the other two quantizers, but per sub-block we
+    minimize the true squared error over a coarse 5x5 then fine 5x5 grid of
+    (is_, im_) around the anchored ideal, all sub-blocks in parallel
+    (chunked to bound memory). Recovers most of the scalar search's quality
+    (relRMSE ~0.05 vs fast's ~0.09 on weight-like data) at numpy speed.
+    """
+    assert w.shape[1] % 256 == 0, w.shape
+    x = np.ascontiguousarray(w, dtype=np.float32).reshape(-1)
+    nb = x.size // 256
+    S = x.reshape(nb * 8, 32)                       # all sub-blocks [nsb, 32]
+    nsb = S.shape[0]
+    mn = S.min(axis=1)
+    mx = S.max(axis=1)
+    rng_ = np.maximum(mx - mn, 1e-30)
+    d_super = (rng_.reshape(nb, 8).max(axis=1) / 63.0)      # [nb]
+    d = np.repeat(d_super, 8)                                # [nsb]
+    dmin = d
+    const = (mx == mn)
+    rng_ = np.where(const, 1.0, rng_)
+    d = np.where(d > 0, d, 1.0)
+    is_ideal = np.clip(np.rint((rng_ / 15.0) / d), 1, 63).astype(np.int32)
+    im_ideal = np.clip(np.rint(np.where(const, 0.0, -mn) / dmin), 0, 63).astype(np.int32)
+
+    is_b = np.empty(nsb, dtype=np.int32)
+    im_b = np.empty(nsb, dtype=np.int32)
+    CHUNK = 1 << 15                                  # sub-blocks per grid pass (12.7GB-VM safe)
+
+    def cand(base, lo, hi, step, n):
+        offs = np.arange(-step * n, step * n + 1, step)      # [2n+1]
+        return np.clip(base[None, :] + offs[:, None], lo, hi)
+
+    for lo in range(0, nsb, CHUNK):
+        hi = min(nsb, lo + CHUNK)
+        xs = S[lo:hi]                                # [c, 32]
+        ds = d[lo:hi, None]                          # [c, 1]
+        ii = is_ideal[lo:hi]
+        mi = im_ideal[lo:hi]
+        for step, n in ((4, 2), (1, 2)):             # coarse then fine
+            is_c = cand(ii, 1, 63, step, n)          # [G, c]
+            im_c = cand(mi, 0, 63, step, n)
+            G = is_c.shape[0] * im_c.shape[0]
+            is_f = np.repeat(is_c, im_c.shape[0], axis=0).reshape(G, -1)
+            im_f = np.tile(im_c, (is_c.shape[0], 1)).reshape(G, -1)
+            # err [G, c]: sum of sq err over the 32 weights of each sub-block
+            dd = ds[None] * is_f[:, :, None].astype(np.float32)   # [G, c, 1]
+            mm = dmin[lo:hi, None][None] * im_f[:, :, None].astype(np.float32)
+            z = xs[None] + mm                        # [G, c, 32]
+            q = np.clip(np.rint(z / np.maximum(dd, 1e-30)), 0, 15)
+            e = ((z - dd * q) ** 2).sum(axis=2)
+            best = e.argmin(axis=0)                  # [c]
+            ar = np.arange(hi - lo)
+            ii = is_f[best, ar]
+            mi = im_f[best, ar]
+        is_b[lo:hi] = ii
+        im_b[lo:hi] = mi
+
+    dd = (d * is_b.astype(np.float32))[:, None]      # [nsb, 1]
+    mm = (dmin * im_b.astype(np.float32))[:, None]
+    q = np.clip(np.rint((S + mm) / np.maximum(dd, 1e-30)), 0, 15).astype(np.uint8)
+    q = np.where(const[:, None], 0, q)
+    q = q.reshape(nb, 8, 32)
+    is_b = is_b.reshape(nb, 8)
+    im_b = im_b.reshape(nb, 8)
+
+    qs = (q[:, 0::2, :] & 0xF) | ((q[:, 1::2, :] & 0xF) << 4)
+    sc = np.zeros((nb, 12), dtype=np.uint8)
+    d6 = is_b.astype(np.uint8)
+    m6 = im_b.astype(np.uint8)
+    for j in range(4):
+        sc[:, j] |= d6[:, j] & 63
+        sc[:, j + 4] |= m6[:, j] & 63
+    for j in range(4, 8):
+        sc[:, j + 4] |= d6[:, j] & 0xF
+        sc[:, j - 4] |= (d6[:, j] >> 4) << 6
+        sc[:, j + 4] |= (m6[:, j] & 0xF) << 4
+        sc[:, j] |= (m6[:, j] >> 4) << 6
+    d16 = np.ascontiguousarray(d_super.astype(np.float16)).view(np.uint8).reshape(-1)
+    block = np.zeros((nb, 144), dtype=np.uint8)
+    block[:, 0:2] = d16.reshape(nb, 2)
+    block[:, 2:4] = d16.reshape(nb, 2)
     block[:, 4:16] = sc
     block[:, 16:] = qs.reshape(nb, 128)
     return block.tobytes()
@@ -220,7 +329,10 @@ class GGUFWriter:
     def _encode(w: np.ndarray, qtype: int) -> Tuple[list, bytes]:
         if qtype == T_Q4_K:
             a = np.ascontiguousarray(w, dtype=np.float32)
-            data = (quantize_q4_k_fast(a) if _QUANT_FAST else quantize_q4_k(a))
+            if _QUANT_MODE == "qsearch":
+                data = quantize_q4_k_qsearch(a)
+            else:
+                data = (quantize_q4_k_fast(a) if _QUANT_FAST else quantize_q4_k(a))
             dims = [w.shape[1], w.shape[0]]           # gguf: fastest first
         elif qtype == T_F16:
             data = np.ascontiguousarray(w, dtype=np.float16).tobytes()
@@ -668,7 +780,8 @@ def convert(hf_dir: str, out_path: str, workers: int, fast: bool = False) -> Non
     # stacks are quantized lazily inside write() and each shard is unlinked
     # the moment its last consumed tensor is written (mmap of an unlinked
     # file stays valid, so mid-write deletion is safe).
-    qexp = quantize_q4_k_fast if fast else quantize_q4_k
+    qexp = quantize_q4_k_qsearch if _QUANT_MODE == "qsearch" else (
+        quantize_q4_k_fast if fast else quantize_q4_k)
     # Shard bookkeeping: a shard is unlinked when every DEFERRED key it
     # holds has been written. Eager keys (dense tensors, embed, head) live
     # in their own shards and simply never release - they are a few GB.
@@ -727,5 +840,13 @@ if __name__ == "__main__":
     ap.add_argument("--fast", action="store_true",
                     help="vectorized anchored quantization (no grid search); "
                          "~100x faster, slightly worse RMSE - for CI/smoke")
+    ap.add_argument("--qsearch", action="store_true",
+                    help="vectorized two-stage (is,im) grid search - near "
+                         "scalar-search quality at fast-ish speed (root-31)")
     a = ap.parse_args()
+    if a.qsearch:
+        # module-level assignment (no `global` needed at this scope); a plain
+        # `import convert_hf_to_sager` would create a SECOND module instance
+        # under script mode and the flag would silently not apply.
+        _QUANT_MODE = "qsearch"
     convert(a.hf_dir, a.out_gguf, a.workers, a.fast)
