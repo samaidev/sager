@@ -75,7 +75,7 @@ def get_session(sid: str) -> SessionState:
 def start_engine(args) -> None:
     global engine, tokenizer
     tok_dir = args.tokenizer_dir or os.path.dirname(os.path.abspath(args.model))
-    tokenizer = load_tokenizer_for_model(args.model)
+    tokenizer = load_tokenizer_for_model(args.model, tok_dir)
     if not tokenizer.exact:
         print("[sager] WARNING: no tokenizer.json found - tokenization is "
               "approximate. Point --tokenizer-dir at the HF snapshot.",

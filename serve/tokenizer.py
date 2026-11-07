@@ -63,13 +63,15 @@ class Tokenizer:
         return [IM_END, EOS_ID]
 
 
-def load_tokenizer_for_model(model_path: str) -> Tokenizer:
-    """Look for tokenizer.json next to the GGUF, or in SAGER_TOKENIZER_DIR."""
+def load_tokenizer_for_model(model_path: str, extra_dir: Optional[str] = None) -> Tokenizer:
+    """Look for tokenizer.json next to the GGUF, in SAGER_TOKENIZER_DIR, or extra_dir."""
     cand = []
     d = os.path.dirname(os.path.abspath(model_path))
     cand.append(d)
     if os.environ.get("SAGER_TOKENIZER_DIR"):
         cand.append(os.environ["SAGER_TOKENIZER_DIR"])
+    if extra_dir:
+        cand.append(extra_dir)
     for c in cand:
         if os.path.exists(os.path.join(c, "tokenizer.json")):
             return Tokenizer(c)
