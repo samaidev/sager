@@ -24,6 +24,7 @@ from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
+from starlette.concurrency import run_in_threadpool
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from engine_proc import EngineError, EngineOptions, EngineProcess  # noqa: E402
@@ -226,7 +227,6 @@ async def chat_completions(request: Request):
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     # ---- non-streaming ----
-    from starlette.concurrency import run_in_threadpool
     gen_ids: List[int] = []
 
     def collect(t: int) -> bool:
@@ -287,7 +287,6 @@ async def completions(request: Request):
 
 
 # ---------------------------------------------------------------------------
-from starlette.concurrency import run_in_threadpool  # noqa: E402
 
 
 def main() -> None:
