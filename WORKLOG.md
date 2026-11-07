@@ -858,3 +858,16 @@ BENCH v0.12 干净是因为用的是 safetensors 重转换的 GGUF。
   单实例重启，注意 hf shard 可能已被删光需先查）。
 - 判读不变：v12_quality 三段文本对比 HANDOVER_V6.md 第1节 fast 词汤样本；
   连贯 → 根因 = 损坏发布 GGUF（+ qsearch 合格）；仍词汤 → 转 o-vs-ref。
+
+## 2026-11-07 21:35 +08 — 用户供 PAT，仓库首次推送 GitHub
+
+- 推送 colab-oneclick（新分支）并快进 main：7eea3e6 → **f372333**
+  （非破坏 ff，已验证 7eea3e6 为祖先）；rel-v0.12.8 不动（78bd203）。
+- f372333 含：c34b5af（v128 跨线 bug 修复+同源配对+ship 工具）、ab37505
+  （cron 511750 中途检查）、f372333（diag 留档：FETCH-FAILED-1530 +
+  ebat3-queue）。
+- 推送前秘密扫描：全仓无 ait_Ev/github_pat_/ghp_/AKIA 真实令牌
+  （colab_v8_run.sh:5 为占位符示例 github_pat_xxx）；推送用环境变量
+  askpass，令牌未落盘未入 config 未入日志。
+- 意义：VM 下次 bootstrap 克隆 main 即得 qsearch 转换器 + 修复版
+  colab 一键链；colab-oneclick 分支与 main 同步。
