@@ -141,6 +141,9 @@ def main() -> None:
     ap.add_argument("--hf", default=None, help="HF dir with the original weights")
     ap.add_argument("--rows", type=int, default=32, help="rows sampled per tensor")
     ap.add_argument("--tensors", default="expert", choices=["expert", "all"])
+    ap.add_argument("--include", default="",
+                    help="comma-separated substrings; only tensors matching "
+                         "at least one are validated (empty = all)")
     a = ap.parse_args()
 
     kv, tensors, data_start = read_gguf_dir(a.gguf)
@@ -153,6 +156,9 @@ def main() -> None:
         if a.tensors == "expert" else sorted(tensors)
     if a.tensors == "expert" and not names:
         names = sorted(n for n in tensors if n.endswith(".weight"))[:8]
+    if a.include:
+        subs = [s for s in a.include.split(",") if s]
+        names = [n for n in names if any(s in n for s in subs)]
 
     rng = random.Random(0)
     worst = 0.0
@@ -200,9 +206,13 @@ def main() -> None:
 
 
 def _map_back(name: str, row: int, per_expert: int | None = None):
-    """Map (sager tensor, flat row) -> (file, hf_key) via cwd listing.
+    """Map (sager tensor, flat row) -> (file, hf_key, hf_row).
     For 3D expert stacks per_expert = rows per expert: expert = row // per_expert,
-    within-expert row = row % per_expert."""
+    within-expert row = row % per_expert.
+    Extended (root-31 round): plain identity tensors (attn_*, lin_out, shexp,
+    output head) and the vstack-fused GDN input projections lin_in_qkvz /
+    lin_in_ba (row < n_first -> first HF tensor, else second with adjusted
+    row)."""
     import os
     import glob
     import json
@@ -218,24 +228,77 @@ def _map_back(name: str, row: int, per_expert: int | None = None):
     # blk.{L}.ffn_{gate,up,down}_exps row r -> experts.{r}.{proj}
     parts = name.split(".")
     # "blk.{L}.ffn_{gate,up,down}_exps" -> parts = [blk, L, kind]
-    if len(parts) < 3 or parts[2] not in ("ffn_gate_exps", "ffn_up_exps",
-                                          "ffn_down_exps"):
-        return None  # lin_* / attn_* tensors: not expert rows, skip quietly
-    L, kind = parts[1], parts[2]
-    proj = {"ffn_gate_exps": "gate_proj",
-            "ffn_up_exps": "up_proj",
-            "ffn_down_exps": "down_proj"}[kind]
-    expert, erow = (row // per_expert, row % per_expert) \
-        if per_expert else (row, None)
-    for pref in ("model.language_model.layers.", "model.layers."):
-        key = (f"{pref}{L}.mlp.experts.{expert}.{proj}.weight")
-        fn = wm.get(key)
-        if not fn:
-            fn = next((f for f in files
-                       if key in _keys_of(os.path.join(hf, f))), None)
-        if fn:
-            fn = os.path.join(hf, fn) if not os.path.isabs(fn) else fn
-            return (fn, key, erow) if erow is not None else (fn, key, None)
+    if len(parts) >= 3 and parts[2] in ("ffn_gate_exps", "ffn_up_exps",
+                                        "ffn_down_exps"):
+        L, kind = parts[1], parts[2]
+        proj = {"ffn_gate_exps": "gate_proj",
+                "ffn_up_exps": "up_proj",
+                "ffn_down_exps": "down_proj"}[kind]
+        expert, erow = (row // per_expert, row % per_expert) \
+            if per_expert else (row, None)
+        for pref in ("model.language_model.layers.", "model.layers."):
+            key = (f"{pref}{L}.mlp.experts.{expert}.{proj}.weight")
+            fn = wm.get(key)
+            if not fn:
+                fn = next((f for f in files
+                           if key in _keys_of(os.path.join(hf, f))), None)
+            if fn:
+                fn = os.path.join(hf, fn) if not os.path.isabs(fn) else fn
+                return (fn, key, erow) if erow is not None else (fn, key, None)
+
+    if len(parts) < 3 and name != "output.weight":
+        return None
+    L = parts[1] if len(parts) >= 3 and parts[0] == "blk" else None
+    prefs = ("model.language_model.layers.", "model.layers.")
+
+    if name == "output.weight":
+        for key in ("lm_head.weight",
+                    "model.language_model.embed_tokens.weight",
+                    "model.embed_tokens.weight"):
+            fn = wm.get(key)
+            if fn:
+                return (os.path.join(hf, fn), key, row)
+        return None
+
+    if L is None:
+        return None
+    simple = {"attn_q": "self_attn.q_proj.weight",
+              "attn_k": "self_attn.k_proj.weight",
+              "attn_v": "self_attn.v_proj.weight",
+              "attn_output": "self_attn.o_proj.weight",
+              "lin_out": "linear_attn.out_proj.weight",
+              "ffn_gate_shexp": "mlp.shared_expert.gate_proj.weight",
+              "ffn_up_shexp": "mlp.shared_expert.up_proj.weight",
+              "ffn_down_shexp": "mlp.shared_expert.down_proj.weight"}
+    # vstack-fused GDN inputs: (gguf kind -> [(hf key, is_first), ...])
+    fused = {"lin_in_qkvz": [("linear_attn.in_proj_qkv.weight", True),
+                             ("linear_attn.in_proj_z.weight", False)],
+             "lin_in_ba": [("linear_attn.in_proj_b.weight", True),
+                           ("linear_attn.in_proj_a.weight", False)]}
+    if parts[2] in simple:
+        key = simple[parts[2]]
+        for pref in prefs:
+            fn = wm.get(pref + key)
+            if fn:
+                return (os.path.join(hf, fn), pref + key, row)
+        return None
+    if parts[2] in fused:
+        segs = fused[parts[2]]
+        for pref in prefs:
+            resolved = []
+            for key, _is_first in segs:
+                fn = wm.get(pref + key)
+                if fn is None:
+                    break
+                resolved.append((os.path.join(hf, fn), pref + key))
+            if len(resolved) == len(segs):
+                from safetensors import safe_open  # type: ignore
+                with safe_open(resolved[0][0], framework="numpy") as g:
+                    n_first = g.get_slice(resolved[0][1]).get_shape()[0]
+                if row < n_first:
+                    return (resolved[0][0], resolved[0][1], row)
+                return (resolved[1][0], resolved[1][1], row - n_first)
+        return None
     return None
 
 
