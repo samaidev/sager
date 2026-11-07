@@ -22,6 +22,17 @@ Stages (also runnable standalone):
 | `02_serve.sh` | start `serve/server.py` with **200k ctx** + expert-pool env (first load builds the 18 GB pool) | `/content/SERVE_DONE` |
 | `03_tunnel.sh` | map the API port to the public internet via a **registered aitun tunnel** (needs `AITUN_API_KEY`) | prints public URL |
 | `04_zagent.sh` | install ZAgent (`samaidev/zagent_r`), fix the pip-wrapper binary path, start web UI on :8384 pointed at the local API | `/content/ZAGENT_DONE` |
+| `05_reconvert_clean.sh` | **if word soup**: the published `InternScience/Sage-A1.5-Q4_K_M-GGUF` is CORRUPT (ssm_conv1d 66KB boundary garbage, ssm_a stride-2 scramble, blk0 ssm_out corr 0.05 - see `scripts/MIRROR_README.md` @ rel-v0.12.8). This chain reconverts clean weights from HF safetensors (`--qsearch`, the root-31 quantizer fix), cold-fills a fresh pool, runs the v12_quality gate, and restarts the 200k API on clean weights (~3.5-4 h total) | `/content/V128_SERVE_DONE` / `/content/V128_FAILED` |
+
+## Recommended order on a brand-new VM
+
+```bash
+export AITUN_API_KEY=ait_...        # registered aitun key (never committed)
+bash colab/01_bootstrap.sh && bash colab/02_serve.sh && bash colab/03_tunnel.sh
+bash colab/04_zagent.sh
+bash colab/05_reconvert_clean.sh    # run immediately in parallel - the HF GGUF is corrupt;
+                                    # soup until this finishes + swaps the server
+```
 
 ## Environment variables (keys are NEVER stored in this repo)
 
