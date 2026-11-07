@@ -278,19 +278,19 @@ def _map_back(name: str, row: int, per_expert: int | None = None):
     if parts[2] in simple:
         key = simple[parts[2]]
         for pref in prefs:
-            fn = wm.get(pref + key)
+            fn = wm.get(f"{pref}{L}.{key}")
             if fn:
-                return (os.path.join(hf, fn), pref + key, row)
+                return (os.path.join(hf, fn), f"{pref}{L}.{key}", row)
         return None
     if parts[2] in fused:
         segs = fused[parts[2]]
         for pref in prefs:
             resolved = []
             for key, _is_first in segs:
-                fn = wm.get(pref + key)
+                fn = wm.get(f"{pref}{L}.{key}")
                 if fn is None:
                     break
-                resolved.append((os.path.join(hf, fn), pref + key))
+                resolved.append((os.path.join(hf, fn), f"{pref}{L}.{key}"))
             if len(resolved) == len(segs):
                 from safetensors import safe_open  # type: ignore
                 with safe_open(resolved[0][0], framework="numpy") as g:
