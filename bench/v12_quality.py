@@ -61,11 +61,21 @@ def chatml(user: str, system: str = SYSTEM) -> str:
 
 
 class Engine:
-    def __init__(self, engine: str, model: str, chunk: int, pool: str | None):
+    def __init__(self, engine: str, model: str, chunk: int, pool: str | None,
+                 eager: bool = False):
         env = dict(os.environ)
         env.setdefault("SAGER_EXPERT_POOL_REUSE", "1")
         env.setdefault("SAGER_DECODE_DEVICE", "1")
         env.setdefault("SAGER_DEVICE_SAMPLER", "1")
+        if eager:
+            # eager isolation: disable CUDA graphs AND all device-side
+            # prefill/decode paths -> forces the step-by-step eager kernels.
+            env["SAGER_STEP_GRAPH"] = "0"
+            env["SAGER_FULL_GRAPH"] = "0"
+            env["SAGER_PF_DEVICE"] = "0"
+            env["SAGER_DECODE_DEVICE"] = "0"
+            print("eager isolation: graphs OFF, STEP/FULL_GRAPH/PF/DECODE_DEVICE=0",
+                  flush=True)
         if pool:
             env["SAGER_EXPERT_POOL_FILE"] = pool
         env.pop("SAGER_DUMP_LOGITS", None)
@@ -128,14 +138,18 @@ def main() -> None:
     ap.add_argument("--max-tokens", type=int, default=160)
     ap.add_argument("--vram-mb", type=int, default=9984)
     ap.add_argument("--chunk", type=int, default=2048)
+    ap.add_argument("--no-graphs", action="store_true",
+                    help="eager isolation: graphs:false + all SAGER_*_DEVICE=0")
     args = ap.parse_args()
 
     tok_dir = ensure_tokenizer(TOK_DIR)
     tk = load_tokenizer(tok_dir)
 
-    eng = Engine(args.engine, args.model, args.chunk, args.pool)
+    eng = Engine(args.engine, args.model, args.chunk, args.pool,
+                 eager=args.no_graphs)
     ld, _ = eng.cmd({"cmd": "load", "model": args.model, "ctx": 8192,
-                     "vram_mb": args.vram_mb, "threads": 2, "graphs": True,
+                     "vram_mb": args.vram_mb, "threads": 2,
+                     "graphs": not args.no_graphs,
                      "mtp": False, "chunk": args.chunk, "kv_q8": True},
                     timeout=1800)
     print("load:", json.dumps(ld)[:220], flush=True)
