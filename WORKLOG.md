@@ -656,3 +656,70 @@ validation on the actual v6 GGUF is still required (next VM session).
 5. Still soup -> o-vs-ref layer ladder on clean data (full_ref.py family)
    against the fetched HF reference (beware root-22 lesson: references must
    be re-derived from modeling_qwen3_5.py, not from old engine mirrors).
+
+## Session 2026-11-07 (tunnel 1LCGODPP): E-battery re-queued behind running v6 rebuild
+Cron check found rebuild7.log/ebat2.log absent: UYJ23XUZ died; the VM now on
+1LCGODPP is mid-rebuild6 (S5 converter running, GGUF 7.25/44.5 GB at 02:06 UTC).
+Crucially this VM's rebuild6.sh still has the OLD unaligned S6 pool gate, so it
+will false-FAIL (POOL_GATE_FAILED) and never write stage_s6_done (root-28).
+Queued /content/ebat3_waiter.sh instead (launch_ebat3_waiter.py): waits for
+pool.bin >= 17 GB with no writers, runs the root-28 ALIGNED gate itself, then
+E1/E2/E3 (ebat.py verbatim) and E4/E5 (ebat2.py verbatim), marker
+stage_ebat_done. Details + timeline: diag/2026-11-07-1LCGODPP-ebat3-queue.md.
+Follow-up cron 510772 at 15:30 +08:00 pulls ebat3_waiter/ebat/ebat2 logs and
+applies the verdict matrix.
+
+## 2026-11-07 (v6-v2 on fresh VM, tunnel 1LCGODPP): root-31 CONFIRMED LIVE; runtime glue EXONERATED; qsearch chain launched
+
+Reproduction: S1-S5 all green on the fresh T4 (patch commit eaeebff = c437ab7
++ roots 22/23/24/26/30/31). GGUF_SIZE=20301730496 == v6 byte-exact ->
+deterministic artifact. Soup reproduced token-identically (3 prompts, same
+token families, P3 starts 走吧 again). S6 pool-gate tail NaN (0.0244 @0.99) =
+root-28 unaligned-sample FP again, everything else green.
+
+### Discriminator 1 - validate_quant (extended this session)
+_map_back previously validated ONLY expert stacks (attn_*/lin_*/output
+returned None "skip quietly"). Extended: identity mapping for
+attn_{q,k,v,output}/lin_out/shexp/output head, two-segment vstack mapping for
+lin_in_qkvz (in_proj_qkv | in_proj_z) and lin_in_ba (in_proj_b | in_proj_a),
+--include substring filter; bf16-safe HF row reader (numpy framework cannot
+materialize bf16 -> torch fallback). Local unit test 12/12 (caught a missing
+layer-id in the key builder pre-push).
+REAL v6 numbers (32 rows/tensor, all classes):
+  expert stacks   relRMSE 0.093-0.096  cos ~0.9956
+  GDN qkvz/ba/out 0.099-0.118          0.9931-0.9952
+  attn q/k/v/out  0.100-0.135          0.9909-0.9950 (worst blk.39.attn_v)
+  output head     0.0983               0.9952
+EVERY tensor above the 0.08 iid-gaussian floor; a healthy Q4_K_M should sit
+at 2-5% (peaked distributions beat the floor). The --fast anchored quantizer
+underperforms the format floor by 2-4x on real weights, exactly as the
+offline synthetic prediction (0.093-0.130). ROOT 31 IS LIVE IN THE ARTIFACT.
+
+### Discriminator 2 - eager isolation (graphs:false + STEP/FULL_GRAPH/PF/DECODE_DEVICE=0)
+Output is TOKEN-IDENTICAL to the graphs-on S6 run on all three prompts
+(P1 byte-equal: `!历史股东RWRW"_tuples襲 single h0feefee#...`), decode
+1.2-2.0 tok/s vs 3.4-7.7 with graphs (expected slowdown, same stream).
+-> runtime glue (decode graphs / device paths) EXONERATED. GDN decode
+kernels personally re-verified clean the same session (gate/conv/l2/delta/
+out_norm: alpha=exp(-exp(A_log)*softplus(a+dt)), beta=sigmoid(b),
+S<-aS-ab(Sk)k+bvk, vh=h*ratio+j/V, bare-L2 branch; ldh() everywhere).
+
+### Verdict + action
+Only remaining suspect shared by both paths: WEIGHT quantization noise
+(root-31). Launched the unattended qsearch chain 03:17:30 UTC
+(/content/qchain.sh, log /content/qconv.log): wait shard topup ->
+convert_hf_to_sager --workers 4 --qsearch -> Sage-qsearch.gguf ->
+engine load fills pool_qsearch.bin -> v12_quality graphs-on.
+Markers: /content/qconv_done, /content/qchain_done.
+Local commits this session: 3eda4d3 (v12_quality --no-graphs), 0561509
+(extended mapping+include), f410384 (layer-id fix), 56f3917 (bf16 reader).
+
+### Tunnel/exec traps learned this session
+- /execute is SERIAL (is_executing lock): a long payload keeps the lock and
+  outlives local HTTP timeouts - check /health before assuming tunnel dead.
+- Envelope bodies >~12KB arrive truncated (binascii padding error) - gzip
+  files before embedding (validator 14KB -> 4.2KB gz).
+- exec globals/locals separation (HANDOVER trap #1) still bites: functions
+  must bind outer names via parameter defaults.
+- The converter DELETES hf shards as it processes them (disk management) -
+  post-pipeline validate needs a shard re-download (subset via weight_map).
