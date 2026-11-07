@@ -723,3 +723,119 @@ Local commits this session: 3eda4d3 (v12_quality --no-graphs), 0561509
   must bind outer names via parameter defaults.
 - The converter DELETES hf shards as it processes them (disk management) -
   post-pipeline validate needs a shard re-download (subset via weight_map).
+
+## 2026-11-07 15:30 +08 cron (Job 510772) — 隧道离线，ebat3 结果未能拉取
+
+- 1LCGODPP /health 与 /execute 均 HTTP 502；/status: "tunnel 1LCGODPP is
+  currently offline"。8s 间隔重试 4 次一致 → 非抖动，隧道已断。
+- 三份日志（ebat3_waiter.log / ebat.log / ebat2.log）均无法读取；
+  stage_ebat_done 状态未知。最后已知 VM 快照 02:04-02:06 UTC
+  （convert shard 4/14，预计 04:40 UTC 完成 → 全量 E1-E5 结果
+  预计 06:15-06:30 UTC 就绪）。
+- 按协议停止并等待用户新隧道码；未创建新 cron。
+  恢复后的完整待办见 diag/2026-11-07-1LCGODPP/FETCH-FAILED-1530.md。
+
+## 2026-11-07 16:00-17:30 +08 — 新 VM(1LCGODPP→UKHF0RIR) 全栈重建 + 服务化 + 首次 API 基准
+
+### 背景
+旧 VM 回收（隧道 1LCGODPP 07:30 UTC 离线，v6 产物全失）。用户开新 Colab VM
+（aitun 免费码 UKHF0RIR + 注册 key），指令：跑模型测速 → 200k ctx OpenAI 兼容 API
+→ 公网映射 → 装 samaidev/zagent_r 派 AI 新闻任务 → 脚本入仓一键化。
+
+### 快速路径（未走 2.5h 重转换）
+- GGUF/池产物在 HF：`InternScience/Sage-A1.5-Q4_K_M-GGUF`（21.7GB，Colab 3 分钟拉完）
+- **v012-fixed 池产物在 HF/MS 均不存在** → 池由引擎首载自建（sage_pool.bin 18.1GB，~37min）
+- tokenizer.json 从 `InternScience/Sage-A1.5` 单文件拉取；编译 4/4 测试过
+
+### 服务化成果
+- serve/server.py @ HEAD，ctx=**204800 被引擎接受**，vram_mb=8192，热专家 4854/4854 全驻留
+- 发现并修复 server.py 死变量 bug：--tokenizer-dir 从未传入 load_tokenizer_for_model
+  （近似 tokenizer 静默服务错误 prompt）；已修 tokenizer.py+server.py 并入仓
+- 公网 API：注册隧道 `https://test.aitun.cc` → :8000（本地 curl /props 验证通过）
+- ZAgent(samai-zagent 0.32.102)：pip 壳下载解压后找不到二进制（壳找 'zagent'，
+  归档实为 'zagent-linux-amd64'）→ 手动放置后正常；daemon :8384，llm_base 指向本地 API
+
+### 速度（引擎计数器，贪婪）
+| 项 | 本次 | BENCH v0.12 基线 |
+|---|---|---|
+| prefill | 988.9 tok/s (pp2k) | 995-1320 tok/s |
+| decode | 191.7-214.4 tok/s (tg) | 39.4 tok/s |
+
+### ⚠️ 词汤仍在 + 新疑点
+- "The capital of France is" → 贪婪全 "!"；prefill 速度正常而 decode 比基线快 5x、GPU ~0%
+  → 专家 FFN 疑似未真正参与（稀疏零页特征）
+- Test A：**v0.12 引擎(40d86c0) + HEAD 自建池 → 仍汤** → 池内容垃圾 或 ctx 触发
+- Test B（进行中）：v0.12 引擎 + 全新自建池 sage_pool_v012.bin + ctx 8192 + vram 9728
+  （= BENCH 已知良好配置）。若净 → HEAD 池构建器回归实锤；若汤 → ctx/更深
+- 注：HEAD 领先 40d86c0 共 104 commits；v0.12 工作树已备 /content/sager_v012
+
+## 2026-11-07 18:15 +08 — 根因闭环：HF 发布 GGUF 本身损坏；v128 重建链已启动
+
+### Test B 判决
+v0.12 引擎(40d86c0) + 全新自建池(sage_pool_v012.bin) + BENCH 完全相同配置
+(ctx 8192, graphs ON, vram 9728) → 仍词汤（`!派@不调fee professionalbons本产品`，
+经典 fee/本产品 家族），GPU 6-21% 真实计算，decode ~1.3 tok/s（真实前向，
+首载冷均值）。引擎无罪、池构建无罪 → 唯一变量是权重。
+
+### 实锤（仓库里早有记载）
+rel-v0.12.8 scripts/MIRROR_README.md @78bd203 (2026-10-31)：
+"InternScience/Sage-A1.5-Q4_K_M-GGUF (HF + ModelScope) is corrupt:
+ssm_conv1d garbage past a fixed 66 KB boundary per layer, ssm_a stride-2
+scramble (-exp(A_log) mis-shuffled), blk0 ssm_out corr 0.05 vs HF safetensors.
+Every engine version since v0.1 produced word soup on it."
+BENCH v0.12 干净是因为用的是 safetensors 重转换的 GGUF。
+→ 一周词汤诊断（roots 1-31）全部收敛于此。
+
+### 已采取的行动
+1. 停服，删除损坏源生的 GGUF + 两个池（腾出 ~57GB）
+2. 启动 05_reconvert_clean.sh（后台 nohup，log /content/logs/v128_chain.log，
+   启动于 16:16 UTC）：
+   - rel-v0.12.8(78bd203) 引擎已编译 ✓
+   - HF safetensors 44GB 下载（skip MTP，71% @ 10:28 UTC）
+   - convert_hf_to_sager --workers 8 --qsearch（root-31 两阶段网格搜索，
+     与 --fast 同速）
+   - 池冷填 + v12_quality 质量门 → /content/v128_quality.log
+   - 自动重启 200k API（/content/Sage-v128.gguf + pool_v128.bin）
+   - 标记：/content/V128_SERVE_DONE / /content/V128_FAILED
+3. 修复 server.py 流式 NameError（run_in_threadpool 作用域）——zagent 必需，
+   已入仓 + 已补丁到 VM /content/sager/serve/server.py
+4. 入仓：colab/05_reconvert_clean.sh + README 更新（分支 colab-oneclick）
+5. cron 511662 @ 23:05 +08：验收链结果 → 质量探针 → 真实基准 → zagent 新闻任务实测
+
+### 中途修正记录
+- v128 链首启失败：浅克隆单分支 fetch 只落 FETCH_HEAD 无 tracking ref，
+  worktree add origin/rel-v0.12.8 → invalid reference；改用 FETCH_HEAD 后正常
+- 洞察：损坏 GGUF 上 prefill 989 tok/s、decode 192-214 tok/s、GPU ~0% ——
+  权重损坏使专家 FFN 空转（稀疏零页），"过快" 本身就是损坏指纹
+
+## 2026-11-07 19:50 +08 cron (Job 510875) — qsearch 链随旧 VM 确认丢失；v128 修复链以同源配对重启
+
+- UKHF0RIR 通路验证：测试信封回显 42；/health GPU ok、uptime 159.9 min
+  → VM 约 08:10 UTC 启动（即 16:00-18:15 条目那台新机）。
+- 旧 qsearch 线标记全部缺席（qconv.log / qchain_done / Sage-qsearch.gguf /
+  pool_qsearch.bin）→ 随 1LCGODPP VM 回收而丢失，本 cron 的原始目标不可达。
+- 后继链现场：05_reconvert_clean.sh 已于 10:28 UTC 失败（V128_FAILED）。
+  convert_v128.log：rel-v0.12.8(78bd203) 转换器不认 --qsearch
+  ("unrecognized arguments")——脚本 cd 进 rel worktree 后用了早于 qsearch
+  功能的转换器。干净 safetensors（14 文件，65GB）下载已完成，引擎 4/4 测试过。
+- 修复：本地 HEAD 源码子集（src/include/tests/CMakeLists/
+  tools/convert_hf_to_sager.py/bench/v12_quality.py/serve/*，233.5KB tgz）
+  分 45 个信封分片上传 → /content/sager_head（远端 crc e737cbbc 校验过）；
+  写 /content/v128_fix_chain.sh（沿用原标记与日志路径），以同 commit 配对的
+  转换器+引擎重建。
+- 新踩的执行陷阱（记牢）：
+  1) /execute 返回 success=false 但远端实际已执行（副作用发生）→ 首次
+     ship_fix_chain 已把链点火，重试造成两个实例赛跑同一 build 目录；
+     杀两个进程组 + 清 build 目录 + 单实例重启。
+  2) pgrep -f 自匹配：payload 以 python -c "<代码>" 运行，命令行含脚本名
+     字符串 → 守卫匹配到自己拒绝点火；改用 ps+awk 按 comm==bash 判定。
+- 11:04:57 UTC 单实例链启动（pid 47825）；build 4/4（2.69s）；11:06 转换器
+  带 --qsearch 运行中（workers 8）。ETA：转换 1-2.5h → 池+质量 ~40min →
+  自动 200k 服务。全链预计 13:30-14:30 UTC（21:30-22:30 +08）完成。
+- 本地仓：colab/05_reconvert_clean.sh 修复（同源配对构建 + qsearch grep
+  守卫 + serve 引擎路径改 $REPO/build）；fuse-bisect 环境开关
+  （SAGER_DECODE_FUSE_NORM/2M/RESADD，默认 ON=行为不变）入仓；上传/点火
+  工具入 scripts/v128_ship/。
+- 判定待出：Sage-v128.gguf（干净 safetensors + qsearch）的 v12_quality
+  三段文本 = 本 cron 想要的 qsearch 判定。cron 511662 @ 23:05 +08 验收；
+  另设一次性 cron @ 21:10 +08 中途检查。

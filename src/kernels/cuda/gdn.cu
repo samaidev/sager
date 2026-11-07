@@ -143,7 +143,7 @@ __global__ void gdn_l2_norm_kernel(uint16_t* qn, uint16_t* kn,
   }
   const float inv_q = rsqrtf(block_sum_reduce(red, ss2) + eps);
   for (int i = tid; i < K; i += blockDim.x) {
-    sth(qn + static_cast<size_t>(h) * K + i, vals[i] * inv_q);
+    sth(qn + static_cast<size_t>(h) * K + i, vals[i] * inv_q * rsqrtf((float)K));
   }
   __syncthreads();
 
@@ -379,7 +379,7 @@ __global__ void gdn_l2_norm_chunk_kernel(uint16_t* qn, uint16_t* kn,
   }
   const float inv_q = rsqrtf(block_sum_reduce(red, ss2) + eps);
   for (int i = tid; i < K; i += blockDim.x) {
-    sth(qn + (static_cast<size_t>(t) * nk + h) * K + i, vals[i] * inv_q);
+    sth(qn + (static_cast<size_t>(t) * nk + h) * K + i, vals[i] * inv_q * rsqrtf((float)K));
   }
   __syncthreads();
 

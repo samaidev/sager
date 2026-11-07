@@ -672,7 +672,12 @@ __global__ void gemv_nm_q4_k_q8_f16out_kernel(
 
   // scalar select: dynamically-indexed local arrays spill to local memory
   // (measured +80 us/layer on the T4 step graph) - keep everything in scalars
-  const int r12 = rows1 + rows2;
+  // v0.12.10 FIX (root 32): rows2/rows3 arrive CUMULATIVE (rowss[1],
+  // rowss[2]). The old NM==3 test `row >= rows1 + rows2` double-counted
+  // rows1, so k rows [rows1+rows2, ...) read w3's data as oob 'k' rows and
+  // the v matrix was never written (row >= r12 unreachable, r12 > total)
+  // - every dense-layer decode step computed attention on garbage k/v
+  // and stomped past k_ into neighbouring slabs.
   const int total = (NM == 2) ? rows2 : rows3;
   const int row = blockIdx.x * 8 + warp;
   mmq_stage(reinterpret_cast<const unsigned char*>(xq),
@@ -683,7 +688,7 @@ __global__ void gemv_nm_q4_k_q8_f16out_kernel(
   if (NM == 2) {
     if (row >= rows1) { m = 1; rlocal = row - rows1; }
   } else {
-    if (row >= r12) { m = 2; rlocal = row - r12; }
+    if (row >= rows2) { m = 2; rlocal = row - rows2; }
     else if (row >= rows1) { m = 1; rlocal = row - rows1; }
   }
   const q4k::BlockQ4K* wm = (m == 0) ? w1 : ((m == 1) ? w2 : w3);

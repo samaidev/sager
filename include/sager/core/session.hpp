@@ -302,6 +302,9 @@ class Session {
   // v0.8 knobs (all default on; each flips cleanly back to the v0.7 path)
   bool pf_mmq_ = false;      // SAGER_PF_MMQ=1 -> experimental MMQ prefill GEMM
   bool dec_fuse_ = true;     // SAGER_DECODE_FUSE=0 -> v0.7 per-kernel decode
+  bool dec_fuse_norm_ = true;   // SAGER_DECODE_FUSE_NORM=0 -> split norm+quant
+  bool dec_fuse_2m_ = true;     // SAGER_DECODE_FUSE_2M=0 -> separate GEMVs
+  bool dec_fuse_resadd_ = true; // SAGER_DECODE_FUSE_RESADD=0 -> gemv+add
   bool head_smx_ = true;     // SAGER_HEAD_SMX=0 -> v0.6 Q6_K head kernel
   // v0.12 FIX: default ON. The qwen35moe GDN blocks carry a real
   // post_attention_norm between the GDN body and the MoE half - skipping it

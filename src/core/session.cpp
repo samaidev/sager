@@ -458,6 +458,12 @@ Status Session::prepare() {
       if (mq) pf_mmq_ = (*mq != "0");
       const auto df = env_get("SAGER_DECODE_FUSE");
       if (df) dec_fuse_ = (*df != "0");
+      const auto dfn = env_get("SAGER_DECODE_FUSE_NORM");
+      if (dfn) dec_fuse_norm_ = (*dfn != "0");
+      const auto df2 = env_get("SAGER_DECODE_FUSE_2M");
+      if (df2) dec_fuse_2m_ = (*df2 != "0");
+      const auto dfr = env_get("SAGER_DECODE_FUSE_RESADD");
+      if (dfr) dec_fuse_resadd_ = (*dfr != "0");
       const auto hs = env_get("SAGER_HEAD_SMX");
       if (hs) head_smx_ = (*hs != "0");
       const auto gf = env_get("SAGER_GDN_FFN_NORM");
@@ -646,7 +652,7 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
     // filled by the fallback below or the n==1 decode path).
     cuda::rmsnorm_batched_f16(xn_.get(), x_.get(), lw.attn_norm, H,
                               mc_.norm_eps, n_tokens, s);
-  } else if (dec_fuse_ && n_tokens == 1) {
+  } else if (dec_fuse_ && dec_fuse_norm_ && n_tokens == 1) {
     // v0.8: rmsnorm + Q8_K quant in one launch (bit-identical to the pair);
     // decode-only - at n>1 the two-kernel sequence's spread-out quantize
     // grid wins (the fused kernel is barrier-heavy per row)
@@ -663,7 +669,7 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
   }
 
   if (n_tokens == 1) {
-    if (dec_fuse_) {
+    if (dec_fuse_ && dec_fuse_2m_) {
       // v0.8: q|k|v projections in ONE launch (per-row math unchanged)
       cuda::gemv3m_q4_k_q8_f16out(Q4W(lw.wq), Q4W(lw.wk), Q4W(lw.wv),
                                   d_xq_.get(), q_.get(), k_.get(), v_.get(),
@@ -932,7 +938,7 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
   }
   if (n_tokens == 1) {
     cuda::quantize_q8_k(attn_out_.get(), d_hq_.get(), Q, s);
-    if (dec_fuse_) {
+    if (dec_fuse_ && dec_fuse_resadd_) {
       // v0.8: o_proj with the residual add as epilogue (one launch less the
       // o_proj buffer round trip; add_kernel semantics preserved)
       cuda::gemv_q4_k_q8_f16out_resadd(Q4W(lw.wo), d_hq_.get(),
@@ -1010,7 +1016,7 @@ void Session::dense_layer_launch(int layer, int n_tokens) {
       }
     }
   }
-  if (dec_fuse_ && n_tokens == 1) {
+  if (dec_fuse_ && dec_fuse_norm_ && n_tokens == 1) {
     cuda::rmsnorm_quant_f16(xn_.get(), x_.get(), lw.ffn_norm, d_xq_.get(),
                             H, mc_.norm_eps, n_tokens, s);
     moe_xq_in_ = d_xq_.get();   // the MoE quantizes xn - reuse the fused q8
@@ -1059,7 +1065,7 @@ void Session::linear_layer_launch(int layer, int n_tokens) {
     uint16_t* x_row = x_.get() + static_cast<size_t>(t) * H;
     uint16_t* xn_row = xn_.get() + static_cast<size_t>(t) * H;
     uint16_t* op_row = o_proj_.get() + static_cast<size_t>(t) * H;
-    if (dec_fuse_) {
+    if (dec_fuse_ && dec_fuse_norm_) {
       // v0.8: rmsnorm + Q8_K quant in one launch (bit-identical to the pair)
       cuda::rmsnorm_quant_f16(xn_row, x_row, lw.attn_norm, d_xq_.get(), H,
                               mc_.norm_eps, 1, s);
@@ -1068,7 +1074,7 @@ void Session::linear_layer_launch(int layer, int n_tokens) {
       cuda::quantize_q8_k(xn_row, d_xq_.get(), H, s);
     }
     // fused projections: qkvz -> [q|k|v|z], ba -> [b|a]
-    if (n_tokens == 1 && dec_fuse_) {
+    if (n_tokens == 1 && dec_fuse_ && dec_fuse_2m_) {
       // v0.8: qkvz|ba projections in ONE launch (per-row math unchanged)
       cuda::gemv2m_q4_k_q8_f16out(Q4W(lw.lin_in_qkvz), Q4W(lw.lin_in_ba),
                                   d_xq_.get(), lin_proj_.get(), lin_ba_.get(),
@@ -1102,7 +1108,7 @@ void Session::linear_layer_launch(int layer, int n_tokens) {
                            g.n_v_heads, g.value_dim, mc_.norm_eps, s);
     // out_proj -> residual
     cuda::quantize_q8_k(lin_on_.get(), d_hq_.get(), g.y_rows(), s);
-    if (n_tokens == 1 && dec_fuse_) {
+    if (n_tokens == 1 && dec_fuse_ && dec_fuse_resadd_) {
       // v0.8: out_proj with the residual add as epilogue
       cuda::gemv_q4_k_q8_f16out_resadd(Q4W(lw.lin_out), d_hq_.get(), op_row,
                                        x_row, H, g.y_rows(), s);
@@ -1119,7 +1125,7 @@ void Session::linear_layer_launch(int layer, int n_tokens) {
   // (post_attention_layernorm), so the norm belongs here exactly as it is
   // applied at the end of dense_layer_launch.
   if (gdn_ffn_norm_) {
-    if (dec_fuse_) {
+    if (dec_fuse_ && dec_fuse_norm_) {
       cuda::rmsnorm_quant_f16(xn_.get(), x_.get(), lw.ffn_norm, d_xq_.get(),
                               H, mc_.norm_eps, n_tokens, s);
       moe_xq_in_ = d_xq_.get();
